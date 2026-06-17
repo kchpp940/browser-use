@@ -1384,13 +1384,13 @@ class BrowserSession(BaseModel):
 			Storage state dict with cookies in Playwright format.
 
 		"""
+		from browser_use.browser.watchdogs.storage_state_watchdog import _normalize_storage_state
+
 		from pathlib import Path
 
-		# Get all cookies using Storage.getCookies (returns decrypted cookies from all domains)
 		cookies = await self._cdp_get_cookies()
 
-		# Convert CDP cookie format to Playwright storage_state format
-		storage_state = {
+		storage_state: dict[str, Any] = {
 			'cookies': [
 				{
 					'name': c['name'],
@@ -1404,8 +1404,10 @@ class BrowserSession(BaseModel):
 				}
 				for c in cookies
 			],
-			'origins': [],  # Could add localStorage/sessionStorage extraction if needed
+			'origins': [],
 		}
+
+		storage_state = _normalize_storage_state(storage_state)
 
 		if output_path:
 			import json
