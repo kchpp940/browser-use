@@ -206,28 +206,71 @@ class LLMEffectiveConfig(BaseModel):
 
 	This is the single source of truth for LLM initialization across all entry points
 	(Python API, CLI, TUI, skill_cli, beta agent, sandbox/cloud).
+
+	Provider-specific parameters that don't have a dedicated field can be placed in
+	``provider_params`` — build_llm() will forward them as kwargs to the constructor.
 	"""
 
 	model_config = ConfigDict(extra='forbid', populate_by_name=True)
 
+	# Core identity
 	provider: str | None = Field(default=None, description='LLM provider name, e.g. "browser-use", "openai", "anthropic"')
 	model: str | None = Field(default=None, description='Model name string, e.g. "gpt-4.1-mini"')
-	temperature: float | None = Field(default=None, description='Sampling temperature')
-	max_tokens: int | None = Field(default=None, description='Maximum output tokens')
-	api_key: str | None = Field(default=None, description='API key (masked in logs)')
-	base_url: str | None = Field(default=None, description='Custom API base URL')
-	timeout: int | None = Field(default=None, description='LLM call timeout in seconds')
 	model_class: str | None = Field(
 		default=None, description='Fully qualified class name, e.g. "browser_use.llm.browser_use.chat.ChatBrowserUse"'
 	)
 
+	# Common sampling params
+	temperature: float | None = Field(default=None, description='Sampling temperature')
+	max_tokens: int | None = Field(default=None, description='Maximum output tokens (alias: max_completion_tokens)')
+	max_completion_tokens: int | None = Field(default=None, description='Maximum completion tokens')
+	top_p: float | None = None
+	frequency_penalty: float | None = None
+	presence_penalty: float | None = None
+	seed: int | None = None
+	reasoning_effort: str | None = None
+
+	# Client / transport params
+	api_key: str | None = Field(default=None, description='API key (masked in logs)')
+	base_url: str | None = Field(default=None, description='Custom API base URL')
+	timeout: float | None = Field(default=None, description='LLM call timeout in seconds')
+	max_retries: int | None = None
+	organization: str | None = None
+	project: str | None = None
+
+	# Provider-specific catch-all — forwarded as **kwargs to the LLM constructor
+	provider_params: dict[str, Any] = Field(
+		default_factory=dict,
+		description='Provider-specific kwargs forwarded directly to the LLM constructor',
+	)
+
 	def get_log_safe_dict(self) -> dict[str, Any]:
-		"""Return a dict safe for logging (API key masked)."""
+		"""Return a dict safe for logging (API key masked, provider_params redacted)."""
 		d = self.model_dump(exclude_none=True)
 		if d.get('api_key'):
 			key = d['api_key']
 			d['api_key'] = key[:4] + '...' + key[-4:] if len(key) > 8 else '***'
+		if d.get('provider_params'):
+			d['provider_params'] = f'<{len(d["provider_params"])} keys>'
 		return d
+
+	def to_llm_kwargs(self) -> dict[str, Any]:
+		"""Build the kwargs dict for constructing the LLM client.
+
+		Maps field aliases (e.g. max_tokens → max_completion_tokens for OpenAI-style clients)
+		and merges provider_params on top.
+		"""
+		raw = self.model_dump(exclude_none=True, exclude={'provider', 'model_class', 'provider_params'})
+
+		# Alias: max_tokens <-> max_completion_tokens (prefer explicit max_completion_tokens)
+		if 'max_completion_tokens' in raw:
+			raw['max_tokens'] = raw.pop('max_completion_tokens')
+
+		# Merge provider-specific params (they win if keys collide)
+		raw.update(self.provider_params or {})
+
+		# Remove None values again after merging
+		return {k: v for k, v in raw.items() if v is not None}
 
 
 class EffectiveConfig(BaseModel):
