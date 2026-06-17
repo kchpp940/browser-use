@@ -821,34 +821,38 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 
 	@model_validator(mode='after')
 	def load_storage_state_from_env(self) -> Self:
-		"""Load storage_state from BU_BROWSER_STORAGE_STATE_PATH env var with highest priority.
+		"""Load storage_state from environment variables when not explicitly provided.
 
 		This ensures managed browser workers launched by the Rust SDK receive
 		the original file path (not a flattened dict) so StorageStateWatchdog
 		can write updates back to the file.
 
-		Priority:
-		1. BU_BROWSER_STORAGE_STATE_PATH env var (always highest, even if
-		   storage_state was explicitly provided as dict)
-		2. Existing storage_state value (dict or path)
-		3. BU_BROWSER_STORAGE_STATE env var (JSON dict, fallback only)
+		Configuration priority (highest to lowest):
+		1. Explicit storage_state parameter (dict or Path) — NEVER overridden
+		2. BU_BROWSER_STORAGE_STATE_PATH env var (path-based persistence)
+		3. BU_BROWSER_STORAGE_STATE env var (JSON dict, read-only seed)
+
+		Env vars are only consulted when storage_state is None. This prevents
+		residual environment variables from overriding explicit user configuration
+		via Python API, CLI config, or cloud parameters.
 		"""
-		env_path = os.getenv('BU_BROWSER_STORAGE_STATE_PATH')
-		if env_path and str(env_path).strip():
-			# Use object.__setattr__ to bypass Pydantic validation and avoid
-			# infinite recursion when setting storage_state inside validator
-			object.__setattr__(self, 'storage_state', Path(env_path).expanduser())
-		elif self.storage_state is None:
-			# Only fall back to BU_BROWSER_STORAGE_STATE dict if no path exists
-			env_dict_str = os.getenv('BU_BROWSER_STORAGE_STATE')
-			if env_dict_str and str(env_dict_str).strip():
-				try:
-					import json
-					parsed = json.loads(env_dict_str)
-					if isinstance(parsed, dict):
-						object.__setattr__(self, 'storage_state', parsed)
-				except (json.JSONDecodeError, ValueError):
-					pass
+		if self.storage_state is None:
+			env_path = os.getenv('BU_BROWSER_STORAGE_STATE_PATH')
+			if env_path and str(env_path).strip():
+				# Use object.__setattr__ to bypass Pydantic validation and avoid
+				# infinite recursion when setting storage_state inside validator
+				object.__setattr__(self, 'storage_state', Path(env_path).expanduser())
+			else:
+				# Fall back to BU_BROWSER_STORAGE_STATE JSON dict
+				env_dict_str = os.getenv('BU_BROWSER_STORAGE_STATE')
+				if env_dict_str and str(env_dict_str).strip():
+					try:
+						import json
+						parsed = json.loads(env_dict_str)
+						if isinstance(parsed, dict):
+							object.__setattr__(self, 'storage_state', parsed)
+					except (json.JSONDecodeError, ValueError):
+						pass
 		return self
 
 	@model_validator(mode='after')

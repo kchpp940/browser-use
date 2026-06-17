@@ -6781,8 +6781,14 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.browser_viewport:
 			env['BU_BROWSER_VIEWPORT'] = json.dumps(self.browser_viewport)
 		if self.browser_storage_state_path is not None:
+			# Path-based storage state: ONLY set BU_BROWSER_STORAGE_STATE_PATH.
+			# Do NOT set BU_BROWSER_STORAGE_STATE (JSON dict) to avoid the Rust
+			# SDK parsing it as a dict and passing it explicitly, which would
+			# prevent the downstream validator from using the path (since
+			# storage_state would no longer be None).
 			env['BU_BROWSER_STORAGE_STATE_PATH'] = str(self.browser_storage_state_path)
-		if self.browser_storage_state:
+		elif self.browser_storage_state:
+			# Dict-based storage state: pass as JSON for read-only seed data
 			env['BU_BROWSER_STORAGE_STATE'] = json.dumps(self.browser_storage_state)
 		if self.managed_browser_env and _is_managed_browser_mode(browser_mode):
 			env.update(self.managed_browser_env)
