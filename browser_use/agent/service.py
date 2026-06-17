@@ -655,13 +655,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	async def _check_and_update_downloads(self, context: str = '') -> None:
 		"""Check for new downloads and update available file paths.
 
-		Collects files from three sources:
-		1. Browser session downloads (CDP download events)
-		2. FileSystem managed files (save_as_pdf, write_file, etc.)
-		3. Existing available_file_paths
+		Collects REAL LOCAL FILE PATHS (absolute paths on disk) from:
+		1. Browser session downloads (CDP download events - PDF auto-downloads, clicked downloads)
+		2. Existing available_file_paths (user-provided real paths)
 
-		All paths are normalized before comparison to avoid duplicates
-		from relative/absolute path mismatches.
+		NOTE: FileSystem-managed files (read_file/write_file/save_as_pdf) are NOT
+		added here. They live in a separate namespace and are referenced by
+		virtual basename (e.g. "todo.md"), not by real disk path. Mixing the two
+		would cause semantic confusion — upload_file expects real disk paths,
+		while read_file/write_file expect FileSystem virtual names.
 		"""
 		if not self.has_downloads_path:
 			return
@@ -669,31 +671,20 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 
 		try:
-			all_downloads: list[str] = []
+			# Collect only real local downloads — FileSystem files are separate
+			real_downloads: list[str] = []
 
-			# Source 1: Browser session downloads (normalized at source)
+			# Source 1: Browser session downloads (CDP download events)
 			session_downloads = self.browser_session.downloaded_files
-			all_downloads.extend(session_downloads)
-
-			# Source 2: FileSystem managed files (save_as_pdf, write_file, etc.)
-			if self.file_system and self.file_system.get_dir():
-				fs_dir = self.file_system.get_dir()
-				try:
-					for file_path in Path(fs_dir).iterdir():
-						if file_path.is_file() and not file_path.name.startswith('.'):
-							norm_path = normalize_path(file_path)
-							if norm_path:
-								all_downloads.append(norm_path)
-				except Exception as e:
-					self.logger.debug(f'📁 Failed to scan FileSystem directory: {type(e).__name__}: {e}')
+			real_downloads.extend(session_downloads)
 
 			# Normalize and deduplicate
-			norm_all_downloads: list[str] = []
-			for p in all_downloads:
+			norm_downloads: list[str] = []
+			for p in real_downloads:
 				norm = normalize_path(p)
 				if norm is not None:
-					norm_all_downloads.append(norm)
-			unique_downloads = list(dict.fromkeys(norm_all_downloads))
+					norm_downloads.append(norm)
+			unique_downloads = list(dict.fromkeys(norm_downloads))
 
 			last_known_set: set[str] = set()
 			for p in self._last_known_downloads:
@@ -713,15 +704,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug(f'📁 Failed to check for downloads{error_context}: {type(e).__name__}: {e}')
 
 	def _update_available_file_paths(self, downloads: list[str]) -> None:
-		"""Update available_file_paths with downloaded files using normalized path comparison.
+		"""Update available_file_paths with real downloaded files using normalized path comparison.
+
+		available_file_paths contains ONLY real local absolute paths (user-provided
+		paths + browser session downloads). FileSystem virtual files are tracked
+		separately by the FileSystem instance and referenced by basename.
 
 		Args:
-			downloads: List of file paths to add (should already be normalized)
+			downloads: List of real file paths to add (should already be normalized)
 		"""
 		if not self.has_downloads_path:
 			return
 
-		# Normalize existing available_file_paths
+		# Normalize existing available_file_paths — these are all real local paths
 		existing_normalized: dict[str, str] = {}
 		for p in self.available_file_paths or []:
 			norm = normalize_path(p)
@@ -736,7 +731,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				existing_normalized[norm_path] = norm_path
 
 		if new_files:
-			# Rebuild available_file_paths with all normalized unique paths
+			# Rebuild available_file_paths with all normalized unique real paths
 			self.available_file_paths = list(existing_normalized.values())
 
 			self.logger.info(
@@ -745,7 +740,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			for file_path in new_files:
 				self.logger.info(f'📄 New file available: {file_path}')
 		else:
-			self.logger.debug(f'📁 No new downloads detected (tracking {len(existing_normalized)} files)')
+			self.logger.debug(f'📁 No new downloads detected (tracking {len(existing_normalized)} real files)')
 
 	def _set_file_system(self, file_system_path: str | None = None) -> None:
 		# Check for conflicting parameters

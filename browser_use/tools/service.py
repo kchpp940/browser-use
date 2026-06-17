@@ -845,32 +845,45 @@ class Tools(Generic[Context]):
 		async def upload_file(
 			params: UploadFileAction, browser_session: BrowserSession, available_file_paths: list[str], file_system: FileSystem
 		):
-			# Check if file is accessible using normalized path comparison
-			# For remote browsers (is_local=False), we allow absolute remote paths even if not tracked locally
+			# Two namespaces with strict boundaries:
+			#
+			# 1. FileSystem VIRTUAL filenames — basename like "todo.md", "data.csv",
+			#    and even traversal attempts like "../note.md" (GHSA-j9hj-92j8-jv9h).
+			#    Anything that is NOT an absolute path or ~ path is first tried as a
+			#    FileSystem virtual file. The FileSystem.get_file() method takes the
+			#    basename internally, so "../note.md" resolves to "note.md" safely.
+			#    The actual disk path is built from file_obj.full_name, NOT from the
+			#    user-controlled params.path, plus a realpath containment check.
+			#
+			# 2. REAL LOCAL PATHS — absolute paths starting with "/" or "~/" like
+			#    "/Users/xx/Downloads/a.pdf" or "~/a.pdf". These must be explicitly
+			#    allowlisted in:
+			#      - available_file_paths (user-provided)
+			#      - browser_session.downloaded_files (CDP download events)
+			#
+			# Remote browsers (is_local=False): allow absolute remote paths through
+			# (they are resolved in the browser's remote filesystem, not ours).
 
-			# Normalize the input path for consistent comparison
-			norm_requested_path = normalize_path(params.path)
+			import os
+
+			requested_path = params.path
+			norm_requested_path = normalize_path(requested_path)
 			path_allowed = False
-			resolved_path = params.path
+			resolved_path = requested_path
 
-			# Check 1: available_file_paths (user-provided or downloaded files)
-			if norm_requested_path and is_path_in_list(norm_requested_path, available_file_paths):
-				path_allowed = True
-				resolved_path = norm_requested_path
+			# Heuristic: ONLY absolute paths (starts with / or ~) are treated as
+			# "real local paths" upfront. Everything else — pure basenames like
+			# "todo.md", relative traversal like "../note.md", "./note.md" — is
+			# first tried against the FileSystem namespace, because FileSystem's
+			# get_file() safely takes the basename internally.
+			is_absolute_real_path = requested_path.startswith('/') or requested_path.startswith('~')
 
-			# Check 2: Recently downloaded files that might not be in available_file_paths yet
-			if not path_allowed:
-				downloaded_files = browser_session.downloaded_files
-				if norm_requested_path and is_path_in_list(norm_requested_path, downloaded_files):
-					path_allowed = True
-					resolved_path = norm_requested_path
-
-			# Check 3: FileSystem service files
-			if not path_allowed and browser_session.is_local and file_system and file_system.get_dir():
-				# Check if the file is actually managed by the FileSystem service
-				# The path should be just the filename for FileSystem files
-				file_obj = file_system.get_file(params.path)
-				if file_obj:
+			# ------------------------------------------------------------------
+			# Namespace 1: FileSystem virtual file (not an absolute real path)
+			# ------------------------------------------------------------------
+			if not is_absolute_real_path and browser_session.is_local and file_system and file_system.get_dir():
+				file_obj = file_system.get_file(requested_path)
+				if file_obj is not None:
 					# Construct the upload path from the FileSystem-owned basename
 					# (file_obj.full_name), NOT from params.path. The agent-controlled
 					# params.path may contain '..' traversal sequences that escape
@@ -883,24 +896,45 @@ class Tools(Generic[Context]):
 					real_path = os.path.realpath(file_system_path)
 					real_dir = os.path.realpath(str(file_system.get_dir()))
 					if not (real_path == real_dir or real_path.startswith(real_dir + os.sep)):
-						msg = f'Upload of {params.path!r} escapes FileSystem directory; refusing.'
+						msg = f'Upload of {requested_path!r} escapes FileSystem directory; refusing.'
 						logger.error(f'❌ {msg}')
 						return ActionResult(error=msg)
 					resolved_path = file_system_path
 					path_allowed = True
 
-			# Check 4: For remote browsers, allow absolute remote paths
+			# ------------------------------------------------------------------
+			# Namespace 2: Real local path (absolute path OR basename not in FileSystem)
+			# ------------------------------------------------------------------
+			if not path_allowed and browser_session.is_local:
+				# Check 2a: available_file_paths (user-provided real paths)
+				if norm_requested_path and is_path_in_list(norm_requested_path, available_file_paths):
+					path_allowed = True
+					resolved_path = norm_requested_path
+
+				# Check 2b: Recently downloaded files (real CDP downloads)
+				if not path_allowed:
+					downloaded_files = browser_session.downloaded_files
+					if norm_requested_path and is_path_in_list(norm_requested_path, downloaded_files):
+						path_allowed = True
+						resolved_path = norm_requested_path
+
+			# ------------------------------------------------------------------
+			# Namespace 3 (remote only): remote browser absolute paths
+			# ------------------------------------------------------------------
 			if not path_allowed and not browser_session.is_local:
 				path_allowed = True
-				resolved_path = params.path
+				resolved_path = requested_path
 
+			# ------------------------------------------------------------------
+			# Final gate
+			# ------------------------------------------------------------------
 			if not path_allowed:
-				msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
+				msg = f'File path {requested_path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{requested_path}"])'
 				logger.error(f'❌ {msg}')
 				return ActionResult(error=msg)
 
 			# Update params with the resolved (normalized) path
-			if resolved_path != params.path:
+			if resolved_path != requested_path:
 				params = UploadFileAction(index=params.index, path=resolved_path)
 
 			# For local browsers, ensure the file exists and has content
@@ -1627,25 +1661,12 @@ You will be given a query and the markdown of a webpage that has been filtered t
 
 			file_size = file_path.stat().st_size
 
-			# Track the saved PDF in the browser session's downloaded files
-			# so it becomes available for subsequent read_file/upload_file actions
-			norm_path = browser_session.add_downloaded_file(file_path)
-
-			# Dispatch FileDownloadedEvent to notify all listeners (including Agent)
-			if norm_path:
-				from browser_use.browser.events import FileDownloadedEvent
-
-				browser_session.event_bus.dispatch(
-					FileDownloadedEvent(
-						url=str(file_path),
-						path=str(file_path),
-						file_name=file_name,
-						file_size=file_size,
-						file_type='pdf',
-						mime_type='application/pdf',
-						auto_download=False,
-					)
-				)
+			# NOTE: This PDF is saved to the FileSystem directory and tracked by
+			# the FileSystem instance. It is NOT added to browser_session.downloaded_files
+			# because that list is for REAL browser downloads (CDP events).
+			# FileSystem files live in a separate namespace — they are accessed by
+			# basename (e.g. "report.pdf") via read_file/write_file, and upload_file
+			# finds them through FileSystem.get_file() basename matching.
 
 			msg = f'Saved page as PDF: {file_name} ({file_size:,} bytes)'
 			logger.info(f'📄 {msg}. Full path: {file_path}')
@@ -1744,7 +1765,6 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			file_name: str,
 			content: str,
 			file_system: FileSystem,
-			browser_session: BrowserSession,
 			append: bool = False,
 			trailing_newline: bool = True,
 			leading_newline: bool = False,
@@ -1763,28 +1783,10 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			file_path = file_system.get_dir() / resolved_name
 			logger.info(f'💾 {result} File location: {file_path}')
 
-			# Track the written file in the browser session's downloaded files
-			# so it becomes available for subsequent read_file/upload_file actions
-			if file_path.exists():
-				norm_path = browser_session.add_downloaded_file(file_path)
-
-				# Dispatch FileDownloadedEvent to notify all listeners (including Agent)
-				if norm_path:
-					from browser_use.browser.events import FileDownloadedEvent
-
-					file_size = file_path.stat().st_size
-					file_ext = file_path.suffix.lower().lstrip('.')
-
-					browser_session.event_bus.dispatch(
-						FileDownloadedEvent(
-							url=str(file_path),
-							path=str(file_path),
-							file_name=resolved_name,
-							file_size=file_size,
-							file_type=file_ext if file_ext else None,
-							auto_download=False,
-						)
-					)
+			# NOTE: This file is tracked by the FileSystem instance. It is NOT
+			# added to browser_session.downloaded_files because that list is for
+			# REAL browser downloads (CDP events). FileSystem files are accessed
+			# by basename in their own namespace.
 
 			return ActionResult(extracted_content=result, long_term_memory=result)
 
@@ -1805,24 +1807,80 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			file_system: FileSystem,
 			browser_session: BrowserSession,
 		):
-			norm_file_name = normalize_path(file_name)
-			is_external = False
+			# Two namespaces:
+			# 1. FileSystem VIRTUAL filenames — basename like "todo.md", "data.csv",
+			#    and even traversal attempts like "../note.md". Anything NOT starting
+			#    with "/" or "~" is tried first against FileSystem because get_file()
+			#    safely takes the basename internally.
+			# 2. REAL LOCAL PATHS — absolute paths like "/Users/xx/Downloads/a.pdf"
+			#    or ~ paths that resolve to real files on disk. Must be allowlisted
+			#    in available_file_paths or browser_session.downloaded_files.
+			#
+			# Heuristic to distinguish:
+			#   - starts with '/' or '~' → treat as real local path
+			#   - everything else → try FileSystem first, fall back to real paths
 
-			# Check 1: available_file_paths (user-provided or downloaded files)
+
+			is_absolute_real_path = file_name.startswith('/') or file_name.startswith('~')
+
+			is_external = False
+			resolved_name = file_name
+
+			# --- Path A: not absolute → try FileSystem virtual namespace first ---
+			if not is_absolute_real_path:
+				fs_file = file_system.get_file(file_name)
+				if fs_file is not None:
+					# This is a FileSystem-managed file — read through FileSystem API
+					structured_result = await file_system.read_file_structured(file_name)
+					result = structured_result['message']
+					images = structured_result.get('images')
+
+					MAX_MEMORY_SIZE = 1000
+					if images:
+						memory = f'Read image file {file_name}'
+					elif len(result) > MAX_MEMORY_SIZE:
+						lines = result.splitlines()
+						display = ''
+						lines_count = 0
+						for line in lines:
+							if len(display) + len(line) < MAX_MEMORY_SIZE:
+								display += line + '\n'
+								lines_count += 1
+							else:
+								break
+						remaining_lines = len(lines) - lines_count
+						memory = f'{display}{remaining_lines} more lines...' if remaining_lines > 0 else display
+					else:
+						memory = result
+					logger.info(f'💾 {memory}')
+					return ActionResult(
+						extracted_content=result,
+						long_term_memory=memory,
+						images=images,
+						include_extracted_content_only_once=True,
+					)
+
+			# --- Path B: real local path (or basename not in FileSystem) ---
+			norm_file_name = normalize_path(file_name)
+
+			# Check real paths in order:
+			# 1. available_file_paths (user-provided real paths)
+			# 2. browser_session.downloaded_files (real CDP downloads)
 			if norm_file_name and is_path_in_list(norm_file_name, available_file_paths):
 				is_external = True
-				file_name = norm_file_name
+				resolved_name = norm_file_name
 
-			# Check 2: Recently downloaded files
 			if not is_external:
 				downloaded_files = browser_session.downloaded_files
 				if norm_file_name and is_path_in_list(norm_file_name, downloaded_files):
 					is_external = True
-					file_name = norm_file_name
+					resolved_name = norm_file_name
 
 			if is_external:
-				structured_result = await file_system.read_file_structured(file_name, external_file=True)
+				# Confirmed real local path — read with external_file=True
+				structured_result = await file_system.read_file_structured(resolved_name, external_file=True)
 			else:
+				# Fall back to FileSystem (may produce "file not found" error)
 				structured_result = await file_system.read_file_structured(file_name)
 
 			result = structured_result['message']
@@ -1831,7 +1889,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			MAX_MEMORY_SIZE = 1000
 			# For images, create a shorter memory message
 			if images:
-				memory = f'Read image file {file_name}'
+				memory = f'Read image file {resolved_name}'
 			elif len(result) > MAX_MEMORY_SIZE:
 				lines = result.splitlines()
 				display = ''
