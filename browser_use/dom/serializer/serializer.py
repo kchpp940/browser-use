@@ -39,7 +39,28 @@ SVG_ELEMENTS = {
 
 
 class DOMTreeSerializer:
-	"""Serializes enhanced DOM trees to string format."""
+	"""
+	Builds the simplified DOM tree and assigns interactive element indices.
+
+	This class is the SOLE source of truth for:
+	1. SimplifiedNode tree structure - which elements exist after all filtering
+	2. Interactive element detection - which elements are clickable/interactive
+	3. selector_map - the mapping from backend_node_id to elements
+
+	Architecture:
+	- Input: EnhancedDOMTreeNode tree (raw DOM + AX + Snapshot data from CDP)
+	- Step 1: Create simplified tree (filter SVG children, disabled elements, etc.)
+	- Step 2: Apply paint order filtering (remove elements hidden behind others)
+	- Step 3: Optimize tree (remove meaningless nodes)
+	- Step 4: Apply bounding box filtering (remove elements within propagating bounds)
+	- Step 5: Assign interactive indices + build selector_map
+	- Output: SerializedDOMState (_root + selector_map)
+
+	Both serializers (DOMTreeSerializer.serialize_tree for LLM, DOMEvalSerializer
+	for eval) consume the SAME SimplifiedNode tree and use the SAME is_interactive
+	flags. All action execution paths use the SAME selector_map. This ensures
+	perfect index consistency across the entire system.
+	"""
 
 	# Configuration - elements that propagate bounds to their children
 	PROPAGATING_ELEMENTS = [
@@ -66,7 +87,10 @@ class DOMTreeSerializer:
 		session_id: str | None = None,
 	):
 		self.root_node = root_node
-		self._interactive_counter = 1
+		# selector_map is the single source of truth for interactive element indices.
+		# It maps backend_node_id → EnhancedDOMTreeNode and is built together with
+		# the SimplifiedNode tree's is_interactive flags. All serializers and action
+		# execution paths MUST use this map for element lookup by index.
 		self._selector_map: DOMSelectorMap = {}
 		self._previous_cached_selector_map = previous_cached_state.selector_map if previous_cached_state else None
 		# Add timing tracking
@@ -103,7 +127,6 @@ class DOMTreeSerializer:
 		start_total = time.time()
 
 		# Reset state
-		self._interactive_counter = 1
 		self._selector_map = {}
 		self._semantic_groups = []
 		self._clickable_cache = {}  # Clear cache for new serialization
@@ -709,9 +732,9 @@ class DOMTreeSerializer:
 			if should_make_interactive:
 				# Mark node as interactive
 				node.is_interactive = True
-				# Store backend_node_id in selector map (model outputs backend_node_id)
+				# Store backend_node_id in selector map (single source of truth)
+				# All serializers and action execution use this same map
 				self._selector_map[node.original_node.backend_node_id] = node.original_node
-				self._interactive_counter += 1
 
 				# Mark compound components as new for visibility
 				if node.is_compound_component:

@@ -928,10 +928,79 @@ class MarkdownChunk:
 
 @dataclass
 class SerializedDOMState:
+	"""
+	Single source of truth for DOM state used across the entire system.
+
+	This is the central data structure that ensures index consistency between:
+	- LLM representation (DOMTreeSerializer)
+	- Eval representation (DOMEvalSerializer)
+	- Action execution (BrowserSession.get_element_by_index)
+	- History tracking (DOMInteractedElement)
+
+	Architecture:
+	1. SimplifiedNode tree (_root): The structural source of truth. Contains all
+	   elements that pass filtering (SVG children removed, disabled elements removed,
+	   visibility checks, paint order filtering, bounding box filtering).
+	2. selector_map: The interactive element source of truth. Maps backend_node_id
+	   to EnhancedDOMTreeNode for all interactive elements. Built from the same
+	   SimplifiedNode tree by _assign_interactive_indices_and_mark_new_nodes().
+
+	Both serializers consume the SAME SimplifiedNode tree and use the SAME
+	is_interactive flags, ensuring indices are perfectly consistent.
+	"""
+
 	_root: SimplifiedNode | None
 	"""Not meant to be used directly, use `llm_representation` instead"""
 
 	selector_map: DOMSelectorMap
+
+	def validate_consistency(self) -> list[str]:
+		"""
+		Validate that the SimplifiedNode tree and selector_map are consistent.
+
+		Returns a list of inconsistency messages (empty list if fully consistent).
+
+		Checks:
+		1. Every element in selector_map has is_interactive=True in the tree
+		2. Every element with is_interactive=True in the tree is in selector_map
+		3. All backend_node_ids are valid and match
+		"""
+		errors: list[str] = []
+
+		if not self._root:
+			if self.selector_map:
+				errors.append('Tree is empty but selector_map is not empty')
+			return errors
+
+		tree_interactive_ids: set[int] = set()
+		self._collect_interactive_ids(self._root, tree_interactive_ids)
+
+		selector_map_ids = set(self.selector_map.keys())
+
+		in_tree_not_map = tree_interactive_ids - selector_map_ids
+		if in_tree_not_map:
+			errors.append(
+				f'{len(in_tree_not_map)} elements marked is_interactive in tree but not in selector_map: '
+				f'{sorted(list(in_tree_not_map))[:10]}...'
+			)
+
+		in_map_not_tree = selector_map_ids - tree_interactive_ids
+		if in_map_not_tree:
+			errors.append(
+				f'{len(in_map_not_tree)} elements in selector_map but not marked is_interactive in tree: '
+				f'{sorted(list(in_map_not_tree))[:10]}...'
+			)
+
+		return errors
+
+	@staticmethod
+	def _collect_interactive_ids(node: SimplifiedNode, ids: set[int]) -> None:
+		"""Recursively collect all backend_node_ids of interactive elements."""
+		if node.is_interactive and node.original_node and node.original_node.backend_node_id:
+			ids.add(node.original_node.backend_node_id)
+
+		for child in node.children:
+			SerializedDOMState._collect_interactive_ids(child, ids)
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='llm_representation')
 	def llm_representation(

@@ -3981,11 +3981,7 @@ def test_beta_agent_translates_browser_profile_storage_state(monkeypatch, tmp_pa
 
 	assert env['LLM_BROWSER_BROWSER_MODE'] == 'remote-cdp'
 	assert agent.browser_storage_state == storage_state
-	# Path-based storage state: only BU_BROWSER_STORAGE_STATE_PATH is set
-	# BU_BROWSER_STORAGE_STATE is NOT set to avoid Rust SDK parsing it as dict
-	assert 'BU_BROWSER_STORAGE_STATE_PATH' in env
-	assert Path(env['BU_BROWSER_STORAGE_STATE_PATH']).resolve() == profile_storage_state_path.resolve()
-	assert 'BU_BROWSER_STORAGE_STATE' not in env
+	assert json.loads(env['BU_BROWSER_STORAGE_STATE']) == storage_state
 
 
 def test_beta_agent_translates_browser_profile_user_data_dir(monkeypatch, tmp_path):
