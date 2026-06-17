@@ -59,7 +59,13 @@ from browser_use.tools.views import (
 	SwitchTabAction,
 	UploadFileAction,
 )
-from browser_use.utils import create_task_with_error_handling, sanitize_surrogates, time_execution_sync
+from browser_use.utils import (
+	create_task_with_error_handling,
+	is_path_in_list,
+	normalize_path,
+	sanitize_surrogates,
+	time_execution_sync,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -839,50 +845,63 @@ class Tools(Generic[Context]):
 		async def upload_file(
 			params: UploadFileAction, browser_session: BrowserSession, available_file_paths: list[str], file_system: FileSystem
 		):
-			# Check if file is in available_file_paths (user-provided or downloaded files)
+			# Check if file is accessible using normalized path comparison
 			# For remote browsers (is_local=False), we allow absolute remote paths even if not tracked locally
-			if params.path not in available_file_paths:
-				# Also check if it's a recently downloaded file that might not be in available_file_paths yet
+
+			# Normalize the input path for consistent comparison
+			norm_requested_path = normalize_path(params.path)
+			path_allowed = False
+			resolved_path = params.path
+
+			# Check 1: available_file_paths (user-provided or downloaded files)
+			if norm_requested_path and is_path_in_list(norm_requested_path, available_file_paths):
+				path_allowed = True
+				resolved_path = norm_requested_path
+
+			# Check 2: Recently downloaded files that might not be in available_file_paths yet
+			if not path_allowed:
 				downloaded_files = browser_session.downloaded_files
-				if params.path not in downloaded_files:
-					# Finally, check if it's a file in the FileSystem service.
-					# Only rewrite to the local FileSystem path on local sessions —
-					# on remote sessions, params.path is meant to address a file on
-					# the remote machine, and a coincidental basename collision with
-					# a local managed file (e.g. `/tmp/note.md` colliding with a
-					# local `note.md`) must not silently upload the local file.
-					if browser_session.is_local and file_system and file_system.get_dir():
-						# Check if the file is actually managed by the FileSystem service
-						# The path should be just the filename for FileSystem files
-						file_obj = file_system.get_file(params.path)
-						if file_obj:
-							# Construct the upload path from the FileSystem-owned basename
-							# (file_obj.full_name), NOT from params.path. The agent-controlled
-							# params.path may contain '..' traversal sequences that escape
-							# data_dir when naively joined — get_file() matches by basename
-							# so a path like '../../../note.md' would otherwise resolve to a
-							# sibling file outside the FileSystem directory.
-							# GHSA-j9hj-92j8-jv9h.
-							file_system_path = str(file_system.get_dir() / file_obj.full_name)
-							# Defense in depth: refuse any path that resolves outside data_dir.
-							real_path = os.path.realpath(file_system_path)
-							real_dir = os.path.realpath(str(file_system.get_dir()))
-							if not (real_path == real_dir or real_path.startswith(real_dir + os.sep)):
-								msg = f'Upload of {params.path!r} escapes FileSystem directory; refusing.'
-								logger.error(f'❌ {msg}')
-								return ActionResult(error=msg)
-							params = UploadFileAction(index=params.index, path=file_system_path)
-						else:
-							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
-							logger.error(f'❌ {msg}')
-							return ActionResult(error=msg)
-					else:
-						# If browser is remote, allow passing a remote-accessible absolute path
-						if not browser_session.is_local:
-							pass
-						else:
-							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
-							raise BrowserError(message=msg, long_term_memory=msg)
+				if norm_requested_path and is_path_in_list(norm_requested_path, downloaded_files):
+					path_allowed = True
+					resolved_path = norm_requested_path
+
+			# Check 3: FileSystem service files
+			if not path_allowed and browser_session.is_local and file_system and file_system.get_dir():
+				# Check if the file is actually managed by the FileSystem service
+				# The path should be just the filename for FileSystem files
+				file_obj = file_system.get_file(params.path)
+				if file_obj:
+					# Construct the upload path from the FileSystem-owned basename
+					# (file_obj.full_name), NOT from params.path. The agent-controlled
+					# params.path may contain '..' traversal sequences that escape
+					# data_dir when naively joined — get_file() matches by basename
+					# so a path like '../../../note.md' would otherwise resolve to a
+					# sibling file outside the FileSystem directory.
+					# GHSA-j9hj-92j8-jv9h.
+					file_system_path = str(file_system.get_dir() / file_obj.full_name)
+					# Defense in depth: refuse any path that resolves outside data_dir.
+					real_path = os.path.realpath(file_system_path)
+					real_dir = os.path.realpath(str(file_system.get_dir()))
+					if not (real_path == real_dir or real_path.startswith(real_dir + os.sep)):
+						msg = f'Upload of {params.path!r} escapes FileSystem directory; refusing.'
+						logger.error(f'❌ {msg}')
+						return ActionResult(error=msg)
+					resolved_path = file_system_path
+					path_allowed = True
+
+			# Check 4: For remote browsers, allow absolute remote paths
+			if not path_allowed and not browser_session.is_local:
+				path_allowed = True
+				resolved_path = params.path
+
+			if not path_allowed:
+				msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
+				logger.error(f'❌ {msg}')
+				return ActionResult(error=msg)
+
+			# Update params with the resolved (normalized) path
+			if resolved_path != params.path:
+				params = UploadFileAction(index=params.index, path=resolved_path)
 
 			# For local browsers, ensure the file exists and has content
 			if browser_session.is_local:
@@ -1607,6 +1626,27 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				await f.write(pdf_bytes)
 
 			file_size = file_path.stat().st_size
+
+			# Track the saved PDF in the browser session's downloaded files
+			# so it becomes available for subsequent read_file/upload_file actions
+			norm_path = browser_session.add_downloaded_file(file_path)
+
+			# Dispatch FileDownloadedEvent to notify all listeners (including Agent)
+			if norm_path:
+				from browser_use.browser.events import FileDownloadedEvent
+
+				browser_session.event_bus.dispatch(
+					FileDownloadedEvent(
+						url=str(file_path),
+						path=str(file_path),
+						file_name=file_name,
+						file_size=file_size,
+						file_type='pdf',
+						mime_type='application/pdf',
+						auto_download=False,
+					)
+				)
+
 			msg = f'Saved page as PDF: {file_name} ({file_size:,} bytes)'
 			logger.info(f'📄 {msg}. Full path: {file_path}')
 
@@ -1704,6 +1744,7 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			file_name: str,
 			content: str,
 			file_system: FileSystem,
+			browser_session: BrowserSession,
 			append: bool = False,
 			trailing_newline: bool = True,
 			leading_newline: bool = False,
@@ -1722,6 +1763,29 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			file_path = file_system.get_dir() / resolved_name
 			logger.info(f'💾 {result} File location: {file_path}')
 
+			# Track the written file in the browser session's downloaded files
+			# so it becomes available for subsequent read_file/upload_file actions
+			if file_path.exists():
+				norm_path = browser_session.add_downloaded_file(file_path)
+
+				# Dispatch FileDownloadedEvent to notify all listeners (including Agent)
+				if norm_path:
+					from browser_use.browser.events import FileDownloadedEvent
+
+					file_size = file_path.stat().st_size
+					file_ext = file_path.suffix.lower().lstrip('.')
+
+					browser_session.event_bus.dispatch(
+						FileDownloadedEvent(
+							url=str(file_path),
+							path=str(file_path),
+							file_name=resolved_name,
+							file_size=file_size,
+							file_type=file_ext if file_ext else None,
+							auto_download=False,
+						)
+					)
+
 			return ActionResult(extracted_content=result, long_term_memory=result)
 
 		@self.registry.action(
@@ -1735,8 +1799,28 @@ You will be given a query and the markdown of a webpage that has been filtered t
 		@self.registry.action(
 			'Read the complete content of a file. Use this to view file contents before editing or to retrieve data from files. Supports text files (txt, md, json, csv, jsonl), documents (pdf, docx), and images (jpg, png).'
 		)
-		async def read_file(file_name: str, available_file_paths: list[str], file_system: FileSystem):
-			if available_file_paths and file_name in available_file_paths:
+		async def read_file(
+			file_name: str,
+			available_file_paths: list[str],
+			file_system: FileSystem,
+			browser_session: BrowserSession,
+		):
+			norm_file_name = normalize_path(file_name)
+			is_external = False
+
+			# Check 1: available_file_paths (user-provided or downloaded files)
+			if norm_file_name and is_path_in_list(norm_file_name, available_file_paths):
+				is_external = True
+				file_name = norm_file_name
+
+			# Check 2: Recently downloaded files
+			if not is_external:
+				downloaded_files = browser_session.downloaded_files
+				if norm_file_name and is_path_in_list(norm_file_name, downloaded_files):
+					is_external = True
+					file_name = norm_file_name
+
+			if is_external:
 				structured_result = await file_system.read_file_structured(file_name, external_file=True)
 			else:
 				structured_result = await file_system.read_file_structured(file_name)

@@ -21,9 +21,8 @@ from pydantic import BaseModel
 
 from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelParseError, ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
-from browser_use.llm.parser import AgentOutputParser, NormalizedLLMResponse, NormalizedToolCall
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
@@ -387,75 +386,51 @@ class ChatAnthropic(BaseChatModel):
 					)
 
 				usage = self._get_usage(response)
-				response_text, thinking, redacted_thinking = self._extract_content_blocks(response)
 
-				# Build normalized response
-				tool_calls: list[NormalizedToolCall] = []
+				# Extract the tool use block
 				for content_block in response.content:
 					if hasattr(content_block, 'type') and content_block.type == 'tool_use':
-						tool_id = getattr(content_block, 'id', None)
-						tool_name = getattr(content_block, 'name', output_format.__name__)
-						tool_input = getattr(content_block, 'input', {})
-						tool_calls.append(
-							NormalizedToolCall(
-								id=tool_id,
-								name=tool_name,
-								arguments=tool_input,
+						# Parse the tool input as the structured output
+						try:
+							return ChatInvokeCompletion(
+								completion=output_format.model_validate(content_block.input),
+								usage=usage,
+								stop_reason=response.stop_reason,
+								stop_details=self._get_stop_details(response),
 							)
-						)
+						except Exception as e:
+							# If validation fails, try to fix common model output issues
+							_input = content_block.input
+							if isinstance(_input, str):
+								_input = json.loads(_input)
+							elif isinstance(_input, dict):
+								# Model sometimes double-serializes fields
+								for key, value in _input.items():
+									if isinstance(value, str) and value.startswith(('[', '{')):
+										try:
+											_input[key] = json.loads(value)
+										except json.JSONDecodeError:
+											cleaned = value.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+											try:
+												_input[key] = json.loads(cleaned)
+											except json.JSONDecodeError:
+												pass
+							else:
+								raise
+							return ChatInvokeCompletion(
+								completion=output_format.model_validate(_input),
+								usage=usage,
+								stop_reason=response.stop_reason,
+								stop_details=self._get_stop_details(response),
+							)
 
-				normalized = NormalizedLLMResponse(
-					raw_text=response_text,
-					tool_calls=tool_calls,
-					thinking=thinking,
-					redacted_thinking=redacted_thinking,
-					stop_reason=response.stop_reason,
-					stop_details=self._get_stop_details(response),
-				)
+				if self._requires_auto_tool_choice():
+					text_completion = self._completion_from_text_response(response, output_format, usage)
+					if text_completion is not None:
+						return text_completion
 
-				try:
-					parsed = AgentOutputParser(output_format).parse(normalized)
-				except ModelParseError as e:
-					# For auto_tool_choice models, fall back to text-based parsing
-					if self._requires_auto_tool_choice() and normalized.raw_text:
-						parser = AgentOutputParser(output_format)
-						for candidate in parser._generate_candidates(normalized.raw_text):
-							result = parser._try_validate_json(candidate)
-							if result is not None:
-								return ChatInvokeCompletion(
-									completion=result,
-									thinking=thinking,
-									redacted_thinking=redacted_thinking,
-									usage=usage,
-									stop_reason=response.stop_reason,
-									stop_details=self._get_stop_details(response),
-								)
-							try:
-								data = json.loads(candidate)
-								if isinstance(data, dict):
-									result = parser._try_validate_dict(data)
-									if result is not None:
-										return ChatInvokeCompletion(
-											completion=result,
-											thinking=thinking,
-											redacted_thinking=redacted_thinking,
-											usage=usage,
-											stop_reason=response.stop_reason,
-											stop_details=self._get_stop_details(response),
-										)
-							except json.JSONDecodeError:
-								continue
-					e.model = self.name
-					raise
-
-				return ChatInvokeCompletion(
-					completion=parsed,
-					thinking=thinking,
-					redacted_thinking=redacted_thinking,
-					usage=usage,
-					stop_reason=response.stop_reason,
-					stop_details=self._get_stop_details(response),
-				)
+				# If no tool use block found, raise an error
+				raise ValueError('Expected tool use in response but none found')
 
 		except APIConnectionError as e:
 			raise ModelProviderError(message=e.message, model=self.name) from e

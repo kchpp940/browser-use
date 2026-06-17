@@ -56,7 +56,13 @@ from browser_use.browser.profile import BrowserProfile, ProxySettings
 from browser_use.browser.views import BrowserStateSummary, TabInfo
 from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, TargetInfo
 from browser_use.observability import observe_debug
-from browser_use.utils import _log_pretty_url, create_task_with_error_handling, is_new_tab_page
+from browser_use.utils import (
+	_log_pretty_url,
+	create_task_with_error_handling,
+	is_new_tab_page,
+	is_path_in_list,
+	normalize_path,
+)
 
 if TYPE_CHECKING:
 	from browser_use.actor.page import Page
@@ -1207,14 +1213,36 @@ class BrowserSession(BaseModel):
 	async def on_FileDownloadedEvent(self, event: FileDownloadedEvent) -> None:
 		"""Track downloaded files during this session."""
 		self.logger.debug(f'FileDownloadedEvent received: {event.file_name} at {event.path}')
-		if event.path and event.path not in self._downloaded_files:
-			self._downloaded_files.append(event.path)
-			self.logger.info(f'📁 Tracked download: {event.file_name} ({len(self._downloaded_files)} total downloads in session)')
-		else:
-			if not event.path:
-				self.logger.warning(f'FileDownloadedEvent has no path: {event}')
+		norm_path = normalize_path(event.path)
+		if norm_path:
+			if not is_path_in_list(norm_path, self._downloaded_files):
+				self._downloaded_files.append(norm_path)
+				self.logger.info(
+					f'📁 Tracked download: {event.file_name} ({len(self._downloaded_files)} total downloads in session)'
+				)
 			else:
-				self.logger.debug(f'File already tracked: {event.path}')
+				self.logger.debug(f'File already tracked (normalized): {norm_path}')
+		else:
+			self.logger.warning(f'FileDownloadedEvent has invalid path: {event}')
+
+	def add_downloaded_file(self, path: str | Path) -> str | None:
+		"""Manually add a file to the downloaded files list.
+
+		Used by save_as_pdf, write_file, and other tools that save files
+		outside the CDP download flow to ensure they're visible to the agent.
+
+		Args:
+			path: Path to the file to add
+
+		Returns:
+			Normalized path if added, None if path was invalid or already present
+		"""
+		norm_path = normalize_path(path)
+		if norm_path and not is_path_in_list(norm_path, self._downloaded_files):
+			self._downloaded_files.append(norm_path)
+			self.logger.debug(f'📁 Manually tracked file: {norm_path}')
+			return norm_path
+		return None
 
 	def _cloud_session_id_from_cdp_url(self) -> str | None:
 		"""Derive cloud browser session ID from a Browser Use CDP URL."""
@@ -3273,9 +3301,14 @@ class BrowserSession(BaseModel):
 		"""Get list of files downloaded during this browser session.
 
 		Returns:
-			list[str]: List of absolute file paths to downloaded files in this session
+			list[str]: List of normalized absolute file paths to downloaded files in this session
 		"""
-		return self._downloaded_files.copy()
+		result: list[str] = []
+		for p in self._downloaded_files:
+			norm = normalize_path(p)
+			if norm is not None:
+				result.append(norm)
+		return result
 
 	# endregion - ========== Helper Methods ==========
 

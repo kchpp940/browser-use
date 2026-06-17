@@ -1,38 +1,17 @@
 import base64
-import json
 
-from google.genai.types import Content, ContentListUnion, FunctionCall, Part
+from google.genai.types import Content, ContentListUnion, Part
 
 from browser_use.llm.messages import (
 	AssistantMessage,
 	BaseMessage,
 	SystemMessage,
-	ToolCall,
 	UserMessage,
 )
 
 
 class GoogleMessageSerializer:
 	"""Serializer for converting messages to Google Gemini format."""
-
-	@staticmethod
-	def _serialize_tool_calls(tool_calls: list[ToolCall]) -> list[Part]:
-		"""Convert browser-use ToolCalls to Gemini FunctionCall parts."""
-		parts: list[Part] = []
-		for tool_call in tool_calls:
-			try:
-				args = json.loads(tool_call.function.arguments)
-			except json.JSONDecodeError:
-				args = {'arguments': tool_call.function.arguments}
-			parts.append(
-				Part(
-					function_call=FunctionCall(
-						name=tool_call.function.name,
-						args=args,
-					)
-				)
-			)
-		return parts
 
 	@staticmethod
 	def serialize_messages(
@@ -134,11 +113,6 @@ class GoogleMessageSerializer:
 							image_part = Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
 							message_parts.append(image_part)
-
-				# Handle tool calls for assistant messages
-				if isinstance(message, AssistantMessage) and message.tool_calls:
-					tool_call_parts = GoogleMessageSerializer._serialize_tool_calls(message.tool_calls)
-					message_parts.extend(tool_call_parts)
 
 			# Create the Content object
 			if message_parts:

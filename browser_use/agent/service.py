@@ -78,6 +78,7 @@ from browser_use.utils import (
 	check_latest_browser_use_version,
 	get_browser_use_version,
 	is_placeholder_url,
+	normalize_path,
 	sanitize_url_candidate,
 	time_execution_async,
 	time_execution_sync,
@@ -652,17 +653,59 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		return self.llm.model if hasattr(self.llm, 'model') else 'unknown'
 
 	async def _check_and_update_downloads(self, context: str = '') -> None:
-		"""Check for new downloads and update available file paths."""
+		"""Check for new downloads and update available file paths.
+
+		Collects files from three sources:
+		1. Browser session downloads (CDP download events)
+		2. FileSystem managed files (save_as_pdf, write_file, etc.)
+		3. Existing available_file_paths
+
+		All paths are normalized before comparison to avoid duplicates
+		from relative/absolute path mismatches.
+		"""
 		if not self.has_downloads_path:
 			return
 
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 
 		try:
-			current_downloads = self.browser_session.downloaded_files
-			if current_downloads != self._last_known_downloads:
-				self._update_available_file_paths(current_downloads)
-				self._last_known_downloads = current_downloads
+			all_downloads: list[str] = []
+
+			# Source 1: Browser session downloads (normalized at source)
+			session_downloads = self.browser_session.downloaded_files
+			all_downloads.extend(session_downloads)
+
+			# Source 2: FileSystem managed files (save_as_pdf, write_file, etc.)
+			if self.file_system and self.file_system.get_dir():
+				fs_dir = self.file_system.get_dir()
+				try:
+					for file_path in Path(fs_dir).iterdir():
+						if file_path.is_file() and not file_path.name.startswith('.'):
+							norm_path = normalize_path(file_path)
+							if norm_path:
+								all_downloads.append(norm_path)
+				except Exception as e:
+					self.logger.debug(f'📁 Failed to scan FileSystem directory: {type(e).__name__}: {e}')
+
+			# Normalize and deduplicate
+			norm_all_downloads: list[str] = []
+			for p in all_downloads:
+				norm = normalize_path(p)
+				if norm is not None:
+					norm_all_downloads.append(norm)
+			unique_downloads = list(dict.fromkeys(norm_all_downloads))
+
+			last_known_set: set[str] = set()
+			for p in self._last_known_downloads:
+				norm = normalize_path(p)
+				if norm is not None:
+					last_known_set.add(norm)
+
+			current_set = set(unique_downloads)
+
+			if current_set != last_known_set:
+				self._update_available_file_paths(unique_downloads)
+				self._last_known_downloads = list(unique_downloads)
 				if context:
 					self.logger.debug(f'📁 {context}: Updated available files')
 		except Exception as e:
@@ -670,15 +713,31 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug(f'📁 Failed to check for downloads{error_context}: {type(e).__name__}: {e}')
 
 	def _update_available_file_paths(self, downloads: list[str]) -> None:
-		"""Update available_file_paths with downloaded files."""
+		"""Update available_file_paths with downloaded files using normalized path comparison.
+
+		Args:
+			downloads: List of file paths to add (should already be normalized)
+		"""
 		if not self.has_downloads_path:
 			return
 
-		current_files = set(self.available_file_paths or [])
-		new_files = set(downloads) - current_files
+		# Normalize existing available_file_paths
+		existing_normalized: dict[str, str] = {}
+		for p in self.available_file_paths or []:
+			norm = normalize_path(p)
+			if norm is not None:
+				existing_normalized[norm] = norm
+
+		new_files: list[str] = []
+		for download_path in downloads:
+			norm_path = normalize_path(download_path)
+			if norm_path and norm_path not in existing_normalized:
+				new_files.append(norm_path)
+				existing_normalized[norm_path] = norm_path
 
 		if new_files:
-			self.available_file_paths = list(current_files | new_files)
+			# Rebuild available_file_paths with all normalized unique paths
+			self.available_file_paths = list(existing_normalized.values())
 
 			self.logger.info(
 				f'📁 Added {len(new_files)} downloaded files to available_file_paths (total: {len(self.available_file_paths)} files)'
@@ -686,7 +745,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			for file_path in new_files:
 				self.logger.info(f'📄 New file available: {file_path}')
 		else:
-			self.logger.debug(f'📁 No new downloads detected (tracking {len(current_files)} files)')
+			self.logger.debug(f'📁 No new downloads detected (tracking {len(existing_normalized)} files)')
 
 	def _set_file_system(self, file_system_path: str | None = None) -> None:
 		# Check for conflicting parameters
@@ -1660,68 +1719,40 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				self.logger.info(judge_log)
 
 	async def _get_model_output_with_retry(self, input_messages: list[BaseMessage]) -> AgentOutput:
-		"""Get model output with retry logic for empty actions and validation errors"""
-		max_retries = 2
+		"""Get model output with retry logic for empty actions"""
+		model_output = await self.get_model_output(input_messages)
+		self.logger.debug(
+			f'✅ Step {self.state.n_steps}: Got LLM response with {len(model_output.action) if model_output.action else 0} actions'
+		)
 
-		for attempt in range(max_retries + 1):
-			try:
-				model_output = await self.get_model_output(input_messages)
-				self.logger.debug(
-					f'✅ Step {self.state.n_steps}: Got LLM response with {len(model_output.action) if model_output.action else 0} actions'
+		if (
+			not model_output.action
+			or not isinstance(model_output.action, list)
+			or all(action.model_dump() == {} for action in model_output.action)
+		):
+			self.logger.warning('Model returned empty action. Retrying...')
+
+			clarification_message = UserMessage(
+				content='You forgot to return an action. Please respond with a valid JSON action according to the expected schema with your assessment and next actions.'
+			)
+
+			retry_messages = input_messages + [clarification_message]
+			model_output = await self.get_model_output(retry_messages)
+
+			if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
+				self.logger.warning('Model still returned empty after retry. Inserting safe noop action.')
+				action_instance = self.ActionModel()
+				setattr(
+					action_instance,
+					'done',
+					{
+						'success': False,
+						'text': 'No next action returned by LLM!',
+					},
 				)
+				model_output.action = [action_instance]
 
-				if (
-					not model_output.action
-					or not isinstance(model_output.action, list)
-					or all(action.model_dump() == {} for action in model_output.action)
-				):
-					if attempt < max_retries:
-						self.logger.warning(f'Model returned empty action (attempt {attempt + 1}/{max_retries + 1}). Retrying...')
-						clarification_message = UserMessage(
-							content='You forgot to return an action. Please respond with a valid JSON action according to the expected schema with your assessment and next actions. Make sure to include at least one action in the "action" array.'
-						)
-						input_messages = input_messages + [clarification_message]
-						continue
-					else:
-						self.logger.warning('Model still returned empty after retries. Inserting safe noop action.')
-						action_instance = self.ActionModel()
-						setattr(
-							action_instance,
-							'done',
-							{
-								'success': False,
-								'text': 'No next action returned by LLM!',
-							},
-						)
-						model_output.action = [action_instance]
-
-				return model_output
-
-			except ValidationError as e:
-				if attempt < max_retries:
-					self.logger.warning(
-						f'Model output failed validation (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying with schema hints...'
-					)
-					error_details = []
-					for err in e.errors():
-						loc = '.'.join(str(loc_item) for loc_item in err.get('loc', []))
-						msg = err.get('msg', '')
-						error_details.append(f'- Field "{loc}": {msg}')
-					error_summary = '\n'.join(error_details)
-					retry_hint = (
-						f'Your previous response failed validation with these errors:\n{error_summary}\n\n'
-						f'Please respond with a valid JSON object matching the required schema. '
-						f'Ensure all required fields are present and have the correct types. '
-						f'Pay special attention to the "action" array - it must contain valid action objects.'
-					)
-					clarification_message = UserMessage(content=retry_hint)
-					input_messages = input_messages + [clarification_message]
-					continue
-				else:
-					self.logger.error(f'Validation failed after {max_retries + 1} attempts: {e}')
-					raise
-
-		raise RuntimeError('Retry loop completed without return')
+		return model_output
 
 	async def _handle_post_llm_processing(
 		self,
@@ -1989,17 +2020,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			self._log_next_action_summary(parsed)
 			return parsed
-		except ValidationError as e:
-			self.logger.warning(f'⚠️ Model output failed validation: {e}')
-			# Try fallback LLM on validation errors too - different provider may handle schema better
-			wrapped_error = ModelProviderError(
-				message=f'Output validation failed: {str(e)}',
-				status_code=500,
-				model=getattr(self.llm, 'name', 'unknown'),
-			)
-			if not self._try_switch_to_fallback_llm(wrapped_error):
-				raise
-			return await self.get_model_output(input_messages)
+		except ValidationError:
+			# Just re-raise - Pydantic's validation errors are already descriptive
+			raise
 		except (ModelRateLimitError, ModelProviderError) as e:
 			# Check if we can switch to a fallback LLM
 			if not self._try_switch_to_fallback_llm(e):

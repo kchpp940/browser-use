@@ -12,10 +12,9 @@ from openai.types.shared_params.response_format_json_schema import (
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelParseError, ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openrouter.serializer import OpenRouterMessageSerializer
-from browser_use.llm.parser import AgentOutputParser, NormalizedLLMResponse, NormalizedToolCall
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
@@ -186,39 +185,15 @@ class ChatOpenRouter(BaseChatModel):
 					**(self.extra_body or {}),
 				)
 
-				choice = response.choices[0] if response.choices else None
-				if choice is None:
+				if response.choices[0].message.content is None:
 					raise ModelProviderError(
-						message='Empty choices returned by OpenRouter',
-						status_code=502,
+						message='Failed to parse structured output from model response',
+						status_code=500,
 						model=self.name,
 					)
-				msg = choice.message
 				usage = self._get_usage(response)
 
-				# Extract tool_calls if present
-				tool_calls_list: list[NormalizedToolCall] = []
-				if getattr(msg, 'tool_calls', None):
-					for tc in msg.tool_calls:
-						tool_calls_list.append(
-							NormalizedToolCall(
-								id=getattr(tc, 'id', None),
-								name=tc.function.name,
-								arguments=tc.function.arguments,
-							)
-						)
-
-				normalized = NormalizedLLMResponse(
-					raw_text=msg.content or '',
-					refusal=getattr(msg, 'refusal', None),
-					tool_calls=tool_calls_list,
-					stop_reason=choice.finish_reason,
-				)
-				try:
-					parsed = AgentOutputParser(output_format).parse(normalized)
-				except ModelParseError as e:
-					e.model = self.name
-					raise
+				parsed = output_format.model_validate_json(response.choices[0].message.content)
 
 				return ChatInvokeCompletion(
 					completion=parsed,

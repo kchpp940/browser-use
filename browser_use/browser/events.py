@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.dom.views import EnhancedDOMTreeNode
+from browser_use.utils import normalize_path
 
 
 def _get_timeout(env_var: str, default: float) -> float | None:
@@ -577,6 +578,17 @@ class FileDownloadedEvent(BaseEvent):
 	auto_download: bool = False  # Whether this was an automatic download (e.g., PDF auto-download)
 
 	event_timeout: float | None = Field(default_factory=lambda: _get_timeout('TIMEOUT_FileDownloadedEvent', 30.0))  # seconds
+
+	@field_validator('path', mode='before')
+	@classmethod
+	def normalize_path_field(cls, value: Any) -> str:
+		"""Normalize the path field to a consistent absolute path format."""
+		if value is None:
+			raise ValueError('FileDownloadedEvent.path cannot be None')
+		normalized = normalize_path(value)
+		if normalized is None:
+			raise ValueError(f'FileDownloadedEvent.path is invalid: {value}')
+		return normalized
 
 
 class AboutBlankDVDScreensaverShownEvent(BaseEvent):

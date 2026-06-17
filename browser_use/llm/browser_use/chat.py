@@ -6,7 +6,6 @@ for optimized browser automation LLM inference.
 """
 
 import asyncio
-import json
 import logging
 import os
 import random
@@ -221,34 +220,36 @@ class ChatBrowserUse(BaseChatModel):
 			raise RuntimeError('Retry loop completed without return or exception')
 
 		# Parse response - server returns structured data as dict
-		from browser_use.llm.exceptions import ModelParseError
-		from browser_use.llm.parser import AgentOutputParser, NormalizedLLMResponse
-
-		# Parse usage info first (used in both branches)
-		usage = None
-		if 'usage' in result and result['usage'] is not None:
-			from browser_use.llm.views import ChatInvokeUsage
-
-			usage = ChatInvokeUsage(**result['usage'])
-
 		if output_format is not None:
-			# Server returns structured data as a dict, validate it via unified parser
+			# Server returns structured data as a dict, validate it
 			completion_data = result['completion']
 			logger.debug(
 				f'📥 Got structured data from service: {list(completion_data.keys()) if isinstance(completion_data, dict) else type(completion_data)}'
 			)
 
-			normalized = NormalizedLLMResponse(
-				parsed_dict=completion_data if isinstance(completion_data, dict) else None,
-				raw_text=(json.dumps(completion_data) if isinstance(completion_data, dict) else str(completion_data)),
-			)
-			try:
-				completion = AgentOutputParser(output_format).parse(normalized)
-			except ModelParseError as e:
-				e.model = self.name
-				raise
+			# Convert action dicts to ActionModel instances if needed
+			# llm-use returns dicts to avoid validation with empty ActionModel
+			if isinstance(completion_data, dict) and 'action' in completion_data:
+				actions = completion_data['action']
+				if actions and isinstance(actions[0], dict):
+					from typing import get_args
+
+					# Get ActionModel type from output_format
+					action_model_type = get_args(output_format.model_fields['action'].annotation)[0]
+
+					# Convert dicts to ActionModel instances
+					completion_data['action'] = [action_model_type.model_validate(action_dict) for action_dict in actions]
+
+			completion = output_format.model_validate(completion_data)
 		else:
 			completion = result['completion']
+
+		# Parse usage info
+		usage = None
+		if 'usage' in result and result['usage'] is not None:
+			from browser_use.llm.views import ChatInvokeUsage
+
+			usage = ChatInvokeUsage(**result['usage'])
 
 		return ChatInvokeCompletion(
 			completion=completion,

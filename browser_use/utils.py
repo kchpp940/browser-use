@@ -866,3 +866,108 @@ def sanitize_surrogates(text: str) -> str:
 		Text with surrogate characters removed
 	"""
 	return text.encode('utf-8', errors='ignore').decode('utf-8')
+
+
+def normalize_path(path: str | Path | None) -> str | None:
+	"""Normalize a file path to a consistent absolute path format.
+
+	Handles:
+	- None → None
+	- Empty string → None
+	- ~ expansion
+	- Relative → absolute resolution
+	- . and .. components
+	- Symlink resolution (realpath)
+	- Trailing slashes
+	- Path separators normalization
+
+	Args:
+		path: The path to normalize (string or Path)
+
+	Returns:
+		Normalized absolute path string, or None if input is invalid
+	"""
+	if path is None:
+		return None
+
+	path_str = str(path).strip()
+	if not path_str:
+		return None
+
+	try:
+		# Expand user (~) and resolve to absolute path, resolving symlinks
+		normalized = Path(path_str).expanduser().resolve()
+		return str(normalized)
+	except Exception:
+		# If resolution fails, try basic normalization without symlink resolution
+		try:
+			normalized = Path(path_str).expanduser().absolute()
+			return str(normalized)
+		except Exception:
+			# Last resort: return the original string trimmed
+			return path_str
+
+
+def paths_equal(path1: str | Path | None, path2: str | Path | None) -> bool:
+	"""Check if two paths are equal after normalization.
+
+	Args:
+		path1: First path to compare
+		path2: Second path to compare
+
+	Returns:
+		True if both paths normalize to the same value, False otherwise
+	"""
+	norm1 = normalize_path(path1)
+	norm2 = normalize_path(path2)
+
+	if norm1 is None and norm2 is None:
+		return True
+	if norm1 is None or norm2 is None:
+		return False
+
+	return norm1 == norm2
+
+
+def is_path_in_list(path: str | Path, path_list: list[str] | None) -> bool:
+	"""Check if a path exists in a list after normalization.
+
+	Args:
+		path: The path to check
+		path_list: List of paths to check against
+
+	Returns:
+		True if the normalized path exists in the normalized list
+	"""
+	if path_list is None:
+		return False
+
+	norm_path = normalize_path(path)
+	if norm_path is None:
+		return False
+
+	norm_list = {normalize_path(p) for p in path_list if normalize_path(p) is not None}
+	return norm_path in norm_list
+
+
+def add_path_to_list(path: str | Path, path_list: list[str]) -> list[str]:
+	"""Add a path to a list, ensuring no duplicates after normalization.
+
+	Args:
+		path: The path to add
+		path_list: The existing list of paths
+
+	Returns:
+		Updated list with the path added if not already present
+	"""
+	norm_path = normalize_path(path)
+	if norm_path is None:
+		return path_list
+
+	# Normalize existing paths and check for duplicates
+	norm_existing = {normalize_path(p): p for p in path_list if normalize_path(p) is not None}
+
+	if norm_path not in norm_existing:
+		path_list.append(norm_path)
+
+	return path_list

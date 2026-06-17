@@ -27,15 +27,3 @@ class ModelRateLimitError(ModelProviderError):
 		model: str | None = None,
 	):
 		super().__init__(message, status_code, model)
-
-
-class ModelParseError(ModelProviderError):
-	"""Exception raised when the model response cannot be parsed into the expected schema."""
-
-	def __init__(
-		self,
-		message: str,
-		status_code: int = 500,
-		model: str | None = None,
-	):
-		super().__init__(message, status_code, model)
