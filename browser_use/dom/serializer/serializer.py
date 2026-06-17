@@ -170,21 +170,44 @@ class DOMTreeSerializer:
 
 		state = SerializedDOMState(_root=filtered_tree, selector_map=self._selector_map)
 
-		# Validate consistency between tree and selector_map (single source of truth guarantee)
-		# This ensures every element marked is_interactive in the tree is in the selector_map,
-		# and every element in the selector_map is marked is_interactive in the tree.
-		inconsistencies = state.validate_consistency()
-		if inconsistencies:
+		# ── Runtime Consistency Gate (single source of truth enforcement) ──
+		# Stage 1: Auto-fix mode - run unified index pruning + tree/map alignment
+		# This catches any edge case where earlier filtering stages missed a node.
+		issues = state.validate_consistency(auto_fix=True)
+
+		if issues:
 			import logging
 
 			logger = logging.getLogger('browser_use.dom.serializer')
-			logger.error(
-				f'❌ DOM index inconsistency detected! {len(inconsistencies)} issues found:'
-			)
-			for msg in inconsistencies[:5]:
-				logger.error(f'   - {msg}')
-			if len(inconsistencies) > 5:
-				logger.error(f'   - ... and {len(inconsistencies) - 5} more')
+			pruned_msgs = [m for m in issues if m.startswith('[PRUNED]')]
+			fixed_msgs = [m for m in issues if m.startswith('[FIXED]')]
+			remaining = [m for m in issues if not m.startswith('[PRUNED]') and not m.startswith('[FIXED]')]
+
+			if pruned_msgs:
+				for m in pruned_msgs:
+					logger.info(f'🧹 DOM index pruning applied: {m}')
+			if fixed_msgs:
+				for m in fixed_msgs:
+					logger.warning(f'🔧 DOM index inconsistency auto-fixed: {m}')
+			if remaining:
+				for m in remaining[:5]:
+					logger.error(f'❌ DOM index issue NOT resolved: {m}')
+
+			# Stage 2: Verify that auto-fix actually produced a consistent state.
+			# If auto-fix failed (shouldn't happen unless there's a structural bug),
+			# log a critical error - but we still return the (partially fixed) state
+			# rather than crashing the agent loop.
+			post_fix_issues = state.validate_consistency(auto_fix=False)
+			if post_fix_issues:
+				logger.critical(
+					f'🚨 DOM index consistency GATE FAILED after auto-fix! '
+					f'{len(post_fix_issues)} unresolved issues. '
+					f'LLM will receive a partially inconsistent DOM. This indicates a bug in the serializer.'
+				)
+				for m in post_fix_issues[:5]:
+					logger.critical(f'   - {m}')
+			else:
+				logger.info('✅ DOM index consistency verified after auto-fix.')
 
 		return state, self.timing_info
 
