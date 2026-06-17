@@ -24,6 +24,7 @@ from browser_use.sandbox.views import (
 	SSEEvent,
 	SSEEventType,
 )
+from browser_use.utils import logger
 
 if TYPE_CHECKING:
 	from browser_use.browser import BrowserSession
@@ -348,20 +349,63 @@ async def run(browser):
 
 """
 
-			# 9. Send to server
+			# 9. Build unified browser config using the SAME merge path as all entry points
+			# This ensures cloud/sandbox uses identical config priority as Python API, TUI, skill_cli
+			from browser_use.browser.profile import BrowserProfile
+
+			# Build CLI args from decorator parameters (these take precedence over env/config)
+			sandbox_cli_args: dict[str, Any] = {}
+			if cloud_profile_id is not None:
+				sandbox_cli_args['cloud_profile_id'] = cloud_profile_id
+			if cloud_proxy_country_code is not None:
+				sandbox_cli_args['cloud_proxy_country_code'] = cloud_proxy_country_code
+			if cloud_timeout is not None:
+				sandbox_cli_args['cloud_timeout'] = cloud_timeout
+
+			# Merge config using UNIFIED factory — same path as all other entry points
+			# Priority: direct_kwargs (none here) > CLI args (decorator params) > env > config.json > defaults
+			unified_profile = BrowserProfile.from_config_sources(
+				direct_kwargs=None,
+				cli_args=sandbox_cli_args,
+				load_from_env=True,
+				load_from_config_file=True,
+			)
+
+			# Extract cloud params from nested structure
+			cloud_params = unified_profile.cloud_browser_params
+			resolved_profile_id = cloud_params.profile_id if cloud_params else None
+			resolved_proxy_code = cloud_params.proxy_country_code if cloud_params else None
+			resolved_timeout = cloud_params.timeout if cloud_params else None
+
+			# Log effective config for debugging — ensures logs match actual browser config
+			logger.info(
+				f'[Sandbox] Unified config: headless={unified_profile.headless}, '
+				f'use_cloud={unified_profile.use_cloud}, '
+				f'cloud_profile_id={resolved_profile_id}, '
+				f'cloud_proxy_country_code={resolved_proxy_code}, '
+				f'cloud_timeout={resolved_timeout}, '
+				f'proxy={bool(unified_profile.proxy)}, '
+				f'downloads_path={unified_profile.downloads_path}, '
+				f'storage_state={bool(unified_profile.storage_state)}'
+			)
+
+			# Send to server
 			payload: dict[str, Any] = {'code': base64.b64encode(execution_code.encode()).decode()}
 
 			combined_env: dict[str, str] = env_vars.copy() if env_vars else {}
 			combined_env['LOG_LEVEL'] = log_level.upper()
 			payload['env'] = combined_env
 
-			# Add cloud parameters if provided
-			if cloud_profile_id is not None:
-				payload['cloud_profile_id'] = cloud_profile_id
-			if cloud_proxy_country_code is not None:
-				payload['cloud_proxy_country_code'] = cloud_proxy_country_code
-			if cloud_timeout is not None:
-				payload['cloud_timeout'] = cloud_timeout
+			# Add UNIFIED cloud parameters — these have already been merged with env/config
+			if resolved_profile_id is not None:
+				payload['cloud_profile_id'] = str(resolved_profile_id)
+			if resolved_proxy_code is not None:
+				payload['cloud_proxy_country_code'] = resolved_proxy_code
+			if resolved_timeout is not None:
+				payload['cloud_timeout'] = resolved_timeout
+
+			# Include full config signature for debugging and consistency verification
+			payload['config_signature'] = unified_profile.get_config_signature()
 
 			url = server_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
 

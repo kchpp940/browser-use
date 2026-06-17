@@ -719,13 +719,29 @@ def _resolve_default_llm(llm: BaseChatModel | None) -> BaseChatModel:
 	return ChatBrowserUse()
 
 
+def _get_effective_profile(
+	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
+) -> BrowserProfile | None:
+	"""Get the effective, already-merged BrowserProfile.
+
+	With the unified config merge path, browser_session.browser_profile already
+	contains ALL configuration merged with correct priority.
+	"""
+	if browser_session is not None:
+		session_profile = getattr(browser_session, 'browser_profile', None)
+		if session_profile is not None:
+			return session_profile
+	return browser_profile
+
+
 def _extract_cdp_url(browser_session: BrowserSession | None) -> str | None:
 	if browser_session is None:
 		return None
-	for attr in ('cdp_url',):
-		value = getattr(browser_session, attr, None)
-		if isinstance(value, str) and value:
-			return value
+	# Check session-level cdp_url first (may be populated after connection)
+	value = getattr(browser_session, 'cdp_url', None)
+	if isinstance(value, str) and value:
+		return value
+	# Fall back to profile-level cdp_url
 	profile = getattr(browser_session, 'browser_profile', None)
 	value = getattr(profile, 'cdp_url', None)
 	if isinstance(value, str) and value:
@@ -743,24 +759,23 @@ def _extract_profile_cdp_url(browser_profile: BrowserProfile | None) -> str | No
 
 
 def _extract_headless_preference(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> bool | None:
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile):
-		value = getattr(profile, 'headless', None)
-		if isinstance(value, bool):
-			return value
-	value = getattr(browser_session, 'headless', None)
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None
+	value = getattr(profile, 'headless', None)
 	if isinstance(value, bool):
 		return value
 	return None
 
 
 def _extract_cloud_preference(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> bool:
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		for attr in ('use_cloud', 'cloud_browser'):
-			value = getattr(profile, attr, None)
-			if isinstance(value, bool) and value:
-				return True
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return False
+	for attr in ('use_cloud', 'cloud_browser'):
+		value = getattr(profile, attr, None)
+		if isinstance(value, bool) and value:
+			return True
 	return False
 
 
@@ -808,62 +823,65 @@ def _window_position_arg(window_position: Any) -> str | None:
 
 
 def _managed_browser_launch_args(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> list[str]:
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return []
 	args: list[str] = []
 	seen: set[str] = set()
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile):
-		raw_args = getattr(profile, 'args', None)
-		if isinstance(raw_args, set):
-			raw_args = sorted(raw_args)
-		if isinstance(raw_args, (list, tuple)):
-			for arg in raw_args:
-				_append_unique(args, seen, arg)
-		if getattr(profile, 'disable_security', False) is True:
-			for arg in CHROME_DISABLE_SECURITY_ARGS:
-				_append_unique(args, seen, arg)
-		if getattr(profile, 'deterministic_rendering', False) is True:
-			for arg in CHROME_DETERMINISTIC_RENDERING_ARGS:
-				_append_unique(args, seen, arg)
-		if getattr(profile, 'chromium_sandbox', None) is False:
-			for arg in CHROME_DOCKER_ARGS:
-				_append_unique(args, seen, arg)
-		if getattr(profile, 'devtools', False) is True:
-			_append_unique(args, seen, '--auto-open-devtools-for-tabs')
-		_append_unique(args, seen, _window_size_arg(getattr(profile, 'window_size', None)))
-		_append_unique(args, seen, _window_position_arg(getattr(profile, 'window_position', None)))
-		proxy = getattr(profile, 'proxy', None)
-		proxy_server = _value_from_object(proxy, 'server')
-		if isinstance(proxy_server, str) and proxy_server:
-			_append_unique(args, seen, f'--proxy-server={proxy_server}')
-			proxy_bypass = _value_from_object(proxy, 'bypass')
-			if isinstance(proxy_bypass, str) and proxy_bypass:
-				_append_unique(args, seen, f'--proxy-bypass-list={proxy_bypass}')
-		user_agent = getattr(profile, 'user_agent', None)
-		if isinstance(user_agent, str) and user_agent:
-			_append_unique(args, seen, f'--user-agent={user_agent}')
-		profile_directory = getattr(profile, 'profile_directory', None)
-		if isinstance(profile_directory, str) and profile_directory:
-			_append_unique(args, seen, f'--profile-directory={profile_directory}')
+	raw_args = getattr(profile, 'args', None)
+	if isinstance(raw_args, set):
+		raw_args = sorted(raw_args)
+	if isinstance(raw_args, (list, tuple)):
+		for arg in raw_args:
+			_append_unique(args, seen, arg)
+	if getattr(profile, 'disable_security', False) is True:
+		for arg in CHROME_DISABLE_SECURITY_ARGS:
+			_append_unique(args, seen, arg)
+	if getattr(profile, 'deterministic_rendering', False) is True:
+		for arg in CHROME_DETERMINISTIC_RENDERING_ARGS:
+			_append_unique(args, seen, arg)
+	if getattr(profile, 'chromium_sandbox', None) is False:
+		for arg in CHROME_DOCKER_ARGS:
+			_append_unique(args, seen, arg)
+	if getattr(profile, 'devtools', False) is True:
+		_append_unique(args, seen, '--auto-open-devtools-for-tabs')
+	_append_unique(args, seen, _window_size_arg(getattr(profile, 'window_size', None)))
+	_append_unique(args, seen, _window_position_arg(getattr(profile, 'window_position', None)))
+	proxy = getattr(profile, 'proxy', None)
+	proxy_server = _value_from_object(proxy, 'server')
+	if isinstance(proxy_server, str) and proxy_server:
+		_append_unique(args, seen, f'--proxy-server={proxy_server}')
+		proxy_bypass = _value_from_object(proxy, 'bypass')
+		if isinstance(proxy_bypass, str) and proxy_bypass:
+			_append_unique(args, seen, f'--proxy-bypass-list={proxy_bypass}')
+	user_agent = getattr(profile, 'user_agent', None)
+	if isinstance(user_agent, str) and user_agent:
+		_append_unique(args, seen, f'--user-agent={user_agent}')
+	profile_directory = getattr(profile, 'profile_directory', None)
+	if isinstance(profile_directory, str) and profile_directory:
+		_append_unique(args, seen, f'--profile-directory={profile_directory}')
 	return args
 
 
 def _managed_browser_profile_dir(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> str | None:
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		value = getattr(profile, 'user_data_dir', None)
-		if isinstance(value, (str, os.PathLike)) and str(value):
-			return str(Path(value).expanduser())
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None
+	value = getattr(profile, 'user_data_dir', None)
+	if isinstance(value, (str, os.PathLike)) and str(value):
+		return str(Path(value).expanduser())
 	return None
 
 
 def _managed_browser_executable_path(
 	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
 ) -> str | None:
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		value = getattr(profile, 'executable_path', None)
-		if isinstance(value, (str, os.PathLike)) and str(value):
-			return str(Path(value).expanduser())
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None
+	value = getattr(profile, 'executable_path', None)
+	if isinstance(value, (str, os.PathLike)) and str(value):
+		return str(Path(value).expanduser())
 	return None
 
 
@@ -876,65 +894,66 @@ def _env_value_to_str(value: Any) -> str | None:
 
 
 def _managed_browser_env(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> dict[str, str]:
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return {}
 	env: dict[str, str] = {}
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		raw_env = getattr(profile, 'env', None)
-		if not isinstance(raw_env, dict):
-			continue
-		for key, value in raw_env.items():
-			env_value = _env_value_to_str(value)
-			if isinstance(key, str) and key and env_value is not None:
-				env[key] = env_value
+	raw_env = getattr(profile, 'env', None)
+	if not isinstance(raw_env, dict):
+		return env
+	for key, value in raw_env.items():
+		env_value = _env_value_to_str(value)
+		if isinstance(key, str) and key and env_value is not None:
+			env[key] = env_value
 	return env
 
 
 def _extract_cdp_headers(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> dict[str, str]:
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return {}
 	headers: dict[str, str] = {}
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		raw_headers = getattr(profile, 'headers', None)
-		if not isinstance(raw_headers, dict):
-			continue
-		for key, value in raw_headers.items():
-			header_value = _env_value_to_str(value)
-			if isinstance(key, str) and key and header_value is not None:
-				headers[key] = header_value
+	raw_headers = getattr(profile, 'headers', None)
+	if not isinstance(raw_headers, dict):
+		return headers
+	for key, value in raw_headers.items():
+		header_value = _env_value_to_str(value)
+		if isinstance(key, str) and key and header_value is not None:
+			headers[key] = header_value
 	return headers
 
 
 def _extract_user_agent(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> str | None:
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		value = getattr(profile, 'user_agent', None)
-		if isinstance(value, str) and value:
-			return value
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None
+	value = getattr(profile, 'user_agent', None)
+	if isinstance(value, str) and value:
+		return value
 	return None
 
 
 def _extract_highlight_settings(
 	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
 ) -> tuple[bool | None, str | None, int | None]:
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None, None, None
 	enabled: bool | None = None
 	color: str | None = None
 	duration_ms: int | None = None
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		if enabled is None:
-			if getattr(profile, 'dom_highlight_elements', None) is True:
-				enabled = False
-			else:
-				value = getattr(profile, 'highlight_elements', None)
-				if isinstance(value, bool):
-					enabled = value
-		if color is None:
-			value = getattr(profile, 'interaction_highlight_color', None)
-			if isinstance(value, str) and value:
-				color = value
-		if duration_ms is None:
-			value = getattr(profile, 'interaction_highlight_duration', None)
-			if isinstance(value, (int, float)) and value >= 0:
-				duration_ms = int(value * 1000)
+	if getattr(profile, 'dom_highlight_elements', None) is True:
+		enabled = False
+	else:
+		value = getattr(profile, 'highlight_elements', None)
+		if isinstance(value, bool):
+			enabled = value
+	value = getattr(profile, 'interaction_highlight_color', None)
+	if isinstance(value, str) and value:
+		color = value
+	value = getattr(profile, 'interaction_highlight_duration', None)
+	if isinstance(value, (int, float)) and value >= 0:
+		duration_ms = int(value * 1000)
 	return enabled, color, duration_ms
 
 
@@ -948,64 +967,64 @@ def _extract_wait_timing_settings(
 	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
 ) -> dict[str, str]:
 	settings: dict[str, str] = {}
-	session_profile = getattr(browser_session, 'browser_profile', None)
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return settings
 	mappings = (
 		('minimum_wait_page_load_time', 'BU_BROWSER_MINIMUM_WAIT_PAGE_LOAD_MS'),
 		('wait_for_network_idle_page_load_time', 'BU_BROWSER_NETWORK_IDLE_PAGE_LOAD_MS'),
 		('wait_between_actions', 'BU_BROWSER_WAIT_BETWEEN_ACTIONS_MS'),
 	)
-	for profile in (session_profile, browser_profile, browser_session):
-		for attr, env_name in mappings:
-			if env_name in settings:
-				continue
-			value_ms = _seconds_to_ms(getattr(profile, attr, None))
-			if value_ms is not None:
-				settings[env_name] = str(value_ms)
+	for attr, env_name in mappings:
+		value_ms = _seconds_to_ms(getattr(profile, attr, None))
+		if value_ms is not None:
+			settings[env_name] = str(value_ms)
 	return settings
 
 
 def _extract_block_ip_addresses(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> bool | None:
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		value = getattr(profile, 'block_ip_addresses', None)
-		if isinstance(value, bool):
-			return value
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None
+	value = getattr(profile, 'block_ip_addresses', None)
+	if isinstance(value, bool):
+		return value
 	return None
 
 
 def _extract_profile_permissions(browser_session: BrowserSession | None, browser_profile: BrowserProfile | None) -> list[str]:
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return []
 	values: list[str] = []
 	seen: set[str] = set()
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile):
-		raw_permissions = getattr(profile, 'permissions', None)
-		if isinstance(raw_permissions, set):
-			raw_permissions = sorted(raw_permissions)
-		if not isinstance(raw_permissions, (list, tuple)):
+	raw_permissions = getattr(profile, 'permissions', None)
+	if isinstance(raw_permissions, set):
+		raw_permissions = sorted(raw_permissions)
+	if not isinstance(raw_permissions, (list, tuple)):
+		return values
+	for permission in raw_permissions:
+		if not isinstance(permission, str) or not permission or permission in seen:
 			continue
-		for permission in raw_permissions:
-			if not isinstance(permission, str) or not permission or permission in seen:
-				continue
-			values.append(permission)
-			seen.add(permission)
+		values.append(permission)
+		seen.add(permission)
 	return values
 
 
 def _extract_browser_downloads(
 	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
 ) -> tuple[bool | None, str | None]:
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None, None
 	accept_downloads: bool | None = None
 	downloads_path: str | None = None
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		if accept_downloads is None:
-			value = getattr(profile, 'accept_downloads', None)
-			if isinstance(value, bool):
-				accept_downloads = value
-		if downloads_path is None:
-			value = getattr(profile, 'downloads_path', None)
-			if isinstance(value, (str, os.PathLike)) and str(value):
-				downloads_path = str(Path(value).expanduser())
+	value = getattr(profile, 'accept_downloads', None)
+	if isinstance(value, bool):
+		accept_downloads = value
+	value = getattr(profile, 'downloads_path', None)
+	if isinstance(value, (str, os.PathLike)) and str(value):
+		downloads_path = str(Path(value).expanduser())
 	return accept_downloads, downloads_path
 
 
@@ -1025,24 +1044,21 @@ def _viewport_size(value: Any) -> tuple[int, int] | None:
 def _extract_browser_viewport(
 	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
 ) -> tuple[bool | None, dict[str, int | float] | None]:
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None, None
 	no_viewport: bool | None = None
 	viewport_size: tuple[int, int] | None = None
 	screen_size: tuple[int, int] | None = None
 	device_scale_factor: int | float | None = None
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		if no_viewport is None:
-			value = getattr(profile, 'no_viewport', None)
-			if isinstance(value, bool):
-				no_viewport = value
-		if viewport_size is None:
-			viewport_size = _viewport_size(getattr(profile, 'viewport', None))
-		if screen_size is None:
-			screen_size = _viewport_size(getattr(profile, 'screen', None))
-		if device_scale_factor is None:
-			value = getattr(profile, 'device_scale_factor', None)
-			if isinstance(value, (int, float)) and value >= 0:
-				device_scale_factor = value
+	value = getattr(profile, 'no_viewport', None)
+	if isinstance(value, bool):
+		no_viewport = value
+	viewport_size = _viewport_size(getattr(profile, 'viewport', None))
+	screen_size = _viewport_size(getattr(profile, 'screen', None))
+	value = getattr(profile, 'device_scale_factor', None)
+	if isinstance(value, (int, float)) and value >= 0:
+		device_scale_factor = value
 	if no_viewport is True:
 		return no_viewport, None
 	if viewport_size is None and no_viewport is False:
@@ -1065,12 +1081,13 @@ def _extract_browser_viewport(
 def _extract_browser_window_size(
 	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
 ) -> dict[str, int] | None:
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		window_size = _viewport_size(getattr(profile, 'window_size', None))
-		if window_size is not None:
-			width, height = window_size
-			return {'width': width, 'height': height}
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None
+	window_size = _viewport_size(getattr(profile, 'window_size', None))
+	if window_size is not None:
+		width, height = window_size
+		return {'width': width, 'height': height}
 	return None
 
 
@@ -1095,11 +1112,12 @@ def _storage_state_value(value: Any) -> dict[str, Any] | None:
 def _extract_browser_storage_state(
 	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
 ) -> dict[str, Any] | None:
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile, browser_session):
-		value = _storage_state_value(getattr(profile, 'storage_state', None))
-		if value is not None:
-			return value
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return None
+	value = _storage_state_value(getattr(profile, 'storage_state', None))
+	if value is not None:
+		return value
 	return None
 
 
@@ -1125,15 +1143,16 @@ def _extract_profile_domains(
 	browser_profile: BrowserProfile | None,
 	attr: str,
 ) -> list[str]:
+	profile = _get_effective_profile(browser_session, browser_profile)
+	if profile is None:
+		return []
 	values: list[str] = []
 	seen: set[str] = set()
-	session_profile = getattr(browser_session, 'browser_profile', None)
-	for profile in (session_profile, browser_profile):
-		for domain in _domain_list(getattr(profile, attr, None)):
-			if domain in seen:
-				continue
-			values.append(domain)
-			seen.add(domain)
+	for domain in _domain_list(getattr(profile, attr, None)):
+		if domain in seen:
+			continue
+		values.append(domain)
+		seen.add(domain)
 	return values
 
 
@@ -4060,17 +4079,40 @@ def _default_browser_session(
 	browser_session: Any | None,
 	browser: Any | None,
 ) -> tuple[Any | None, Any | None]:
+	"""Create browser session using the UNIFIED config merge path.
+
+	This ensures Beta Agent uses the EXACT same configuration priority as
+	Python API, TUI, and skill_cli: direct_kwargs > CLI > env > config.json > defaults.
+	"""
 	if browser is not None:
 		return browser, getattr(browser, 'browser_profile', browser_profile)
 	if browser_session is not None:
 		return browser_session, getattr(browser_session, 'browser_profile', browser_profile)
 	if browser_profile is not None and not isinstance(browser_profile, BrowserProfile):
 		return None, browser_profile
-	resolved_profile = browser_profile or BrowserProfile()
-	session = BrowserSession(
-		browser_profile=resolved_profile,
-		id=uuid7str()[:-4] + agent_id[-4:],
-	)
+
+	# Use UNIFIED factory — same path as all other entry points
+	session_id = uuid7str()[:-4] + agent_id[-4:]
+	if browser_profile is not None:
+		# User provided explicit profile — use as direct_kwargs (highest priority)
+		direct_kwargs = browser_profile.model_dump(exclude_unset=True)
+		session = BrowserSession.from_config_sources(
+			direct_kwargs=direct_kwargs,
+			cli_args=None,
+			load_from_env=True,
+			load_from_config_file=True,
+			session_id=session_id,
+		)
+	else:
+		# No explicit profile — let unified factory handle everything
+		session = BrowserSession.from_config_sources(
+			direct_kwargs=None,
+			cli_args=None,
+			load_from_env=True,
+			load_from_config_file=True,
+			session_id=session_id,
+		)
+
 	return session, session.browser_profile
 
 
@@ -4337,6 +4379,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				self._browser_profile = updated_profile
 				if self.browser_session is not None and hasattr(self.browser_session, 'browser_profile'):
 					self.browser_session.browser_profile = updated_profile
+
+		# Log effective config — ensures logs match actual browser configuration
+		if self.browser_session is not None and hasattr(self.browser_session, 'log_effective_config'):
+			self.browser_session.log_effective_config()
+
 		self.tools = _resolve_tools(
 			tools,
 			controller,

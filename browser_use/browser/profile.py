@@ -1365,6 +1365,31 @@ async function initialize(checkInitialized, magic) {{
 		if 'proxy' in merged and isinstance(merged['proxy'], dict):
 			merged['proxy'] = ProxySettings(**merged['proxy'])
 
+		# Handle cloud parameters: nest into cloud_browser_params
+		cloud_params_keys = ['cloud_profile_id', 'cloud_proxy_country_code', 'cloud_timeout']
+		cloud_params_dict: dict[str, Any] = {}
+		for key in cloud_params_keys:
+			if key in merged:
+				# Map to CloudBrowserParams field names (with aliases)
+				if key == 'cloud_profile_id':
+					cloud_params_dict['profile_id'] = merged.pop(key)
+				elif key == 'cloud_proxy_country_code':
+					cloud_params_dict['proxy_country_code'] = merged.pop(key)
+				elif key == 'cloud_timeout':
+					cloud_params_dict['timeout'] = merged.pop(key)
+
+		# Only create cloud_browser_params if we have cloud params or use_cloud is True
+		use_cloud = merged.get('use_cloud', False)
+		if cloud_params_dict or use_cloud:
+			# Merge with existing cloud_browser_params if any
+			existing_cloud_params = merged.get('cloud_browser_params')
+			if existing_cloud_params is None:
+				merged['cloud_browser_params'] = CloudBrowserParams(**cloud_params_dict)
+			elif isinstance(existing_cloud_params, dict):
+				existing_cloud_params.update(cloud_params_dict)
+				merged['cloud_browser_params'] = CloudBrowserParams(**existing_cloud_params)
+			# If it's already a CloudBrowserParams object, we leave it as-is (direct_kwargs takes precedence)
+
 		# Handle deprecated window_width/window_height -> window_size
 		if 'window_width' in merged or 'window_height' in merged:
 			w = merged.pop('window_width', None)
