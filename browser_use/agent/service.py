@@ -221,16 +221,20 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				raise ValueError('llm_screenshot_size dimensions must be at least 100 pixels')
 			self.logger.info(f'🖼️  LLM screenshot resizing enabled: {width}x{height}')
 		if llm is None:
-			default_llm_name = CONFIG.DEFAULT_LLM
-			if default_llm_name:
-				from browser_use.llm.models import get_llm_by_name
+			# Build LLM from the UNIFIED EffectiveConfig — so provider + model + api_key
+			# are resolved exactly the same way as for BrowserSession and the cloud payload.
+			from browser_use.browser.views import EffectiveConfig
 
-				llm = get_llm_by_name(default_llm_name)
-			else:
-				# No default LLM specified, use the original default
-				from browser_use import ChatBrowserUse
-
-				llm = ChatBrowserUse()
+			effective = EffectiveConfig.from_config_sources(
+				direct_kwargs=None,
+				cli_args=None,
+				load_from_env=True,
+				load_from_config_file=True,
+			)
+			llm = effective.build_llm()
+			self.logger.info(
+				f'[Agent] Built LLM from unified EffectiveConfig: provider={effective.llm.provider}, model={effective.llm.model}'
+			)
 
 		# set flashmode = True if llm is ChatBrowserUse
 		if llm.provider == 'browser-use':

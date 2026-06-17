@@ -459,6 +459,41 @@ class BrowserSession(BaseModel):
 		return list_chrome_profiles()
 
 	@classmethod
+	def from_effective_config(
+		cls,
+		effective,
+		session_id: str | None = None,
+		skip_watchdogs: bool = False,
+	) -> 'BrowserSession':
+		"""Create BrowserSession from a pre-built EffectiveConfig.
+
+		This is the preferred entry point — the EffectiveConfig is the single
+		source of truth produced by EffectiveConfig.from_config_sources() and
+		the same object is also used to build the LLM and the cloud payload.
+		"""
+		from browser_use.browser.profile import BrowserProfile
+		from browser_use.browser.views import EffectiveConfig
+
+		if not isinstance(effective, EffectiveConfig):
+			raise TypeError(f'expected EffectiveConfig, got {type(effective).__name__}')
+
+		browser_profile = BrowserProfile(**effective.browser_profile_kwargs())
+		session_kwargs: dict[str, Any] = {'browser_profile': browser_profile}
+		if session_id:
+			session_kwargs['id'] = session_id
+
+		logger = logging.getLogger('browser_use')
+		sig = effective.get_config_signature()
+		logger.info(f'[BrowserSession] Effective config signature: {sig}')
+
+		if skip_watchdogs:
+			from browser_use.skill_cli.browser import CLIBrowserSession
+
+			return CLIBrowserSession(**session_kwargs)
+
+		return cls(**session_kwargs)
+
+	@classmethod
 	def from_config_sources(
 		cls,
 		direct_kwargs: dict[str, Any] | None = None,
@@ -489,37 +524,22 @@ class BrowserSession(BaseModel):
 		    skip_watchdogs: If True, uses lightweight mode without watchdogs
 		        (for skill_cli daemon and similar use cases)
 		"""
-		from browser_use.browser.profile import BrowserProfile
+		from browser_use.browser.views import EffectiveConfig
 
-		# Build profile using the unified merge logic
-		browser_profile = BrowserProfile.from_config_sources(
+		# Build the unified EffectiveConfig first — the same object every
+		# consumer (BrowserSession, LLM, cloud payload) should use.
+		effective = EffectiveConfig.from_config_sources(
 			direct_kwargs=direct_kwargs,
 			cli_args=cli_args,
 			load_from_env=load_from_env,
 			load_from_config_file=load_from_config_file,
 		)
 
-		# Session-level kwargs (not part of BrowserProfile)
-		session_kwargs: dict[str, Any] = {
-			'browser_profile': browser_profile,
-		}
-		if session_id:
-			session_kwargs['id'] = session_id
-
-		logger = logging.getLogger('browser_use')
-		logger.info(
-			f'[BrowserSession] Unified config: headless={browser_profile.headless}, '
-			f'use_cloud={browser_profile.use_cloud}, cdp_url={bool(browser_profile.cdp_url)}, '
-			f'proxy={bool(browser_profile.proxy)}, downloads_path={browser_profile.downloads_path}'
+		return cls.from_effective_config(
+			effective,
+			session_id=session_id,
+			skip_watchdogs=skip_watchdogs,
 		)
-
-		if skip_watchdogs:
-			# Use lightweight CLI session variant
-			from browser_use.skill_cli.browser import CLIBrowserSession
-
-			return CLIBrowserSession(**session_kwargs)
-
-		return cls(**session_kwargs)
 
 	def log_effective_config(self) -> None:
 		"""Log the effective browser configuration for debugging.

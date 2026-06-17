@@ -349,9 +349,10 @@ async def run(browser):
 
 """
 
-			# 9. Build unified browser config using the SAME merge path as all entry points
-			# This ensures cloud/sandbox uses identical config priority as Python API, TUI, skill_cli
-			from browser_use.browser.profile import BrowserProfile
+			# 9. Build the UNIFIED EffectiveConfig — the single source of truth
+			# This EXACT object is what drives BrowserSession, LLM init, AND the
+			# cloud payload, so logs, signature, and real startup params match.
+			from browser_use.browser.views import EffectiveConfig
 
 			# Build CLI args from decorator parameters (these take precedence over env/config)
 			sandbox_cli_args: dict[str, Any] = {}
@@ -362,32 +363,26 @@ async def run(browser):
 			if cloud_timeout is not None:
 				sandbox_cli_args['cloud_timeout'] = cloud_timeout
 
-			# Merge config using UNIFIED factory — same path as all other entry points
-			# Priority: direct_kwargs (none here) > CLI args (decorator params) > env > config.json > defaults
-			unified_profile = BrowserProfile.from_config_sources(
+			# Merge ALL config sources — same exact factory used by every other entry point
+			effective = EffectiveConfig.from_config_sources(
 				direct_kwargs=None,
 				cli_args=sandbox_cli_args,
 				load_from_env=True,
 				load_from_config_file=True,
 			)
 
-			# Extract cloud params from nested structure
-			cloud_params = unified_profile.cloud_browser_params
+			# Extract cloud params from the unified config
+			cloud_params = effective.browser.get('cloud_browser_params')
 			resolved_profile_id = cloud_params.profile_id if cloud_params else None
 			resolved_proxy_code = cloud_params.proxy_country_code if cloud_params else None
 			resolved_timeout = cloud_params.timeout if cloud_params else None
 
-			# Log effective config for debugging — ensures logs match actual browser config
-			logger.info(
-				f'[Sandbox] Unified config: headless={unified_profile.headless}, '
-				f'use_cloud={unified_profile.use_cloud}, '
-				f'cloud_profile_id={resolved_profile_id}, '
-				f'cloud_proxy_country_code={resolved_proxy_code}, '
-				f'cloud_timeout={resolved_timeout}, '
-				f'proxy={bool(unified_profile.proxy)}, '
-				f'downloads_path={unified_profile.downloads_path}, '
-				f'storage_state={bool(unified_profile.storage_state)}'
-			)
+			# Log effective config — this is the SAME signature the cloud receives
+			log_safe = effective.get_log_safe_dict()
+			logger.info(f'[Sandbox] Unified effective config: {log_safe}')
+
+			# Get the ONE config_signature that represents the real startup params
+			config_signature = effective.get_config_signature()
 
 			# Send to server
 			payload: dict[str, Any] = {'code': base64.b64encode(execution_code.encode()).decode()}
@@ -396,7 +391,7 @@ async def run(browser):
 			combined_env['LOG_LEVEL'] = log_level.upper()
 			payload['env'] = combined_env
 
-			# Add UNIFIED cloud parameters — these have already been merged with env/config
+			# Add UNIFIED cloud parameters — derived from the same EffectiveConfig
 			if resolved_profile_id is not None:
 				payload['cloud_profile_id'] = str(resolved_profile_id)
 			if resolved_proxy_code is not None:
@@ -404,8 +399,18 @@ async def run(browser):
 			if resolved_timeout is not None:
 				payload['cloud_timeout'] = resolved_timeout
 
-			# Include full config signature for debugging and consistency verification
-			payload['config_signature'] = unified_profile.get_config_signature()
+			# THE config_signature — guaranteed to match what actually starts because
+			# BrowserSession and LLM are both constructed from this same EffectiveConfig
+			payload['config_signature'] = config_signature
+
+			# Also send the full effective browser config (safe fields only) so the
+			# remote side can start the browser with identical parameters
+			payload['effective_browser_config'] = {
+				k: v
+				for k, v in effective.browser_profile_kwargs().items()
+				if k not in {'storage_state'}  # exclude opaque blobs
+			}
+			payload['effective_llm_config'] = effective.llm.get_log_safe_dict()
 
 			url = server_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
 
