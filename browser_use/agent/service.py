@@ -656,14 +656,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""Check for new downloads and update available file paths.
 
 		Collects REAL LOCAL FILE PATHS (absolute paths on disk) from:
-		1. Browser session downloads (CDP download events - PDF auto-downloads, clicked downloads)
-		2. Existing available_file_paths (user-provided real paths)
+		1. Browser session downloads (CDP download events, network response saves)
+		2. Tool-saved real files (save_as_pdf, screenshot with file_name)
+		3. Existing available_file_paths (user-provided real paths)
 
-		NOTE: FileSystem-managed files (read_file/write_file/save_as_pdf) are NOT
-		added here. They live in a separate namespace and are referenced by
-		virtual basename (e.g. "todo.md"), not by real disk path. Mixing the two
-		would cause semantic confusion — upload_file expects real disk paths,
-		while read_file/write_file expect FileSystem virtual names.
+		All of the above go through browser_session.downloaded_files via
+		add_downloaded_file() / FileDownloadedEvent, so they share one
+		unified availability registration pipeline.
+
+		FileSystem text files (write_file/replace_file) remain in a separate
+		namespace — they are tracked by the FileSystem instance and referenced
+		by virtual basename (e.g. "todo.md"), not by real disk path.
 		"""
 		if not self.has_downloads_path:
 			return
@@ -706,8 +709,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	def _update_available_file_paths(self, downloads: list[str]) -> None:
 		"""Update available_file_paths with real downloaded files using normalized path comparison.
 
-		available_file_paths contains ONLY real local absolute paths (user-provided
-		paths + browser session downloads). FileSystem virtual files are tracked
+		available_file_paths contains real local absolute paths from:
+		- User-provided paths
+		- Browser CDP downloads (DownloadsWatchdog)
+		- Network response saves (DownloadsWatchdog)
+		- Tool-saved real files (save_as_pdf, screenshot)
+
+		FileSystem virtual text files (write_file/replace_file) are tracked
 		separately by the FileSystem instance and referenced by basename.
 
 		Args:

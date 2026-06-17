@@ -1563,6 +1563,26 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				file_path = file_system.get_dir() / file_name
 				file_path.write_bytes(screenshot_bytes)
 
+				# This PNG is written as raw bytes to disk (real local file).
+				# Register through the download pipeline so it's accessible
+				# for subsequent read_file/upload_file actions.
+				norm_path = browser_session.add_downloaded_file(file_path)
+
+				if norm_path:
+					from browser_use.browser.events import FileDownloadedEvent
+
+					browser_session.event_bus.dispatch(
+						FileDownloadedEvent(
+							url=str(file_path),
+							path=str(file_path),
+							file_name=file_name,
+							file_size=len(screenshot_bytes),
+							file_type='png',
+							mime_type='image/png',
+							auto_download=False,
+						)
+					)
+
 				result = f'Screenshot saved to {file_name}'
 				logger.info(f'📸 {result}. Full path: {file_path}')
 				return ActionResult(
@@ -1661,12 +1681,29 @@ You will be given a query and the markdown of a webpage that has been filtered t
 
 			file_size = file_path.stat().st_size
 
-			# NOTE: This PDF is saved to the FileSystem directory and tracked by
-			# the FileSystem instance. It is NOT added to browser_session.downloaded_files
-			# because that list is for REAL browser downloads (CDP events).
-			# FileSystem files live in a separate namespace — they are accessed by
-			# basename (e.g. "report.pdf") via read_file/write_file, and upload_file
-			# finds them through FileSystem.get_file() basename matching.
+			# This PDF is written as raw bytes directly to disk (not through
+			# FileSystem.write_file which only handles text). It is a REAL local
+			# file, so register it through the same pipeline as browser downloads:
+			#   add_downloaded_file → FileDownloadedEvent → Agent._check_and_update_downloads
+			# This makes the file both:
+			#   - READABLE by read_file  (via available_file_paths → external_file=True)
+			#   - UPLOADABLE by upload_file (via available_file_paths)
+			norm_path = browser_session.add_downloaded_file(file_path)
+
+			if norm_path:
+				from browser_use.browser.events import FileDownloadedEvent
+
+				browser_session.event_bus.dispatch(
+					FileDownloadedEvent(
+						url=str(file_path),
+						path=str(file_path),
+						file_name=file_name,
+						file_size=file_size,
+						file_type='pdf',
+						mime_type='application/pdf',
+						auto_download=False,
+					)
+				)
 
 			msg = f'Saved page as PDF: {file_name} ({file_size:,} bytes)'
 			logger.info(f'📄 {msg}. Full path: {file_path}')
@@ -1819,7 +1856,6 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			# Heuristic to distinguish:
 			#   - starts with '/' or '~' → treat as real local path
 			#   - everything else → try FileSystem first, fall back to real paths
-
 
 			is_absolute_real_path = file_name.startswith('/') or file_name.startswith('~')
 
