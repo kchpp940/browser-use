@@ -12,9 +12,10 @@ from openai.types.shared_params.response_format_json_schema import JSONSchema, R
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelParseError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer
+from browser_use.llm.parser import AgentOutputParser, NormalizedLLMResponse
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
@@ -272,16 +273,18 @@ class ChatOpenAI(BaseChatModel):
 						model=self.name,
 					)
 
-				if choice.message.content is None:
-					raise ModelProviderError(
-						message='Failed to parse structured output from model response',
-						status_code=500,
-						model=self.name,
-					)
-
 				usage = self._get_usage(response)
 
-				parsed = output_format.model_validate_json(choice.message.content)
+				normalized = NormalizedLLMResponse(
+					raw_text=choice.message.content or '',
+					refusal=getattr(choice.message, 'refusal', None),
+					stop_reason=choice.finish_reason,
+				)
+				try:
+					parsed = AgentOutputParser(output_format).parse(normalized)
+				except ModelParseError as e:
+					e.model = self.name
+					raise
 
 				return ChatInvokeCompletion(
 					completion=parsed,

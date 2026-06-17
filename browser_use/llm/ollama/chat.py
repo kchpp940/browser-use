@@ -8,9 +8,10 @@ from ollama import Options
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError
+from browser_use.llm.exceptions import ModelParseError, ModelProviderError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.ollama.serializer import OllamaMessageSerializer
+from browser_use.llm.parser import AgentOutputParser, NormalizedLLMResponse
 from browser_use.llm.views import ChatInvokeCompletion
 
 T = TypeVar('T', bound=BaseModel)
@@ -89,11 +90,36 @@ class ChatOllama(BaseChatModel):
 					options=self.ollama_options,
 				)
 
-				completion = response.message.content or ''
-				if output_format is not None:
-					completion = output_format.model_validate_json(completion)
+				raw_text = response.message.content or ''
 
-				return ChatInvokeCompletion(completion=completion, usage=None)
+				# Extract tool_calls if present in Ollama format
+				from browser_use.llm.parser import NormalizedToolCall
+
+				tool_calls_list: list[NormalizedToolCall] = []
+				msg_tool_calls = getattr(response.message, 'tool_calls', None)
+				if isinstance(msg_tool_calls, list):
+					for tc in msg_tool_calls:
+						fn = getattr(tc, 'function', None)
+						if fn is not None:
+							tool_calls_list.append(
+								NormalizedToolCall(
+									id=getattr(tc, 'id', None),
+									name=getattr(fn, 'name', ''),
+									arguments=getattr(fn, 'arguments', ''),
+								)
+							)
+
+				normalized = NormalizedLLMResponse(
+					raw_text=raw_text,
+					tool_calls=tool_calls_list,
+				)
+				try:
+					parsed = AgentOutputParser(output_format).parse(normalized)
+				except ModelParseError as e:
+					e.model = self.name
+					raise
+
+				return ChatInvokeCompletion(completion=parsed, usage=None)
 
 		except Exception as e:
 			raise ModelProviderError(message=str(e), model=self.name) from e

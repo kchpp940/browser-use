@@ -14,8 +14,9 @@ from openai.types.shared_params.response_format_json_schema import (
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelParseError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage, ContentPartTextParam, SystemMessage
+from browser_use.llm.parser import AgentOutputParser, NormalizedLLMResponse, NormalizedToolCall
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.vercel.serializer import VercelMessageSerializer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
@@ -593,38 +594,41 @@ class ChatVercel(BaseChatModel):
 						**model_params,
 					)
 
-					content = response.choices[0].message.content if response.choices else None
+					choice = response.choices[0] if response.choices else None
+					msg = choice.message if choice is not None else None
+					content = msg.content if msg is not None else None
 
-					if not content:
-						raise ModelProviderError(
-							message='No response from model',
-							status_code=500,
-							model=self.name,
-						)
+					# Build normalized response (extract tool_calls too)
+					tool_calls_list: list[NormalizedToolCall] = []
+					if msg is not None and getattr(msg, 'tool_calls', None):
+						for tc in msg.tool_calls:
+							tool_calls_list.append(
+								NormalizedToolCall(
+									id=getattr(tc, 'id', None),
+									name=tc.function.name,
+									arguments=tc.function.arguments,
+								)
+							)
+
+					normalized = NormalizedLLMResponse(
+						raw_text=content or '',
+						refusal=getattr(msg, 'refusal', None) if msg is not None else None,
+						tool_calls=tool_calls_list,
+						stop_reason=choice.finish_reason if choice is not None else None,
+					)
 
 					try:
-						text = content.strip()
-						if text.startswith('```json') and text.endswith('```'):
-							text = text[7:-3].strip()
-						elif text.startswith('```') and text.endswith('```'):
-							text = text[3:-3].strip()
+						parsed = AgentOutputParser(output_format).parse(normalized)
+					except ModelParseError as e:
+						e.model = self.name
+						raise
 
-						parsed_data = json.loads(text)
-						parsed = output_format.model_validate(parsed_data)
-
-						usage = self._get_usage(response)
-						return ChatInvokeCompletion(
-							completion=parsed,
-							usage=usage,
-							stop_reason=response.choices[0].finish_reason if response.choices else None,
-						)
-
-					except (json.JSONDecodeError, ValueError) as e:
-						raise ModelProviderError(
-							message=f'Failed to parse JSON response: {str(e)}. Raw response: {content[:200]}',
-							status_code=500,
-							model=self.name,
-						) from e
+					usage = self._get_usage(response)
+					return ChatInvokeCompletion(
+						completion=parsed,
+						usage=usage,
+						stop_reason=normalized.stop_reason,
+					)
 
 				else:
 					schema = SchemaOptimizer.create_optimized_json_schema(output_format)
@@ -645,22 +649,40 @@ class ChatVercel(BaseChatModel):
 						**model_params,
 					)
 
-					content = response.choices[0].message.content if response.choices else None
+					choice = response.choices[0] if response.choices else None
+					msg = choice.message if choice is not None else None
+					content = msg.content if msg is not None else None
 
-					if not content:
-						raise ModelProviderError(
-							message='Failed to parse structured output from model response - empty or null content',
-							status_code=500,
-							model=self.name,
-						)
+					# Build normalized response
+					tool_calls_list2: list[NormalizedToolCall] = []
+					if msg is not None and getattr(msg, 'tool_calls', None):
+						for tc in msg.tool_calls:
+							tool_calls_list2.append(
+								NormalizedToolCall(
+									id=getattr(tc, 'id', None),
+									name=tc.function.name,
+									arguments=tc.function.arguments,
+								)
+							)
+
+					normalized2 = NormalizedLLMResponse(
+						raw_text=content or '',
+						refusal=getattr(msg, 'refusal', None) if msg is not None else None,
+						tool_calls=tool_calls_list2,
+						stop_reason=choice.finish_reason if choice is not None else None,
+					)
+
+					try:
+						parsed = AgentOutputParser(output_format).parse(normalized2)
+					except ModelParseError as e:
+						e.model = self.name
+						raise
 
 					usage = self._get_usage(response)
-					parsed = output_format.model_validate_json(content)
-
 					return ChatInvokeCompletion(
 						completion=parsed,
 						usage=usage,
-						stop_reason=response.choices[0].finish_reason if response.choices else None,
+						stop_reason=normalized2.stop_reason,
 					)
 
 		except RateLimitError as e:

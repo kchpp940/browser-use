@@ -20,10 +20,11 @@ from httpx import URL
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel, ChatInvokeCompletion
-from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelParseError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.groq.parser import try_parse_groq_failed_generation
 from browser_use.llm.groq.serializer import GroqMessageSerializer
 from browser_use.llm.messages import BaseMessage
+from browser_use.llm.parser import AgentOutputParser, NormalizedLLMResponse
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeUsage
 
@@ -173,14 +174,42 @@ class ChatGroq(BaseChatModel):
 		else:
 			response = await self._invoke_with_json_schema(groq_messages, output_format, schema)
 
-		if not response.choices[0].message.content:
+		choice = response.choices[0] if response.choices else None
+		if choice is None:
 			raise ModelProviderError(
-				message='No content in response',
+				message='No choices in response',
 				status_code=500,
 				model=self.name,
 			)
 
-		parsed_response = output_format.model_validate_json(response.choices[0].message.content)
+		# Collect raw content from both message.content (JSON schema path) and tool_calls (tool calling path)
+		raw_text = choice.message.content or ''
+		tool_calls_list = []
+
+		from browser_use.llm.parser import NormalizedToolCall
+
+		if choice.message.tool_calls:
+			for tc in choice.message.tool_calls:
+				tool_calls_list.append(
+					NormalizedToolCall(
+						id=getattr(tc, 'id', None),
+						name=tc.function.name,
+						arguments=tc.function.arguments,
+					)
+				)
+
+		normalized = NormalizedLLMResponse(
+			raw_text=raw_text,
+			refusal=getattr(choice.message, 'refusal', None),
+			tool_calls=tool_calls_list,
+		)
+
+		try:
+			parsed_response = AgentOutputParser(output_format).parse(normalized)
+		except ModelParseError as e:
+			e.model = self.name
+			raise
+
 		usage = self._get_usage(response)
 
 		return ChatInvokeCompletion(

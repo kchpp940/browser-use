@@ -11,10 +11,11 @@ import httpx
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
+from browser_use.llm.exceptions import ModelParseError, ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.mistral.schema import MistralSchemaOptimizer
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer
+from browser_use.llm.parser import AgentOutputParser, NormalizedLLMResponse, NormalizedToolCall
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
 logger = logging.getLogger(__name__)
@@ -203,13 +204,47 @@ class ChatMistral(BaseChatModel):
 			if not choices:
 				raise ModelProviderError('Mistral returned no choices', model=self.name)
 
-			content_text = self._extract_content_text(choices[0])
+			choice = choices[0]
+			message = choice.get('message', {})
+
+			# Extract raw text
+			content_text = self._extract_content_text(choice)
+
+			# Extract tool calls if present
+			tool_calls_list: list[NormalizedToolCall] = []
+			tool_calls_raw = message.get('tool_calls', [])
+			if isinstance(tool_calls_raw, list):
+				for tc in tool_calls_raw:
+					if isinstance(tc, dict):
+						fn = tc.get('function', {})
+						tool_calls_list.append(
+							NormalizedToolCall(
+								id=tc.get('id'),
+								name=fn.get('name', ''),
+								arguments=fn.get('arguments', ''),
+							)
+						)
+
+			# Extract refusal
+			refusal = message.get('refusal')
+
 			usage = self._build_usage(data.get('usage'))
 
 			if output_format is None:
 				return ChatInvokeCompletion(completion=content_text, usage=usage)
 
-			parsed = output_format.model_validate_json(content_text)
+			normalized = NormalizedLLMResponse(
+				raw_text=content_text,
+				refusal=refusal,
+				tool_calls=tool_calls_list,
+				stop_reason=choice.get('finish_reason'),
+			)
+			try:
+				parsed = AgentOutputParser(output_format).parse(normalized)
+			except ModelParseError as e:
+				e.model = self.name
+				raise
+
 			return ChatInvokeCompletion(completion=parsed, usage=usage)
 
 		except ModelRateLimitError:
