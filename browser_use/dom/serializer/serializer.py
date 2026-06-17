@@ -171,43 +171,46 @@ class DOMTreeSerializer:
 		state = SerializedDOMState(_root=filtered_tree, selector_map=self._selector_map)
 
 		# ── Runtime Consistency Gate (single source of truth enforcement) ──
-		# Stage 1: Auto-fix mode - run unified index pruning + tree/map alignment
-		# This catches any edge case where earlier filtering stages missed a node.
+		# validate_consistency(auto_fix=True) guarantees the returned state is consistent.
+		# It runs 4 stages: structural pruning → intersection alignment → verification → report.
+		# See SerializedDOMState.validate_consistency() for details.
 		issues = state.validate_consistency(auto_fix=True)
 
 		if issues:
 			import logging
 
 			logger = logging.getLogger('browser_use.dom.serializer')
+
+			has_critical = any(m.startswith('[CRITICAL]') for m in issues)
 			pruned_msgs = [m for m in issues if m.startswith('[PRUNED]')]
-			fixed_msgs = [m for m in issues if m.startswith('[FIXED]')]
-			remaining = [m for m in issues if not m.startswith('[PRUNED]') and not m.startswith('[FIXED]')]
+			aligned_msgs = [m for m in issues if m.startswith('[ALIGNED]')]
+			safe_msgs = [m for m in issues if m.startswith('[SAFE]')]
+			ok_msgs = [m for m in issues if m.startswith('[OK]')]
+			other = [m for m in issues if not m.startswith(('[PRUNED]', '[ALIGNED]', '[SAFE]', '[OK]', '[CRITICAL]'))]
+
+			if has_critical:
+				logger.critical(
+					'🚨 DOM index consistency gate CRITICAL failure after auto-fix! '
+					'This indicates a bug in the serializer code.'
+				)
+				for m in issues[:10]:
+					if m.startswith('[CRITICAL]') or m.startswith('   -'):
+						logger.critical(f'   {m}')
 
 			if pruned_msgs:
 				for m in pruned_msgs:
-					logger.info(f'🧹 DOM index pruning applied: {m}')
-			if fixed_msgs:
-				for m in fixed_msgs:
-					logger.warning(f'🔧 DOM index inconsistency auto-fixed: {m}')
-			if remaining:
-				for m in remaining[:5]:
-					logger.error(f'❌ DOM index issue NOT resolved: {m}')
-
-			# Stage 2: Verify that auto-fix actually produced a consistent state.
-			# If auto-fix failed (shouldn't happen unless there's a structural bug),
-			# log a critical error - but we still return the (partially fixed) state
-			# rather than crashing the agent loop.
-			post_fix_issues = state.validate_consistency(auto_fix=False)
-			if post_fix_issues:
-				logger.critical(
-					f'🚨 DOM index consistency GATE FAILED after auto-fix! '
-					f'{len(post_fix_issues)} unresolved issues. '
-					f'LLM will receive a partially inconsistent DOM. This indicates a bug in the serializer.'
-				)
-				for m in post_fix_issues[:5]:
-					logger.critical(f'   - {m}')
-			else:
-				logger.info('✅ DOM index consistency verified after auto-fix.')
+					logger.info(f'🧹 {m}')
+			if aligned_msgs:
+				for m in aligned_msgs:
+					logger.warning(f'🔧 {m}')
+			if safe_msgs:
+				for m in safe_msgs:
+					logger.info(f'🛡️  {m}')
+			if other:
+				for m in other[:5]:
+					logger.warning(f'⚠️  {m}')
+			if ok_msgs:
+				logger.debug('✅ DOM index consistency verified.')
 
 		return state, self.timing_info
 
@@ -648,23 +651,26 @@ class DOMTreeSerializer:
 		_assign_interactive_indices_and_mark_new_nodes) MUST use this method to
 		ensure index consistency across the entire system.
 
-		Checks (in order):
-		1. Not excluded by parent bounding box filtering
-		2. Not ignored by paint order filtering
-		3. Basic interactivity (ClickableElementDetector.is_interactive)
-		4. Visibility OR special exceptions (file input, shadow DOM form elements)
+		Two-layer check:
+		1. STRUCTURAL: Delegates to SimplifiedNode.is_structurally_indexable()
+		   - This is the SAME check used by SerializedDOMState._collect_prunable_indices()
+		   - Guarantees zero rule drift between "add index" and "remove index" paths
+		2. INTERACTIVE + VISIBILITY: Basic interactivity and visibility checks
+		   - Uses ClickableElementDetector.is_interactive() for interactivity
+		   - Visibility check with special exceptions (file input, shadow DOM form elements)
 
 		NOTE: Scrollable container logic is handled separately in _assign_interactive_indices
 		because it depends on descendants, which would create circular dependency here.
 		"""
-		# Excluded nodes don't get indices (but their children might)
-		if node.excluded_by_parent:
+		# ── Layer 1: Structural eligibility (SHARED with pruning) ──
+		# Uses the EXACT SAME structural check as the consistency gate's pruning.
+		# No inside_svg / parent_excluded context needed here because:
+		# - SVG children are already filtered out during _create_simplified_tree()
+		# - excluded_by_parent flag is set on each node individually during bbox filtering
+		if not node.is_structurally_indexable():
 			return False
 
-		# Nodes hidden by paint order don't get indices
-		if node.ignored_by_paint_order:
-			return False
-
+		# ── Layer 2: Interactivity + visibility ──
 		is_interactive = self._is_interactive_cached(node.original_node)
 		if not is_interactive:
 			return False

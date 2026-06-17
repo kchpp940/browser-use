@@ -230,6 +230,58 @@ class SimplifiedNode:
 	is_shadow_host: bool = False  # New field for shadow DOM hosts
 	is_compound_component: bool = False  # True for virtual components of compound controls
 
+	def is_structurally_indexable(self, inside_svg: bool = False, parent_excluded: bool = False) -> bool:
+		"""
+		Check if this node is structurally eligible for an interactive index.
+
+		This is the SINGLE source of truth for STRUCTURAL index eligibility.
+		Both index assignment (_is_element_indexable in DOMTreeSerializer) and
+		index pruning (_collect_prunable_indices in SerializedDOMState) MUST
+		use this method to avoid rule drift.
+
+		Structural checks (all must pass):
+		1. Has valid original_node with a numeric backend_node_id
+		2. should_display is True (element is meant to be shown)
+		3. Not excluded_by_parent (bounding-box propagation filter)
+		4. Not ignored_by_paint_order (paint-order / occlusion filter)
+		5. Not a DOCUMENT_FRAGMENT_NODE (shadow root itself is never interactive)
+		6. Not inside an SVG subtree (unless it's the <svg> root element itself)
+		7. Not cascade-excluded by an ancestor (parent_excluded)
+
+		NOTE: This is only the structural half. The full "should this node
+		have an index?" check also requires interactivity + visibility, which
+		is handled by DOMTreeSerializer._is_element_indexable().
+		"""
+		if self.original_node is None:
+			return False
+
+		backend_id = getattr(self.original_node, 'backend_node_id', None)
+		if backend_id is None or not isinstance(backend_id, int):
+			return False
+
+		if not self.should_display:
+			return False
+
+		if self.excluded_by_parent:
+			return False
+
+		if self.ignored_by_paint_order:
+			return False
+
+		if parent_excluded:
+			return False
+
+		node_type = getattr(self.original_node, 'node_type', None)
+		if node_type == NodeType.DOCUMENT_FRAGMENT_NODE:
+			return False
+
+		tag_name = getattr(self.original_node, 'tag_name', None)
+		is_svg_root = bool(tag_name and tag_name.lower() == 'svg')
+		if inside_svg and not is_svg_root:
+			return False
+
+		return True
+
 	def _clean_original_node_json(self, node_json: dict) -> dict:
 		"""Recursively remove children_nodes and shadow_roots from original_node JSON."""
 		# Remove the fields we don't want in SimplifiedNode serialization
@@ -959,22 +1011,22 @@ class SerializedDOMState:
 		Validate and optionally auto-fix consistency between SimplifiedNode tree and selector_map.
 
 		This is the FINAL consistency gate before DOM state is returned to the Agent.
+		When auto_fix=True, the returned state is GUARANTEED to be consistent.
 
-		Three-stage enforcement:
-		1. UNIFIED INDEX PRUNING (auto_fix only): Walk the entire tree and strip indices
-		   from ANY node that fails ANY of the unified filtering rules:
-		   - should_display=False
-		   - excluded_by_parent=True
-		   - ignored_by_paint_order=True
-		   - Inside collapsed SVG subtrees (non-root SVG children)
-		   - Inside hidden iframe content (content not reachable)
-		   - Node with no valid original_node / backend_node_id
-		2. TREE ⇄ MAP ALIGNMENT: Ensure is_interactive in tree and keys in selector_map
-		   are an exact match (bidirectional).
-		3. REPORT: Return all issues found and fixed.
+		Four-stage enforcement (when auto_fix=True):
+		1. UNIFIED INDEX PRUNING: Strip indices from nodes that fail structural
+		   eligibility (should_display, excluded_by_parent, ignored_by_paint_order,
+		   SVG children, shadow roots, etc.). Uses the EXACT SAME structural check
+		   as DOMTreeSerializer._is_element_indexable() to avoid rule drift.
+		2. INTERSECTION ALIGNMENT: Compute the intersection of tree-is_interactive
+		   and selector_map keys. Keep ONLY indices that exist on both sides.
+		   This is the ultimate consistency guarantee.
+		3. VERIFICATION: Re-check with auto_fix=False to confirm consistency.
+		4. REPORT: Return all issues found and fixed.
 
 		Args:
-			auto_fix: If True (default), automatically prune and align. If False, only report.
+			auto_fix: If True (default), automatically fix to guaranteed consistency.
+				If False, only report problems without modifying state.
 
 		Returns:
 			List of inconsistency/repair messages (empty list if fully consistent).
@@ -986,21 +1038,20 @@ class SerializedDOMState:
 				errors.append('Tree is empty but selector_map is not empty')
 				if auto_fix:
 					self.selector_map.clear()
-					errors.append('[FIXED] Cleared selector_map to match empty tree')
+					errors.append('[SAFE] Cleared selector_map to match empty tree')
 			return errors
 
-		# ── Stage 1: Unified Index Pruning ──────────────────────────────────────
-		# Walk the tree and collect ALL nodes that should NOT have an index,
-		# regardless of what is_interactive or selector_map currently say.
+		# ── Stage 1: Unified Index Pruning (structural only) ──────────────────
+		# Remove indices from nodes that fail structural eligibility.
+		# Uses SimplifiedNode.is_structurally_indexable() - the same check used
+		# during index assignment (zero rule drift).
 		if auto_fix:
 			prune_ids: set[int] = set()
 			prune_reasons: dict[int, str] = {}
 			self._collect_prunable_indices(self._root, prune_ids, prune_reasons)
 
 			if prune_ids:
-				# Strip is_interactive from pruned tree nodes
 				pruned_tree = self._unset_is_interactive_in_tree(self._root, prune_ids)
-				# Remove pruned entries from selector_map
 				pruned_map = 0
 				for backend_id in prune_ids:
 					if backend_id in self.selector_map:
@@ -1008,39 +1059,83 @@ class SerializedDOMState:
 						pruned_map += 1
 				if pruned_tree > 0 or pruned_map > 0:
 					sample = []
-					for bid in list(prune_ids)[:5]:
+					for bid in sorted(prune_ids)[:5]:
 						reason = prune_reasons.get(bid, 'unknown')
 						sample.append(f'backendNodeId={bid}({reason})')
 					errors.append(
-						f'[PRUNED] Unified index pruning: removed {pruned_tree} tree flags '
+						f'[PRUNED] Structural index pruning: removed {pruned_tree} tree flags '
 						f'and {pruned_map} selector_map entries. Sample: {", ".join(sample)}'
 					)
 
-		# ── Stage 2: Tree ⇄ Map Alignment ───────────────────────────────────────
-		tree_interactive_ids: set[int] = set()
-		self._collect_interactive_ids(self._root, tree_interactive_ids)
-		selector_map_ids = set(self.selector_map.keys())
+		# ── Stage 2: Intersection Alignment (ultimate consistency guarantee) ───
+		# Keep ONLY indices that exist in BOTH the tree and selector_map.
+		# This is the final safety net - no matter what bugs exist upstream,
+		# after this stage the two sides are guaranteed to match exactly.
+		if auto_fix:
+			tree_ids: set[int] = set()
+			self._collect_interactive_ids(self._root, tree_ids)
+			map_ids = set(self.selector_map.keys())
 
-		in_tree_not_map = tree_interactive_ids - selector_map_ids
-		if in_tree_not_map:
-			errors.append(
-				f'{len(in_tree_not_map)} elements marked is_interactive in tree but not in selector_map: '
-				f'{sorted(list(in_tree_not_map))[:10]}...'
-			)
-			if auto_fix:
-				removed = self._unset_is_interactive_in_tree(self._root, in_tree_not_map)
-				errors.append(f'[FIXED] Unset is_interactive on {removed} tree nodes missing from selector_map')
+			intersection = tree_ids & map_ids
+			only_tree = tree_ids - map_ids
+			only_map = map_ids - tree_ids
 
-		in_map_not_tree = selector_map_ids - tree_interactive_ids
-		if in_map_not_tree:
-			errors.append(
-				f'{len(in_map_not_tree)} elements in selector_map but not marked is_interactive in tree: '
-				f'{sorted(list(in_map_not_tree))[:10]}...'
-			)
-			if auto_fix:
-				for backend_id in in_map_not_tree:
-					del self.selector_map[backend_id]
-				errors.append(f'[FIXED] Removed {len(in_map_not_tree)} selector_map entries missing from tree')
+			if only_tree or only_map:
+				# Remove tree-only from tree
+				if only_tree:
+					removed_tree = self._unset_is_interactive_in_tree(self._root, only_tree)
+					errors.append(
+						f'[ALIGNED] Removed {removed_tree} tree-only is_interactive flags '
+						f'(not in selector_map): {sorted(only_tree)[:10]}...'
+					)
+				# Remove map-only from map
+				if only_map:
+					for backend_id in only_map:
+						del self.selector_map[backend_id]
+					errors.append(
+						f'[ALIGNED] Removed {len(only_map)} map-only entries '
+						f'(not in tree): {sorted(only_map)[:10]}...'
+					)
+				errors.append(
+					f'[SAFE] Intersection alignment complete. {len(intersection)} indices '
+					f'confirmed on both sides.'
+				)
+
+		# ── Stage 3: Verification (confirm consistency after fixes) ────────────
+		if auto_fix:
+			post_fix_issues = self.validate_consistency(auto_fix=False)
+			if post_fix_issues:
+				# This should NEVER happen if intersection alignment worked correctly.
+				# If it does, there's a structural bug in the code.
+				errors.insert(
+					0,
+					f'[CRITICAL] Consistency gate FAILED verification after auto-fix! '
+					f'{len(post_fix_issues)} unresolved issues. This indicates a bug.',
+				)
+				for issue in post_fix_issues[:5]:
+					errors.append(f'   - {issue}')
+			else:
+				errors.append('[OK] Consistency verified after auto-fix.')
+
+		else:
+			# auto_fix=False: just report, don't modify
+			tree_ids: set[int] = set()
+			self._collect_interactive_ids(self._root, tree_ids)
+			map_ids = set(self.selector_map.keys())
+
+			in_tree_not_map = tree_ids - map_ids
+			if in_tree_not_map:
+				errors.append(
+					f'{len(in_tree_not_map)} elements marked is_interactive in tree but not in selector_map: '
+					f'{sorted(list(in_tree_not_map))[:10]}...'
+				)
+
+			in_map_not_tree = map_ids - tree_ids
+			if in_map_not_tree:
+				errors.append(
+					f'{len(in_map_not_tree)} elements in selector_map but not marked is_interactive in tree: '
+					f'{sorted(list(in_map_not_tree))[:10]}...'
+				)
 
 		return errors
 
@@ -1052,59 +1147,66 @@ class SerializedDOMState:
 		"""
 		Recursively collect backend_node_ids of nodes that should NOT have interactive indices.
 
-		This is the SINGLE source of truth for index pruning. ALL filtering rules
-		that can strip an index are applied here in one place:
+		This is the PRUNING half of the unified index policy. It delegates structural
+		eligibility checks to SimplifiedNode.is_structurally_indexable() - the SAME
+		method used by DOMTreeSerializer._is_element_indexable() for index assignment.
+		This guarantees zero rule drift between "add index" and "remove index" paths.
 
-		Rules applied:
-		1. should_display=False        → element explicitly hidden
-		2. excluded_by_parent=True     → filtered by parent bounding-box propagation
-		3. ignored_by_paint_order=True → filtered by paint-order / occlusion
-		4. inside_svg=True (non-root)  → collapsed SVG subtree children
-		5. parent_excluded=True        → cascaded exclusion from ancestor
-		6. no original_node / no valid backend_node_id → structurally invalid
-		7. DOCUMENT_FRAGMENT_NODE (shadow root) itself → never interactive
+		We still walk the tree here (rather than just calling is_structurally_indexable
+		on each node) to track cascading context: inside_svg and parent_excluded flow
+		from parent to child.
+
+		Args:
+			node: Current SimplifiedNode to check
+			prune_ids: Set of backend_node_ids to prune (output)
+			prune_reasons: Map of backend_node_id -> reason string (output)
+			inside_svg: Whether we're inside an SVG subtree
+			parent_excluded: Whether an ancestor has been pruned
 		"""
 		backend_id = getattr(node.original_node, 'backend_node_id', None) if node.original_node else None
-		node_type = getattr(node.original_node, 'node_type', None) if node.original_node else None
 		tag_name = getattr(node.original_node, 'tag_name', None) if node.original_node else None
 
-		# Determine if this specific node (not just inheriting) is an SVG root
+		# Update SVG context for this subtree
 		is_svg_root = bool(tag_name and tag_name.lower() == 'svg')
 		now_inside_svg = inside_svg or is_svg_root
 
-		should_prune = False
-		prune_reason = ''
+		# Use the unified structural eligibility check
+		structurally_eligible = node.is_structurally_indexable(
+			inside_svg=inside_svg,
+			parent_excluded=parent_excluded,
+		)
 
-		if node.original_node is None or backend_id is None:
-			should_prune = True
-			prune_reason = 'no_original_node_or_backend_id'
-		elif not node.should_display:
-			should_prune = True
-			prune_reason = 'should_display=False'
-		elif node.excluded_by_parent:
-			should_prune = True
-			prune_reason = 'excluded_by_parent'
-		elif node.ignored_by_paint_order:
-			should_prune = True
-			prune_reason = 'ignored_by_paint_order'
-		elif now_inside_svg and not is_svg_root:
-			# SVG root can be interactive, but its collapsed children cannot
-			should_prune = True
-			prune_reason = 'svg_subtree_child'
-		elif parent_excluded:
-			# Cascaded exclusion from a pruned ancestor
-			should_prune = True
-			prune_reason = 'parent_excluded'
-		elif node_type is not None and node_type == NodeType.DOCUMENT_FRAGMENT_NODE:
-			should_prune = True
-			prune_reason = 'document_fragment_node'
-
-		if should_prune and backend_id is not None:
+		if not structurally_eligible and backend_id is not None and isinstance(backend_id, int):
 			prune_ids.add(backend_id)
-			prune_reasons[backend_id] = prune_reason
+			# Determine a human-readable reason
+			if node.original_node is None:
+				reason = 'no_original_node'
+			elif not node.should_display:
+				reason = 'should_display=False'
+			elif node.excluded_by_parent:
+				reason = 'excluded_by_parent'
+			elif node.ignored_by_paint_order:
+				reason = 'ignored_by_paint_order'
+			elif parent_excluded:
+				reason = 'parent_excluded'
+			elif now_inside_svg and not is_svg_root:
+				reason = 'svg_subtree_child'
+			elif getattr(node.original_node, 'node_type', None) == NodeType.DOCUMENT_FRAGMENT_NODE:
+				reason = 'document_fragment_node'
+			else:
+				reason = 'structurally_ineligible'
+			prune_reasons[backend_id] = reason
 
-		# Children inherit pruning context
-		child_parent_excluded = parent_excluded or should_prune
+		# Children inherit pruning context ONLY for visually/structurally hidden nodes.
+		# DOCUMENT_FRAGMENT_NODE (shadow root) itself has no index, but its children
+		# are still valid interactive elements - they should NOT be cascade-excluded.
+		# SVG subtree exclusion is handled separately via inside_svg parameter.
+		node_is_visually_hidden = (
+			not node.should_display
+			or node.excluded_by_parent
+			or node.ignored_by_paint_order
+		)
+		child_parent_excluded = parent_excluded or node_is_visually_hidden
 
 		for child in node.children:
 			SerializedDOMState._collect_prunable_indices(
