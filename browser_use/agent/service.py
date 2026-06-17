@@ -62,7 +62,6 @@ from browser_use.agent.views import (
 	StepMetadata,
 )
 from browser_use.browser.events import _get_timeout
-from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
@@ -78,7 +77,6 @@ from browser_use.utils import (
 	check_latest_browser_use_version,
 	get_browser_use_version,
 	is_placeholder_url,
-	normalize_path,
 	sanitize_url_candidate,
 	time_execution_async,
 	time_execution_sync,
@@ -280,25 +278,47 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.task_id: str = self.id
 		self.session_id: str = uuid7str()
 
-		base_profile = browser_profile or DEFAULT_BROWSER_PROFILE
-		if base_profile is DEFAULT_BROWSER_PROFILE:
-			base_profile = base_profile.model_copy()
-		if demo_mode is not None and base_profile.demo_mode != demo_mode:
-			base_profile = base_profile.model_copy(update={'demo_mode': demo_mode})
-		browser_profile = base_profile
-
 		# Handle browser vs browser_session parameter (browser takes precedence)
 		if browser and browser_session:
 			raise ValueError('Cannot specify both "browser" and "browser_session" parameters. Use "browser" for the cleaner API.')
 		browser_session = browser or browser_session
 
-		if browser_session is not None and demo_mode is not None and browser_session.browser_profile.demo_mode != demo_mode:
-			browser_session.browser_profile = browser_session.browser_profile.model_copy(update={'demo_mode': demo_mode})
+		# Build profile updates from explicit parameters
+		profile_updates: dict[str, Any] = {}
+		if demo_mode is not None:
+			profile_updates['demo_mode'] = demo_mode
 
-		self.browser_session = browser_session or BrowserSession(
-			browser_profile=browser_profile,
-			id=uuid7str()[:-4] + self.id[-4:],  # re-use the same 4-char suffix so they show up together in logs
-		)
+		if browser_session is not None:
+			# User provided an existing session — just apply demo_mode override if needed
+			if profile_updates and browser_session.browser_profile.demo_mode != demo_mode:
+				browser_session.browser_profile = browser_session.browser_profile.model_copy(update=profile_updates)
+			self.browser_session = browser_session
+		else:
+			# No existing session — use UNIFIED factory that merges all config sources
+			session_id = uuid7str()[:-4] + self.id[-4:]
+			if browser_profile is not None:
+				# User provided an explicit profile — use it as direct_kwargs with highest priority
+				explicit_kwargs = browser_profile.model_dump(exclude_unset=True)
+				explicit_kwargs.update(profile_updates)
+				self.browser_session = BrowserSession.from_config_sources(
+					direct_kwargs=explicit_kwargs,
+					cli_args=None,
+					load_from_env=True,
+					load_from_config_file=True,
+					session_id=session_id,
+				)
+			else:
+				# No explicit profile — let the unified factory handle everything
+				self.browser_session = BrowserSession.from_config_sources(
+					direct_kwargs=profile_updates or None,
+					cli_args=None,
+					load_from_env=True,
+					load_from_config_file=True,
+					session_id=session_id,
+				)
+
+		# Always log the effective config so logs match actual browser state
+		self.browser_session.log_effective_config()
 
 		self._demo_mode_enabled: bool = bool(self.browser_profile.demo_mode) if self.browser_session else False
 		if self._demo_mode_enabled and getattr(self.browser_profile, 'headless', False):
@@ -653,53 +673,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		return self.llm.model if hasattr(self.llm, 'model') else 'unknown'
 
 	async def _check_and_update_downloads(self, context: str = '') -> None:
-		"""Check for new downloads and update available file paths.
-
-		Collects REAL LOCAL FILE PATHS (absolute paths on disk) from:
-		1. Browser session downloads (CDP download events, network response saves)
-		2. Tool-saved real files (save_as_pdf, screenshot with file_name)
-		3. Existing available_file_paths (user-provided real paths)
-
-		All of the above go through browser_session.downloaded_files via
-		add_downloaded_file() / FileDownloadedEvent, so they share one
-		unified availability registration pipeline.
-
-		FileSystem text files (write_file/replace_file) remain in a separate
-		namespace — they are tracked by the FileSystem instance and referenced
-		by virtual basename (e.g. "todo.md"), not by real disk path.
-		"""
+		"""Check for new downloads and update available file paths."""
 		if not self.has_downloads_path:
 			return
 
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 
 		try:
-			# Collect only real local downloads — FileSystem files are separate
-			real_downloads: list[str] = []
-
-			# Source 1: Browser session downloads (CDP download events)
-			session_downloads = self.browser_session.downloaded_files
-			real_downloads.extend(session_downloads)
-
-			# Normalize and deduplicate
-			norm_downloads: list[str] = []
-			for p in real_downloads:
-				norm = normalize_path(p)
-				if norm is not None:
-					norm_downloads.append(norm)
-			unique_downloads = list(dict.fromkeys(norm_downloads))
-
-			last_known_set: set[str] = set()
-			for p in self._last_known_downloads:
-				norm = normalize_path(p)
-				if norm is not None:
-					last_known_set.add(norm)
-
-			current_set = set(unique_downloads)
-
-			if current_set != last_known_set:
-				self._update_available_file_paths(unique_downloads)
-				self._last_known_downloads = list(unique_downloads)
+			current_downloads = self.browser_session.downloaded_files
+			if current_downloads != self._last_known_downloads:
+				self._update_available_file_paths(current_downloads)
+				self._last_known_downloads = current_downloads
 				if context:
 					self.logger.debug(f'📁 {context}: Updated available files')
 		except Exception as e:
@@ -707,40 +691,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.debug(f'📁 Failed to check for downloads{error_context}: {type(e).__name__}: {e}')
 
 	def _update_available_file_paths(self, downloads: list[str]) -> None:
-		"""Update available_file_paths with real downloaded files using normalized path comparison.
-
-		available_file_paths contains real local absolute paths from:
-		- User-provided paths
-		- Browser CDP downloads (DownloadsWatchdog)
-		- Network response saves (DownloadsWatchdog)
-		- Tool-saved real files (save_as_pdf, screenshot)
-
-		FileSystem virtual text files (write_file/replace_file) are tracked
-		separately by the FileSystem instance and referenced by basename.
-
-		Args:
-			downloads: List of real file paths to add (should already be normalized)
-		"""
+		"""Update available_file_paths with downloaded files."""
 		if not self.has_downloads_path:
 			return
 
-		# Normalize existing available_file_paths — these are all real local paths
-		existing_normalized: dict[str, str] = {}
-		for p in self.available_file_paths or []:
-			norm = normalize_path(p)
-			if norm is not None:
-				existing_normalized[norm] = norm
-
-		new_files: list[str] = []
-		for download_path in downloads:
-			norm_path = normalize_path(download_path)
-			if norm_path and norm_path not in existing_normalized:
-				new_files.append(norm_path)
-				existing_normalized[norm_path] = norm_path
+		current_files = set(self.available_file_paths or [])
+		new_files = set(downloads) - current_files
 
 		if new_files:
-			# Rebuild available_file_paths with all normalized unique real paths
-			self.available_file_paths = list(existing_normalized.values())
+			self.available_file_paths = list(current_files | new_files)
 
 			self.logger.info(
 				f'📁 Added {len(new_files)} downloaded files to available_file_paths (total: {len(self.available_file_paths)} files)'
@@ -748,7 +707,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			for file_path in new_files:
 				self.logger.info(f'📄 New file available: {file_path}')
 		else:
-			self.logger.debug(f'📁 No new downloads detected (tracking {len(existing_normalized)} real files)')
+			self.logger.debug(f'📁 No new downloads detected (tracking {len(current_files)} files)')
 
 	def _set_file_system(self, file_system_path: str | None = None) -> None:
 		# Check for conflicting parameters

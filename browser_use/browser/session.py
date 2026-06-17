@@ -56,13 +56,7 @@ from browser_use.browser.profile import BrowserProfile, ProxySettings
 from browser_use.browser.views import BrowserStateSummary, TabInfo
 from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, TargetInfo
 from browser_use.observability import observe_debug
-from browser_use.utils import (
-	_log_pretty_url,
-	create_task_with_error_handling,
-	is_new_tab_page,
-	is_path_in_list,
-	normalize_path,
-)
+from browser_use.utils import _log_pretty_url, create_task_with_error_handling, is_new_tab_page
 
 if TYPE_CHECKING:
 	from browser_use.actor.page import Page
@@ -464,6 +458,94 @@ class BrowserSession(BaseModel):
 
 		return list_chrome_profiles()
 
+	@classmethod
+	def from_config_sources(
+		cls,
+		direct_kwargs: dict[str, Any] | None = None,
+		cli_args: dict[str, Any] | None = None,
+		load_from_env: bool = True,
+		load_from_config_file: bool = True,
+		session_id: str | None = None,
+		skip_watchdogs: bool = False,
+	) -> 'BrowserSession':
+		"""Create BrowserSession by merging config sources with defined priority.
+
+		This is the unified entry point for ALL entry points (Python API, TUI,
+		skill_cli, beta agent, cloud/sandbox).
+
+		Priority (highest to lowest):
+		1. direct_kwargs - Python API direct parameters
+		2. cli_args - CLI command-line arguments
+		3. Environment variables (BROWSER_USE_*)
+		4. Config file (config.json)
+		5. Pydantic defaults
+
+		Args:
+		    direct_kwargs: Direct Python API parameters (highest priority)
+		    cli_args: CLI command-line arguments
+		    load_from_env: Whether to load environment variables
+		    load_from_config_file: Whether to load config.json
+		    session_id: Optional explicit session ID
+		    skip_watchdogs: If True, uses lightweight mode without watchdogs
+		        (for skill_cli daemon and similar use cases)
+		"""
+		from browser_use.browser.profile import BrowserProfile
+
+		# Build profile using the unified merge logic
+		browser_profile = BrowserProfile.from_config_sources(
+			direct_kwargs=direct_kwargs,
+			cli_args=cli_args,
+			load_from_env=load_from_env,
+			load_from_config_file=load_from_config_file,
+		)
+
+		# Session-level kwargs (not part of BrowserProfile)
+		session_kwargs: dict[str, Any] = {
+			'browser_profile': browser_profile,
+		}
+		if session_id:
+			session_kwargs['id'] = session_id
+
+		logger = logging.getLogger('browser_use')
+		logger.info(
+			f'[BrowserSession] Unified config: headless={browser_profile.headless}, '
+			f'use_cloud={browser_profile.use_cloud}, cdp_url={bool(browser_profile.cdp_url)}, '
+			f'proxy={bool(browser_profile.proxy)}, downloads_path={browser_profile.downloads_path}'
+		)
+
+		if skip_watchdogs:
+			# Use lightweight CLI session variant
+			from browser_use.skill_cli.browser import CLIBrowserSession
+
+			return CLIBrowserSession(**session_kwargs)
+
+		return cls(**session_kwargs)
+
+	def log_effective_config(self) -> None:
+		"""Log the effective browser configuration for debugging.
+
+		Ensures logs show the same configuration that the browser actually uses.
+		"""
+		p = self.browser_profile
+		self.logger.info(
+			'[BrowserSession] Effective configuration:\n'
+			f'  - Session ID: {self.id}\n'
+			f'  - Headless: {p.headless}\n'
+			f'  - Use cloud: {p.use_cloud}\n'
+			f'  - CDP URL: {p.cdp_url or "<will be provisioned>"}\n'
+			f'  - Is local: {p.is_local}\n'
+			f'  - User data dir: {p.user_data_dir or "<incognito>"}\n'
+			f'  - Profile directory: {p.profile_directory}\n'
+			f'  - Downloads path: {p.downloads_path}\n'
+			f'  - Storage state: {bool(p.storage_state)}\n'
+			f'  - Proxy: {p.proxy.server if p.proxy else None}\n'
+			f'  - Allowed domains: {p.allowed_domains}\n'
+			f'  - Window size: {p.window_size}\n'
+			f'  - Viewport: {p.viewport}\n'
+			f'  - Keep alive: {p.keep_alive}\n'
+			f'  - Extensions enabled: {p.enable_default_extensions}'
+		)
+
 	# Convenience properties for common browser settings
 	@property
 	def cdp_url(self) -> str | None:
@@ -568,6 +650,8 @@ class BrowserSession(BaseModel):
 	_reconnect_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
 	_reconnect_task: asyncio.Task | None = PrivateAttr(default=None)
 	_intentional_stop: bool = PrivateAttr(default=False)
+	_stop_lock: asyncio.Lock = PrivateAttr(default_factory=asyncio.Lock)
+	_is_stopped: bool = PrivateAttr(default=False)
 
 	_logger: Any = PrivateAttr(default=None)
 
@@ -660,7 +744,7 @@ class BrowserSession(BaseModel):
 			self._demo_mode.reset()
 			self._demo_mode = None
 
-		self._intentional_stop = False
+		self._reset_stop_state()
 		self.logger.info('✅ Browser session reset complete')
 
 	def model_post_init(self, __context) -> None:
@@ -703,23 +787,28 @@ class BrowserSession(BaseModel):
 
 	async def kill(self) -> None:
 		"""Kill the browser session and reset all state."""
-		self._intentional_stop = True
-		self.logger.debug('🛑 kill() called - stopping browser with force=True and resetting state')
+		async with self._stop_lock:
+			if self._is_stopped:
+				self.logger.debug('🛑 kill() called but already stopped - skipping')
+				return
+			self._is_stopped = True
+			self._intentional_stop = True
+			self.logger.debug('🛑 kill() called - stopping browser with force=True and resetting state')
 
-		# First save storage state while CDP is still connected
-		from browser_use.browser.events import SaveStorageStateEvent
+			# First save storage state while CDP is still connected
+			from browser_use.browser.events import SaveStorageStateEvent
 
-		save_event = self.event_bus.dispatch(SaveStorageStateEvent())
-		await save_event
+			save_event = self.event_bus.dispatch(SaveStorageStateEvent())
+			await save_event
 
-		# Dispatch stop event to kill the browser
-		await self.event_bus.dispatch(BrowserStopEvent(force=True))
-		# Stop the event bus
-		await self.event_bus.stop(clear=True, timeout=5)
-		# Reset all state
-		await self.reset()
-		# Create fresh event bus
-		self.event_bus = EventBus()
+			# Dispatch stop event to kill the browser
+			await self.event_bus.dispatch(BrowserStopEvent(force=True))
+			# Stop the event bus
+			await self.event_bus.stop(clear=True, timeout=5)
+			# Reset all state
+			await self.reset()
+			# Create fresh event bus
+			self.event_bus = EventBus()
 
 	async def stop(self) -> None:
 		"""Stop the browser session without killing the browser process.
@@ -727,28 +816,38 @@ class BrowserSession(BaseModel):
 		This clears event buses and cached state but keeps the browser alive.
 		Useful when you want to clean up resources but plan to reconnect later.
 		"""
-		self._intentional_stop = True
-		self.logger.debug('⏸️  stop() called - stopping browser gracefully (force=False) and resetting state')
+		async with self._stop_lock:
+			if self._is_stopped:
+				self.logger.debug('⏸️  stop() called but already stopped - skipping')
+				return
+			self._is_stopped = True
+			self._intentional_stop = True
+			self.logger.debug('⏸️  stop() called - stopping browser gracefully (force=False) and resetting state')
 
-		# First save storage state while CDP is still connected
-		from browser_use.browser.events import SaveStorageStateEvent
+			# First save storage state while CDP is still connected
+			from browser_use.browser.events import SaveStorageStateEvent
 
-		save_event = self.event_bus.dispatch(SaveStorageStateEvent())
-		await save_event
+			save_event = self.event_bus.dispatch(SaveStorageStateEvent())
+			await save_event
 
-		# Now dispatch BrowserStopEvent to notify watchdogs
-		await self.event_bus.dispatch(BrowserStopEvent(force=False))
+			# Now dispatch BrowserStopEvent to notify watchdogs
+			await self.event_bus.dispatch(BrowserStopEvent(force=False))
 
-		# Stop the event bus
-		await self.event_bus.stop(clear=True, timeout=5)
-		# Reset all state
-		await self.reset()
-		# Create fresh event bus
-		self.event_bus = EventBus()
+			# Stop the event bus
+			await self.event_bus.stop(clear=True, timeout=5)
+			# Reset all state
+			await self.reset()
+			# Create fresh event bus
+			self.event_bus = EventBus()
 
 	async def close(self) -> None:
 		"""Alias for stop()."""
 		await self.stop()
+
+	def _reset_stop_state(self) -> None:
+		"""Internal: reset the stopped flag after reconnect/reset."""
+		self._is_stopped = False
+		self._intentional_stop = False
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='browser_start_event_handler')
 	async def on_BrowserStartEvent(self, event: BrowserStartEvent) -> dict[str, str]:
@@ -1213,36 +1312,14 @@ class BrowserSession(BaseModel):
 	async def on_FileDownloadedEvent(self, event: FileDownloadedEvent) -> None:
 		"""Track downloaded files during this session."""
 		self.logger.debug(f'FileDownloadedEvent received: {event.file_name} at {event.path}')
-		norm_path = normalize_path(event.path)
-		if norm_path:
-			if not is_path_in_list(norm_path, self._downloaded_files):
-				self._downloaded_files.append(norm_path)
-				self.logger.info(
-					f'📁 Tracked download: {event.file_name} ({len(self._downloaded_files)} total downloads in session)'
-				)
-			else:
-				self.logger.debug(f'File already tracked (normalized): {norm_path}')
+		if event.path and event.path not in self._downloaded_files:
+			self._downloaded_files.append(event.path)
+			self.logger.info(f'📁 Tracked download: {event.file_name} ({len(self._downloaded_files)} total downloads in session)')
 		else:
-			self.logger.warning(f'FileDownloadedEvent has invalid path: {event}')
-
-	def add_downloaded_file(self, path: str | Path) -> str | None:
-		"""Manually add a file to the downloaded files list.
-
-		Used by save_as_pdf, write_file, and other tools that save files
-		outside the CDP download flow to ensure they're visible to the agent.
-
-		Args:
-			path: Path to the file to add
-
-		Returns:
-			Normalized path if added, None if path was invalid or already present
-		"""
-		norm_path = normalize_path(path)
-		if norm_path and not is_path_in_list(norm_path, self._downloaded_files):
-			self._downloaded_files.append(norm_path)
-			self.logger.debug(f'📁 Manually tracked file: {norm_path}')
-			return norm_path
-		return None
+			if not event.path:
+				self.logger.warning(f'FileDownloadedEvent has no path: {event}')
+			else:
+				self.logger.debug(f'File already tracked: {event.path}')
 
 	def _cloud_session_id_from_cdp_url(self) -> str | None:
 		"""Derive cloud browser session ID from a Browser Use CDP URL."""
@@ -3301,14 +3378,9 @@ class BrowserSession(BaseModel):
 		"""Get list of files downloaded during this browser session.
 
 		Returns:
-			list[str]: List of normalized absolute file paths to downloaded files in this session
+			list[str]: List of absolute file paths to downloaded files in this session
 		"""
-		result: list[str] = []
-		for p in self._downloaded_files:
-			norm = normalize_path(p)
-			if norm is not None:
-				result.append(norm)
-		return result
+		return self._downloaded_files.copy()
 
 	# endregion - ========== Helper Methods ==========
 

@@ -156,7 +156,7 @@ load_dotenv()
 
 from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
-from browser_use.browser import BrowserProfile, BrowserSession
+from browser_use.browser import BrowserSession
 from browser_use.logging_config import addLoggingLevel
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
@@ -1526,15 +1526,18 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 		# Get agent settings from config
 		agent_settings = AgentSettings.model_validate(config.get('agent', {}))
 
-		# Create browser session with config parameters
+		# Create browser session using the UNIFIED factory — same path as all entry points
 		browser_config = config.get('browser', {})
-		# Remove None values from browser_config
 		browser_config = {k: v for k, v in browser_config.items() if v is not None}
-		# Create BrowserProfile with user_data_dir
-		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
-		browser_session = BrowserSession(
-			browser_profile=profile,
+		direct_kwargs = {'user_data_dir': str(USER_DATA_DIR)}
+		direct_kwargs.update(browser_config)
+		browser_session = BrowserSession.from_config_sources(
+			direct_kwargs=direct_kwargs,
+			cli_args=None,
+			load_from_env=True,
+			load_from_config_file=True,
 		)
+		browser_session.log_effective_config()
 
 		# Create and run agent
 		agent = Agent(
@@ -1643,14 +1646,17 @@ async def textual_interface(config: dict[str, Any]):
 		else:
 			logger.info('Browser mode: visible')
 
-		# Create BrowserSession directly with config parameters
-		# Remove None values from browser_config
+		# Use UNIFIED BrowserSession factory — same path as all other entry points
 		browser_config = {k: v for k, v in browser_config.items() if v is not None}
-		# Create BrowserProfile with user_data_dir
-		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
-		browser_session = BrowserSession(
-			browser_profile=profile,
+		direct_kwargs = {'user_data_dir': str(USER_DATA_DIR)}
+		direct_kwargs.update(browser_config)
+		browser_session = BrowserSession.from_config_sources(
+			direct_kwargs=direct_kwargs,
+			cli_args=None,
+			load_from_env=True,
+			load_from_config_file=True,
 		)
+		browser_session.log_effective_config()
 		logger.debug('BrowserSession initialized successfully')
 
 		# Set up FIFO logging pipes for streaming logs to UI

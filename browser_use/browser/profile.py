@@ -1286,3 +1286,178 @@ async function initialize(checkInitialized, magic) {{
 			assert self.no_viewport is False
 
 		assert not (self.headless and self.no_viewport), 'headless=True and no_viewport=True cannot both be set at the same time'
+
+	@classmethod
+	def from_config_sources(
+		cls,
+		direct_kwargs: dict[str, Any] | None = None,
+		cli_args: dict[str, Any] | None = None,
+		load_from_env: bool = True,
+		load_from_config_file: bool = True,
+	) -> Self:
+		"""Create BrowserProfile by merging config sources with defined priority.
+
+		Priority (highest to lowest):
+		1. direct_kwargs - Python API direct parameters
+		2. cli_args - CLI command-line arguments
+		3. Environment variables (BROWSER_USE_*)
+		4. Config file (config.json)
+		5. Pydantic defaults
+		"""
+		from browser_use.config import CONFIG, FlatEnvConfig
+
+		merged: dict[str, Any] = {}
+
+		# Layer 4: Config file (lowest priority except defaults)
+		if load_from_config_file:
+			try:
+				config_data = CONFIG.load_config()
+				browser_profile_cfg = config_data.get('browser_profile', {})
+				if browser_profile_cfg:
+					merged.update(browser_profile_cfg)
+			except Exception as e:
+				logger.debug(f'[BrowserProfile] Failed to load config file: {e}')
+
+		# Layer 3: Environment variables
+		if load_from_env:
+			try:
+				env_config = FlatEnvConfig()
+				env_overrides: dict[str, Any] = {}
+
+				if env_config.BROWSER_USE_HEADLESS is not None:
+					env_overrides['headless'] = env_config.BROWSER_USE_HEADLESS
+
+				if env_config.BROWSER_USE_ALLOWED_DOMAINS:
+					domains = [d.strip() for d in env_config.BROWSER_USE_ALLOWED_DOMAINS.split(',') if d.strip()]
+					env_overrides['allowed_domains'] = domains
+
+				# Proxy settings from env
+				proxy_dict: dict[str, Any] = {}
+				if env_config.BROWSER_USE_PROXY_URL:
+					proxy_dict['server'] = env_config.BROWSER_USE_PROXY_URL
+				if env_config.BROWSER_USE_NO_PROXY:
+					proxy_dict['bypass'] = ','.join([d.strip() for d in env_config.BROWSER_USE_NO_PROXY.split(',') if d.strip()])
+				if env_config.BROWSER_USE_PROXY_USERNAME:
+					proxy_dict['username'] = env_config.BROWSER_USE_PROXY_USERNAME
+				if env_config.BROWSER_USE_PROXY_PASSWORD:
+					proxy_dict['password'] = env_config.BROWSER_USE_PROXY_PASSWORD
+				if proxy_dict:
+					env_overrides['proxy'] = ProxySettings(**proxy_dict)
+
+				if env_config.BROWSER_USE_DISABLE_EXTENSIONS is not None:
+					env_overrides['enable_default_extensions'] = not env_config.BROWSER_USE_DISABLE_EXTENSIONS
+
+				if env_overrides:
+					merged.update(env_overrides)
+			except Exception as e:
+				logger.debug(f'[BrowserProfile] Failed to load env config: {e}')
+
+		# Layer 2: CLI arguments
+		if cli_args:
+			cli_kwargs = cls._normalize_cli_args(cli_args)
+			merged.update(cli_kwargs)
+
+		# Layer 1: Direct kwargs (highest priority)
+		if direct_kwargs:
+			merged.update(direct_kwargs)
+
+		# Handle proxy dict-to-object conversion
+		if 'proxy' in merged and isinstance(merged['proxy'], dict):
+			merged['proxy'] = ProxySettings(**merged['proxy'])
+
+		# Handle deprecated window_width/window_height -> window_size
+		if 'window_width' in merged or 'window_height' in merged:
+			w = merged.pop('window_width', None)
+			h = merged.pop('window_height', None)
+			if 'window_size' not in merged and (w or h):
+				merged['window_size'] = ViewportSize(
+					width=w or (merged.get('window_size') and merged['window_size'].width) or 1920,
+					height=h or (merged.get('window_size') and merged['window_size'].height) or 1080,
+				)
+
+		logger.debug(f'[BrowserProfile] Merged config sources, {len(merged)} fields set')
+		return cls(**merged)
+
+	@staticmethod
+	def _normalize_cli_args(cli_args: dict[str, Any]) -> dict[str, Any]:
+		"""Normalize CLI argument names to BrowserProfile field names."""
+		result: dict[str, Any] = {}
+		arg_mapping = {
+			'headless': 'headless',
+			'headed': 'headless',
+			'user_data_dir': 'user_data_dir',
+			'profile_directory': 'profile_directory',
+			'cdp_url': 'cdp_url',
+			'connect': 'cdp_url',
+			'proxy_url': 'proxy_url',
+			'no_proxy': 'no_proxy',
+			'proxy_username': 'proxy_username',
+			'proxy_password': 'proxy_password',
+			'window_width': 'window_width',
+			'window_height': 'window_height',
+			'downloads_path': 'downloads_path',
+			'storage_state': 'storage_state',
+			'use_cloud': 'use_cloud',
+			'cloud_profile_id': 'cloud_profile_id',
+			'cloud_proxy_country_code': 'cloud_proxy_country_code',
+			'cloud_timeout': 'cloud_timeout',
+		}
+
+		for arg_name, value in cli_args.items():
+			if value is None:
+				continue
+			mapped_name = arg_mapping.get(arg_name, arg_name)
+
+			if arg_name == 'headed':
+				result['headless'] = not value
+			elif arg_name in ('proxy_url', 'no_proxy', 'proxy_username', 'proxy_password'):
+				if 'proxy' not in result:
+					result['proxy'] = {}
+				if arg_name == 'proxy_url':
+					result['proxy']['server'] = value
+				elif arg_name == 'no_proxy':
+					result['proxy']['bypass'] = value if isinstance(value, str) else ','.join(value)
+				else:
+					result['proxy'][arg_name.replace('proxy_', '')] = value
+			else:
+				result[mapped_name] = value
+
+		return result
+
+	def get_config_signature(self) -> dict[str, Any]:
+		"""Get a stable signature of the effective configuration for comparison.
+
+		Used by skill_cli daemon to check if running config matches requested config.
+		"""
+		fields_to_compare = [
+			'headless',
+			'cdp_url',
+			'use_cloud',
+			'user_data_dir',
+			'profile_directory',
+			'downloads_path',
+			'storage_state',
+			'allowed_domains',
+			'prohibited_domains',
+			'proxy',
+			'window_size',
+			'viewport',
+			'device_scale_factor',
+			'keep_alive',
+			'auto_download_pdfs',
+			'disable_security',
+			'cloud_browser_params',
+		]
+		sig: dict[str, Any] = {}
+		for field in fields_to_compare:
+			val = getattr(self, field, None)
+			if val is not None:
+				if isinstance(val, ProxySettings):
+					sig[field] = val.model_dump()
+				elif isinstance(val, CloudBrowserParams):
+					sig[field] = val.model_dump()
+				elif hasattr(val, 'model_dump'):
+					sig[field] = val.model_dump()
+				else:
+					sig[field] = val
+		return sig
