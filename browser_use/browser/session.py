@@ -1386,7 +1386,7 @@ class BrowserSession(BaseModel):
 		"""
 		from browser_use.browser.watchdogs.storage_state_watchdog import _normalize_storage_state
 
-		from pathlib import Path
+		from browser_use.browser.storage_state import normalize_storage_state, write_storage_state_atomically
 
 		cookies = await self._cdp_get_cookies()
 
