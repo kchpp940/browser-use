@@ -55,6 +55,7 @@ from browser_use.agent.views import (
 )
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.browser.profile import CHROME_DETERMINISTIC_RENDERING_ARGS, CHROME_DISABLE_SECURITY_ARGS, CHROME_DOCKER_ARGS
+from browser_use.browser.storage_state import StorageStateSource
 from browser_use.browser.views import BrowserStateHistory, BrowserStateSummary, TabInfo
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.base import BaseChatModel
@@ -1074,32 +1075,34 @@ def _extract_browser_window_size(
 	return None
 
 
-def _storage_state_value(value: Any) -> dict[str, Any] | None:
-	if isinstance(value, dict):
-		return value
+def _storage_state_source(value: Any) -> StorageStateSource | None:
+	if value is None:
+		return None
 	if hasattr(value, 'model_dump'):
-		dumped = value.model_dump()
-		return dumped if isinstance(dumped, dict) else None
-	if isinstance(value, (str, os.PathLike)) and str(value):
-		path = Path(value).expanduser()
-		if not path.exists():
-			return None
-		try:
-			loaded = json.loads(path.read_text())
-		except (OSError, json.JSONDecodeError):
-			return None
-		return loaded if isinstance(loaded, dict) else None
-	return None
+		value = value.model_dump()
+	return StorageStateSource.from_any(value)
+
+
+def _storage_state_value(value: Any) -> dict[str, Any] | None:
+	source = _storage_state_source(value)
+	return source.value if source is not None else None
 
 
 def _extract_browser_storage_state(
 	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
 ) -> dict[str, Any] | None:
+	source = _extract_browser_storage_state_source(browser_session, browser_profile)
+	return source.value if source is not None else None
+
+
+def _extract_browser_storage_state_source(
+	browser_session: BrowserSession | None, browser_profile: BrowserProfile | None
+) -> StorageStateSource | None:
 	session_profile = getattr(browser_session, 'browser_profile', None)
 	for profile in (session_profile, browser_profile, browser_session):
-		value = _storage_state_value(getattr(profile, 'storage_state', None))
-		if value is not None:
-			return value
+		source = _storage_state_source(getattr(profile, 'storage_state', None))
+		if source is not None:
+			return source
 	return None
 
 
@@ -4448,7 +4451,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		)
 		self.browser_no_viewport, self.browser_viewport = _extract_browser_viewport(self.browser_session, self.browser_profile)
 		self.browser_window_size = _extract_browser_window_size(self.browser_session, self.browser_profile)
-		self.browser_storage_state = _extract_browser_storage_state(self.browser_session, self.browser_profile)
+		self._browser_storage_state_source = _extract_browser_storage_state_source(self.browser_session, self.browser_profile)
+		self.browser_storage_state = self._browser_storage_state_source.value if self._browser_storage_state_source else None
+		self.browser_storage_state_path = self._browser_storage_state_source.path if self._browser_storage_state_source else None
 		self.sensitive_data_context = _sensitive_data_context(sensitive_data)
 		_warn_sensitive_data_domain_constraints(self.logger, sensitive_data, self.allowed_domains)
 		self.display_files_in_done_text = display_files_in_done_text

@@ -1384,8 +1384,6 @@ class BrowserSession(BaseModel):
 			Storage state dict with cookies in Playwright format.
 
 		"""
-		from browser_use.browser.watchdogs.storage_state_watchdog import _normalize_storage_state
-
 		from browser_use.browser.storage_state import normalize_storage_state, write_storage_state_atomically
 
 		cookies = await self._cdp_get_cookies()
@@ -1407,14 +1405,13 @@ class BrowserSession(BaseModel):
 			'origins': [],
 		}
 
-		storage_state = _normalize_storage_state(storage_state)
+		storage_state = normalize_storage_state(storage_state)
 
 		if output_path:
-			import json
+			from pathlib import Path
 
 			output_file = Path(output_path).expanduser().resolve()
-			output_file.parent.mkdir(parents=True, exist_ok=True)
-			output_file.write_text(json.dumps(storage_state, indent=2, ensure_ascii=False), encoding='utf-8')
+			write_storage_state_atomically(output_file, storage_state)
 			self.logger.info(f'💾 Exported {len(cookies)} cookies to {output_file}')
 
 		return storage_state
