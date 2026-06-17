@@ -1,7 +1,7 @@
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from browser_use.browser import BrowserSession
 from browser_use.filesystem.file_system import FileSystem
@@ -59,11 +59,20 @@ class RegisteredAction(BaseModel):
 class ActionModel(BaseModel):
 	"""Base model for dynamically created action models"""
 
-	# this will have all the registered actions, e.g.
-	# click_element = param_model = ClickElementParams
-	# done = param_model = None
-	#
 	model_config = ConfigDict(arbitrary_types_allowed=True, extra='forbid')
+
+	@model_validator(mode='before')
+	@classmethod
+	def _preprocess_input(cls, data: Any) -> Any:
+		"""Preprocess input to handle common edge cases from different LLM providers."""
+		if isinstance(data, dict):
+			data = data.copy()
+			# Remove None-valued fields to avoid validation issues with strict schemas
+			# Some providers may explicitly set fields to null instead of omitting them
+			keys_to_remove = [k for k, v in data.items() if v is None]
+			for k in keys_to_remove:
+				del data[k]
+		return data
 
 	def get_index(self) -> int | None:
 		"""Get the index of the action"""

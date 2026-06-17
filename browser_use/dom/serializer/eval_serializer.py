@@ -1,5 +1,6 @@
 # @file purpose: Concise evaluation serializer for DOM trees - optimized for LLM query writing
 
+
 from browser_use.dom.utils import cap_text_length
 from browser_use.dom.views import (
 	EnhancedDOMTreeNode,
@@ -109,16 +110,7 @@ SVG_ELEMENTS = {
 
 
 class DOMEvalSerializer:
-	"""Ultra-concise DOM serializer for quick LLM query writing.
-
-	NOTE: This serializer operates on the SAME SimplifiedNode tree as the main
-	DOMTreeSerializer. This ensures interactive element indices (backend_node_id)
-	are perfectly consistent with the selector_map used for action execution.
-
-	The eval serializer shows MORE context (all semantic elements, not just
-	interactive ones) but uses the same element set and the same interactivity
-	source of truth (node.is_interactive).
-	"""
+	"""Ultra-concise DOM serializer for quick LLM query writing."""
 
 	@staticmethod
 	def serialize_tree(node: SimplifiedNode | None, include_attributes: list[str], depth: int = 0) -> str:
@@ -126,19 +118,19 @@ class DOMEvalSerializer:
 		Serialize complete DOM tree structure for LLM understanding.
 
 		Strategy:
-		- Uses SimplifiedNode tree as the single source of truth (consistent with selector_map)
-		- Shows semantic elements for context, not just interactive ones
-		- Interactive elements show full attributes + [i_backend_node_id]
+		- Show ALL elements to preserve DOM structure
+		- Non-interactive elements show just tag name
+		- Interactive elements show full attributes + [index]
 		- Self-closing tags only (no closing tags)
 		"""
 		if not node:
 			return ''
 
-		# Skip excluded nodes but process children (consistent with DOMTreeSerializer)
+		# Skip excluded nodes but process children
 		if hasattr(node, 'excluded_by_parent') and node.excluded_by_parent:
 			return DOMEvalSerializer._serialize_children(node, include_attributes, depth)
 
-		# Skip nodes marked as should_display=False (consistent with DOMTreeSerializer)
+		# Skip nodes marked as should_display=False
 		if not node.should_display:
 			return DOMEvalSerializer._serialize_children(node, include_attributes, depth)
 
@@ -147,14 +139,21 @@ class DOMEvalSerializer:
 
 		if node.original_node.node_type == NodeType.ELEMENT_NODE:
 			tag = node.original_node.tag_name.lower()
+			is_visible = node.original_node.snapshot_node and node.original_node.is_visible
+
+			# Container elements that should be shown even if invisible (might have visible children)
+			container_tags = {'html', 'body', 'div', 'main', 'section', 'article', 'aside', 'header', 'footer', 'nav'}
+
+			# Skip invisible elements UNLESS they're containers or iframes (which might have visible children)
+			if not is_visible and tag not in container_tags and tag not in ['iframe', 'frame']:
+				return DOMEvalSerializer._serialize_children(node, include_attributes, depth)
 
 			# Special handling for iframes - show them with their content
-			# NOTE: Content comes from node.children (SimplifiedNode), NOT raw content_document
 			if tag in ['iframe', 'frame']:
 				return DOMEvalSerializer._serialize_iframe(node, include_attributes, depth)
 
-			# Special handling for SVG elements - show the tag but collapse children
-			# SVG child elements are already filtered out of SimplifiedNode tree by _create_simplified_tree
+			# Skip SVG elements entirely - they're just decorative graphics with no interaction value
+			# Show the <svg> tag itself to indicate graphics, but don't recurse into children
 			if tag == 'svg':
 				line = f'{depth_str}'
 				# Add [i_X] for interactive SVG elements only
@@ -166,6 +165,10 @@ class DOMEvalSerializer:
 					line += f' {attributes_str}'
 				line += ' /> <!-- SVG content collapsed -->'
 				return line
+
+			# Skip SVG child elements entirely (path, rect, g, circle, etc.)
+			if tag in SVG_ELEMENTS:
+				return ''
 
 			# Build compact attributes string
 			attributes_str = DOMEvalSerializer._build_compact_attributes(node.original_node)
@@ -179,9 +182,9 @@ class DOMEvalSerializer:
 			# Build compact element representation
 			line = f'{depth_str}'
 			# Add backend node ID notation - [i_X] for interactive elements only
-			# Uses SAME backend_node_id as DOMTreeSerializer and selector_map
 			if node.is_interactive:
 				line += f'[i_{node.original_node.backend_node_id}] '
+			# Non-interactive elements don't get an index notation
 			line += f'<{tag}'
 
 			if attributes_str:
@@ -196,8 +199,8 @@ class DOMEvalSerializer:
 			# Add inline text if present (keep it on same line for compactness)
 			inline_text = DOMEvalSerializer._get_inline_text(node)
 
-			# Container elements that always show children
-			container_tags = {'html', 'body', 'div', 'main', 'section', 'article', 'aside', 'header', 'footer', 'nav'}
+			# For containers (html, body, div, etc.), always show children even if there's inline text
+			# For other elements, inline text replaces children (more compact)
 			is_container = tag in container_tags
 
 			if inline_text and not is_container:
@@ -218,7 +221,7 @@ class DOMEvalSerializer:
 			pass
 
 		elif node.original_node.node_type == NodeType.DOCUMENT_FRAGMENT_NODE:
-			# Shadow DOM - show children directly with minimal marker
+			# Shadow DOM - just show children directly with minimal marker
 			if node.children:
 				formatted_text.append(f'{depth_str}#shadow')
 				children_text = DOMEvalSerializer._serialize_children(node, include_attributes, depth + 1)
@@ -254,14 +257,14 @@ class DOMEvalSerializer:
 			# If we're in a list container and this child is an li element
 			if is_list_container and current_tag == 'li':
 				li_count += 1
-				# Skip li elements after the 50th one
+				# Skip li elements after the 5th one
 				if li_count > max_list_items:
 					continue
 
 			# Track consecutive anchor tags (links)
 			if current_tag == 'a':
 				consecutive_link_count += 1
-				# Skip links after the 50th consecutive one
+				# Skip links after the 5th consecutive one
 				if consecutive_link_count > max_consecutive_links:
 					total_links_skipped += 1
 					continue
@@ -293,44 +296,6 @@ class DOMEvalSerializer:
 			)
 
 		return '\n'.join(children_output)
-
-	@staticmethod
-	def _serialize_iframe(node: SimplifiedNode, include_attributes: list[str], depth: int) -> str:
-		"""Handle iframe serialization with content from SimplifiedNode children.
-
-		IMPORTANT: Uses node.children (SimplifiedNode tree) as the source of truth
-		for iframe content, NOT node.original_node.content_document. This ensures:
-		- Same element filtering as the main DOM tree
-		- Same interactive element detection
-		- Same indices as the selector_map
-		"""
-		formatted_text = []
-		depth_str = depth * '\t'
-		tag = node.original_node.tag_name.lower()
-
-		# Build iframe element with key attributes
-		attributes_str = DOMEvalSerializer._build_compact_attributes(node.original_node)
-		line = f'{depth_str}<{tag}'
-		if attributes_str:
-			line += f' {attributes_str}'
-
-		# Add scroll info for iframe content
-		if node.original_node.should_show_scroll_info:
-			scroll_text = node.original_node.get_scroll_info_text()
-			if scroll_text:
-				line += f' scroll="{scroll_text}"'
-
-		line += ' />'
-		formatted_text.append(line)
-
-		# Serialize iframe content from SimplifiedNode children (single source of truth)
-		if node.children:
-			formatted_text.append(f'{depth_str}\t#iframe-content')
-			children_text = DOMEvalSerializer._serialize_children(node, include_attributes, depth + 2)
-			if children_text:
-				formatted_text.append(children_text)
-
-		return '\n'.join(formatted_text)
 
 	@staticmethod
 	def _build_compact_attributes(node: EnhancedDOMTreeNode) -> str:
@@ -391,3 +356,123 @@ class DOMEvalSerializer:
 
 		combined = ' '.join(text_parts)
 		return cap_text_length(combined, 80)
+
+	@staticmethod
+	def _serialize_iframe(node: SimplifiedNode, include_attributes: list[str], depth: int) -> str:
+		"""Handle iframe serialization with content document."""
+		formatted_text = []
+		depth_str = depth * '\t'
+		tag = node.original_node.tag_name.lower()
+
+		# Build minimal iframe marker with key attributes
+		attributes_str = DOMEvalSerializer._build_compact_attributes(node.original_node)
+		line = f'{depth_str}<{tag}'
+		if attributes_str:
+			line += f' {attributes_str}'
+
+		# Add scroll info for iframe content
+		if node.original_node.should_show_scroll_info:
+			scroll_text = node.original_node.get_scroll_info_text()
+			if scroll_text:
+				line += f' scroll="{scroll_text}"'
+
+		line += ' />'
+		formatted_text.append(line)
+
+		# If iframe has content document, serialize its content
+		if node.original_node.content_document:
+			# Add marker for iframe content
+			formatted_text.append(f'{depth_str}\t#iframe-content')
+
+			# Process content document children
+			for child_node in node.original_node.content_document.children_nodes or []:
+				# Process html documents
+				if child_node.tag_name.lower() == 'html':
+					# Find and serialize body content only (skip head)
+					for html_child in child_node.children:
+						if html_child.tag_name.lower() == 'body':
+							for body_child in html_child.children:
+								# Recursively process body children (iframe content)
+								DOMEvalSerializer._serialize_document_node(
+									body_child, formatted_text, include_attributes, depth + 2, is_iframe_content=True
+								)
+							break  # Stop after processing body
+				else:
+					# Not an html element - serialize directly
+					DOMEvalSerializer._serialize_document_node(
+						child_node, formatted_text, include_attributes, depth + 1, is_iframe_content=True
+					)
+
+		return '\n'.join(formatted_text)
+
+	@staticmethod
+	def _serialize_document_node(
+		dom_node: EnhancedDOMTreeNode,
+		output: list[str],
+		include_attributes: list[str],
+		depth: int,
+		is_iframe_content: bool = True,
+	) -> None:
+		"""Helper to serialize a document node without SimplifiedNode wrapper.
+
+		Args:
+			is_iframe_content: If True, be more permissive with visibility checks since
+				iframe content might not have snapshot data from parent page.
+		"""
+		depth_str = depth * '\t'
+
+		if dom_node.node_type == NodeType.ELEMENT_NODE:
+			tag = dom_node.tag_name.lower()
+
+			# For iframe content, be permissive - show all semantic elements even without snapshot data
+			# For regular content, skip invisible elements
+			if is_iframe_content:
+				# Only skip if we have snapshot data AND it's explicitly invisible
+				# If no snapshot data, assume visible (cross-origin iframe content)
+				is_visible = (not dom_node.snapshot_node) or dom_node.is_visible
+			else:
+				# Regular strict visibility check
+				is_visible = dom_node.snapshot_node and dom_node.is_visible
+
+			if not is_visible:
+				return
+
+			# Check if semantic or has useful attributes
+			is_semantic = tag in SEMANTIC_ELEMENTS
+			attributes_str = DOMEvalSerializer._build_compact_attributes(dom_node)
+
+			if not is_semantic and not attributes_str:
+				# Skip but process children
+				for child in dom_node.children:
+					DOMEvalSerializer._serialize_document_node(
+						child, output, include_attributes, depth, is_iframe_content=is_iframe_content
+					)
+				return
+
+			# Build element line
+			line = f'{depth_str}<{tag}'
+			if attributes_str:
+				line += f' {attributes_str}'
+
+			# Get direct text content
+			text_parts = []
+			for child in dom_node.children:
+				if child.node_type == NodeType.TEXT_NODE and child.node_value:
+					text = child.node_value.strip()
+					if text and len(text) > 1:
+						text_parts.append(text)
+
+			if text_parts:
+				combined = ' '.join(text_parts)
+				line += f'>{cap_text_length(combined, 100)}'
+			else:
+				line += ' />'
+
+			output.append(line)
+
+			# Process non-text children
+			for child in dom_node.children:
+				if child.node_type != NodeType.TEXT_NODE:
+					DOMEvalSerializer._serialize_document_node(
+						child, output, include_attributes, depth + 1, is_iframe_content=is_iframe_content
+					)

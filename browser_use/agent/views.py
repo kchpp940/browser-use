@@ -396,8 +396,34 @@ class AgentOutput(BaseModel):
 	plan_update: list[str] | None = None
 	action: list[ActionModel] = Field(
 		...,
-		json_schema_extra={'min_items': 1},  # Ensure at least one action is provided
+		json_schema_extra={'min_items': 1},
 	)
+
+	@model_validator(mode='before')
+	@classmethod
+	def _preprocess_input(cls, data: Any) -> Any:
+		"""Preprocess input data to handle common edge cases from different LLM providers."""
+		if isinstance(data, dict):
+			data = data.copy()
+
+			# Handle None action - convert to empty list (will be caught by validation later if needed)
+			if 'action' in data and data['action'] is None:
+				data['action'] = []
+
+			# Handle string None values - some providers may return string "null" or "None"
+			for field in ['thinking', 'evaluation_previous_goal', 'memory', 'next_goal']:
+				if field in data and isinstance(data[field], str) and data[field].lower() in ('none', 'null', ''):
+					data[field] = None
+
+			# Handle empty string for plan_update
+			if 'plan_update' in data and isinstance(data['plan_update'], str) and data['plan_update'] == '':
+				data['plan_update'] = None
+
+			# If action is not a list, try to wrap it
+			if 'action' in data and data['action'] is not None and not isinstance(data['action'], list):
+				data['action'] = [data['action']]
+
+		return data
 
 	@classmethod
 	def model_json_schema(cls, **kwargs):

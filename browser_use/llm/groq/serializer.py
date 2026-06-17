@@ -1,4 +1,4 @@
-from typing import overload
+from typing import Any, cast, overload
 
 from groq.types.chat import (
 	ChatCompletionAssistantMessageParam,
@@ -39,6 +39,10 @@ class GroqMessageSerializer:
 		)
 
 	@staticmethod
+	def _serialize_content_part_refusal(part: ContentPartRefusalParam) -> dict[str, Any]:
+		return {'refusal': part.refusal, 'type': 'refusal'}
+
+	@staticmethod
 	def _serialize_user_content(
 		content: str | list[ContentPartTextParam | ContentPartImageParam],
 	) -> str | list[ChatCompletionContentPartTextParam | ChatCompletionContentPartImageParam]:
@@ -72,19 +76,24 @@ class GroqMessageSerializer:
 	@staticmethod
 	def _serialize_assistant_content(
 		content: str | list[ContentPartTextParam | ContentPartRefusalParam] | None,
-	) -> str | None:
+	) -> Any:
 		"""Serialize content for assistant messages (text and refusal allowed)."""
 		if content is None:
 			return None
 		if isinstance(content, str):
 			return content
 
-		serialized_parts: list[str] = []
+		serialized_parts: list[Any] = []
 		for part in content:
 			if part.type == 'text':
-				serialized_parts.append(GroqMessageSerializer._serialize_content_part_text(part)['text'])
+				serialized_parts.append(GroqMessageSerializer._serialize_content_part_text(part))
+			elif part.type == 'refusal':
+				serialized_parts.append(GroqMessageSerializer._serialize_content_part_refusal(part))
 
-		return '\n'.join(serialized_parts)
+		if len(serialized_parts) == 1 and serialized_parts[0].get('type') == 'text':
+			return serialized_parts[0]['text']
+
+		return serialized_parts
 
 	@staticmethod
 	def _serialize_tool_call(tool_call: ToolCall) -> ChatCompletionMessageToolCallParam:
@@ -132,24 +141,25 @@ class GroqMessageSerializer:
 			return system_result
 
 		elif isinstance(message, AssistantMessage):
-			# Handle content serialization
 			content = None
 			if message.content is not None:
 				content = GroqMessageSerializer._serialize_assistant_content(message.content)
 
-			assistant_result: ChatCompletionAssistantMessageParam = {'role': 'assistant'}
+			assistant_result: dict[str, Any] = {'role': 'assistant'}
 
-			# Only add content if it's not None
 			if content is not None:
 				assistant_result['content'] = content
 
 			if message.name is not None:
 				assistant_result['name'] = message.name
 
+			if message.refusal is not None:
+				assistant_result['refusal'] = message.refusal
+
 			if message.tool_calls:
 				assistant_result['tool_calls'] = [GroqMessageSerializer._serialize_tool_call(tc) for tc in message.tool_calls]
 
-			return assistant_result
+			return cast(ChatCompletionAssistantMessageParam, assistant_result)
 
 		else:
 			raise ValueError(f'Unknown message type: {type(message)}')

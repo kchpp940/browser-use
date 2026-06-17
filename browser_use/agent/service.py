@@ -1660,40 +1660,68 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				self.logger.info(judge_log)
 
 	async def _get_model_output_with_retry(self, input_messages: list[BaseMessage]) -> AgentOutput:
-		"""Get model output with retry logic for empty actions"""
-		model_output = await self.get_model_output(input_messages)
-		self.logger.debug(
-			f'✅ Step {self.state.n_steps}: Got LLM response with {len(model_output.action) if model_output.action else 0} actions'
-		)
+		"""Get model output with retry logic for empty actions and validation errors"""
+		max_retries = 2
 
-		if (
-			not model_output.action
-			or not isinstance(model_output.action, list)
-			or all(action.model_dump() == {} for action in model_output.action)
-		):
-			self.logger.warning('Model returned empty action. Retrying...')
-
-			clarification_message = UserMessage(
-				content='You forgot to return an action. Please respond with a valid JSON action according to the expected schema with your assessment and next actions.'
-			)
-
-			retry_messages = input_messages + [clarification_message]
-			model_output = await self.get_model_output(retry_messages)
-
-			if not model_output.action or all(action.model_dump() == {} for action in model_output.action):
-				self.logger.warning('Model still returned empty after retry. Inserting safe noop action.')
-				action_instance = self.ActionModel()
-				setattr(
-					action_instance,
-					'done',
-					{
-						'success': False,
-						'text': 'No next action returned by LLM!',
-					},
+		for attempt in range(max_retries + 1):
+			try:
+				model_output = await self.get_model_output(input_messages)
+				self.logger.debug(
+					f'✅ Step {self.state.n_steps}: Got LLM response with {len(model_output.action) if model_output.action else 0} actions'
 				)
-				model_output.action = [action_instance]
 
-		return model_output
+				if (
+					not model_output.action
+					or not isinstance(model_output.action, list)
+					or all(action.model_dump() == {} for action in model_output.action)
+				):
+					if attempt < max_retries:
+						self.logger.warning(f'Model returned empty action (attempt {attempt + 1}/{max_retries + 1}). Retrying...')
+						clarification_message = UserMessage(
+							content='You forgot to return an action. Please respond with a valid JSON action according to the expected schema with your assessment and next actions. Make sure to include at least one action in the "action" array.'
+						)
+						input_messages = input_messages + [clarification_message]
+						continue
+					else:
+						self.logger.warning('Model still returned empty after retries. Inserting safe noop action.')
+						action_instance = self.ActionModel()
+						setattr(
+							action_instance,
+							'done',
+							{
+								'success': False,
+								'text': 'No next action returned by LLM!',
+							},
+						)
+						model_output.action = [action_instance]
+
+				return model_output
+
+			except ValidationError as e:
+				if attempt < max_retries:
+					self.logger.warning(
+						f'Model output failed validation (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying with schema hints...'
+					)
+					error_details = []
+					for err in e.errors():
+						loc = '.'.join(str(loc_item) for loc_item in err.get('loc', []))
+						msg = err.get('msg', '')
+						error_details.append(f'- Field "{loc}": {msg}')
+					error_summary = '\n'.join(error_details)
+					retry_hint = (
+						f'Your previous response failed validation with these errors:\n{error_summary}\n\n'
+						f'Please respond with a valid JSON object matching the required schema. '
+						f'Ensure all required fields are present and have the correct types. '
+						f'Pay special attention to the "action" array - it must contain valid action objects.'
+					)
+					clarification_message = UserMessage(content=retry_hint)
+					input_messages = input_messages + [clarification_message]
+					continue
+				else:
+					self.logger.error(f'Validation failed after {max_retries + 1} attempts: {e}')
+					raise
+
+		raise RuntimeError('Retry loop completed without return')
 
 	async def _handle_post_llm_processing(
 		self,
@@ -1961,9 +1989,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			self._log_next_action_summary(parsed)
 			return parsed
-		except ValidationError:
-			# Just re-raise - Pydantic's validation errors are already descriptive
-			raise
+		except ValidationError as e:
+			self.logger.warning(f'⚠️ Model output failed validation: {e}')
+			# Try fallback LLM on validation errors too - different provider may handle schema better
+			wrapped_error = ModelProviderError(
+				message=f'Output validation failed: {str(e)}',
+				status_code=500,
+				model=getattr(self.llm, 'name', 'unknown'),
+			)
+			if not self._try_switch_to_fallback_llm(wrapped_error):
+				raise
+			return await self.get_model_output(input_messages)
 		except (ModelRateLimitError, ModelProviderError) as e:
 			# Check if we can switch to a fallback LLM
 			if not self._try_switch_to_fallback_llm(e):

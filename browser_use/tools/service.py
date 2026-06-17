@@ -905,15 +905,6 @@ class Tools(Generic[Context]):
 			# Try to find a file input element near the selected element
 			file_input_node = browser_session.find_file_input_near_element(node)
 
-			# Verify the found file input is in selector_map (consistency check)
-			# If not, fall back to searching within selector_map only
-			if file_input_node and file_input_node.backend_node_id not in selector_map:
-				logger.debug(
-					f'File input found by find_file_input_near_element (backendNodeId={file_input_node.backend_node_id}) '
-					f'is not in selector_map, falling back to selector_map search'
-				)
-				file_input_node = None
-
 			# Highlight the file input element if found (truly non-blocking)
 			if file_input_node:
 				create_task_with_error_handling(

@@ -104,6 +104,8 @@ class LiteLLMMessageSerializer:
 				d['content'] = LiteLLMMessageSerializer._serialize_assistant_content(msg.content)
 				if msg.name is not None:
 					d['name'] = msg.name
+				if msg.refusal is not None:
+					d['refusal'] = msg.refusal
 				if msg.tool_calls:
 					d['tool_calls'] = [
 						{

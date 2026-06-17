@@ -39,28 +39,7 @@ SVG_ELEMENTS = {
 
 
 class DOMTreeSerializer:
-	"""
-	Builds the simplified DOM tree and assigns interactive element indices.
-
-	This class is the SOLE source of truth for:
-	1. SimplifiedNode tree structure - which elements exist after all filtering
-	2. Interactive element detection - which elements are clickable/interactive
-	3. selector_map - the mapping from backend_node_id to elements
-
-	Architecture:
-	- Input: EnhancedDOMTreeNode tree (raw DOM + AX + Snapshot data from CDP)
-	- Step 1: Create simplified tree (filter SVG children, disabled elements, etc.)
-	- Step 2: Apply paint order filtering (remove elements hidden behind others)
-	- Step 3: Optimize tree (remove meaningless nodes)
-	- Step 4: Apply bounding box filtering (remove elements within propagating bounds)
-	- Step 5: Assign interactive indices + build selector_map
-	- Output: SerializedDOMState (_root + selector_map)
-
-	Both serializers (DOMTreeSerializer.serialize_tree for LLM, DOMEvalSerializer
-	for eval) consume the SAME SimplifiedNode tree and use the SAME is_interactive
-	flags. All action execution paths use the SAME selector_map. This ensures
-	perfect index consistency across the entire system.
-	"""
+	"""Serializes enhanced DOM trees to string format."""
 
 	# Configuration - elements that propagate bounds to their children
 	PROPAGATING_ELEMENTS = [
@@ -87,10 +66,7 @@ class DOMTreeSerializer:
 		session_id: str | None = None,
 	):
 		self.root_node = root_node
-		# selector_map is the single source of truth for interactive element indices.
-		# It maps backend_node_id → EnhancedDOMTreeNode and is built together with
-		# the SimplifiedNode tree's is_interactive flags. All serializers and action
-		# execution paths MUST use this map for element lookup by index.
+		self._interactive_counter = 1
 		self._selector_map: DOMSelectorMap = {}
 		self._previous_cached_selector_map = previous_cached_state.selector_map if previous_cached_state else None
 		# Add timing tracking
@@ -127,6 +103,7 @@ class DOMTreeSerializer:
 		start_total = time.time()
 
 		# Reset state
+		self._interactive_counter = 1
 		self._selector_map = {}
 		self._semantic_groups = []
 		self._clickable_cache = {}  # Clear cache for new serialization
@@ -168,51 +145,7 @@ class DOMTreeSerializer:
 		end_total = time.time()
 		self.timing_info['serialize_accessible_elements_total'] = end_total - start_total
 
-		state = SerializedDOMState(_root=filtered_tree, selector_map=self._selector_map)
-
-		# ── Runtime Consistency Gate (single source of truth enforcement) ──
-		# validate_consistency(auto_fix=True) guarantees the returned state is consistent.
-		# It runs 4 stages: structural pruning → intersection alignment → verification → report.
-		# See SerializedDOMState.validate_consistency() for details.
-		issues = state.validate_consistency(auto_fix=True)
-
-		if issues:
-			import logging
-
-			logger = logging.getLogger('browser_use.dom.serializer')
-
-			has_critical = any(m.startswith('[CRITICAL]') for m in issues)
-			pruned_msgs = [m for m in issues if m.startswith('[PRUNED]')]
-			aligned_msgs = [m for m in issues if m.startswith('[ALIGNED]')]
-			safe_msgs = [m for m in issues if m.startswith('[SAFE]')]
-			ok_msgs = [m for m in issues if m.startswith('[OK]')]
-			other = [m for m in issues if not m.startswith(('[PRUNED]', '[ALIGNED]', '[SAFE]', '[OK]', '[CRITICAL]'))]
-
-			if has_critical:
-				logger.critical(
-					'🚨 DOM index consistency gate CRITICAL failure after auto-fix! '
-					'This indicates a bug in the serializer code.'
-				)
-				for m in issues[:10]:
-					if m.startswith('[CRITICAL]') or m.startswith('   -'):
-						logger.critical(f'   {m}')
-
-			if pruned_msgs:
-				for m in pruned_msgs:
-					logger.info(f'🧹 {m}')
-			if aligned_msgs:
-				for m in aligned_msgs:
-					logger.warning(f'🔧 {m}')
-			if safe_msgs:
-				for m in safe_msgs:
-					logger.info(f'🛡️  {m}')
-			if other:
-				for m in other[:5]:
-					logger.warning(f'⚠️  {m}')
-			if ok_msgs:
-				logger.debug('✅ DOM index consistency verified.')
-
-		return state, self.timing_info
+		return SerializedDOMState(_root=filtered_tree, selector_map=self._selector_map), self.timing_info
 
 	def _add_compound_components(self, simplified: SimplifiedNode, node: EnhancedDOMTreeNode) -> None:
 		"""Enhance compound controls with information from their child components."""
@@ -642,83 +575,26 @@ class DOMTreeSerializer:
 
 		return None
 
-	def _is_element_indexable(self, node: SimplifiedNode) -> bool:
-		"""
-		Unified method to determine if an element should get an interactive index.
-
-		This is the SINGLE source of truth for whether an element is interactive.
-		All methods (_has_interactive_descendants, _collect_interactive_elements,
-		_assign_interactive_indices_and_mark_new_nodes) MUST use this method to
-		ensure index consistency across the entire system.
-
-		Two-layer check:
-		1. STRUCTURAL: Delegates to SimplifiedNode.is_structurally_indexable()
-		   - This is the SAME check used by SerializedDOMState._collect_prunable_indices()
-		   - Guarantees zero rule drift between "add index" and "remove index" paths
-		2. INTERACTIVE + VISIBILITY: Basic interactivity and visibility checks
-		   - Uses ClickableElementDetector.is_interactive() for interactivity
-		   - Visibility check with special exceptions (file input, shadow DOM form elements)
-
-		NOTE: Scrollable container logic is handled separately in _assign_interactive_indices
-		because it depends on descendants, which would create circular dependency here.
-		"""
-		# ── Layer 1: Structural eligibility (SHARED with pruning) ──
-		# Uses the EXACT SAME structural check as the consistency gate's pruning.
-		# No inside_svg / parent_excluded context needed here because:
-		# - SVG children are already filtered out during _create_simplified_tree()
-		# - excluded_by_parent flag is set on each node individually during bbox filtering
-		if not node.is_structurally_indexable():
-			return False
-
-		# ── Layer 2: Interactivity + visibility ──
-		is_interactive = self._is_interactive_cached(node.original_node)
-		if not is_interactive:
-			return False
-
-		is_visible = node.original_node.snapshot_node and node.original_node.is_visible
-		if is_visible:
-			return True
-
-		# EXCEPTION 1: File inputs are often hidden with opacity:0 but still functional
-		is_file_input = (
-			node.original_node.tag_name
-			and node.original_node.tag_name.lower() == 'input'
-			and node.original_node.attributes
-			and node.original_node.attributes.get('type') == 'file'
-		)
-		if is_file_input:
-			return True
-
-		# EXCEPTION 2: Shadow DOM form elements may not have snapshot layout data
-		# from CDP's DOMSnapshot.captureSnapshot, but they're still functional
-		is_shadow_dom_form_element = (
-			not node.original_node.snapshot_node
-			and node.original_node.tag_name
-			and node.original_node.tag_name.lower() in ['input', 'button', 'select', 'textarea', 'a']
-			and self._is_inside_shadow_dom(node)
-		)
-		if is_shadow_dom_form_element:
-			return True
-
-		return False
-
 	def _collect_interactive_elements(self, node: SimplifiedNode, elements: list[SimplifiedNode]) -> None:
-		"""Recursively collect interactive elements using the unified indexable check."""
-		if self._is_element_indexable(node):
+		"""Recursively collect interactive elements that are also visible."""
+		is_interactive = self._is_interactive_cached(node.original_node)
+		is_visible = node.original_node.snapshot_node and node.original_node.is_visible
+
+		# Only collect elements that are both interactive AND visible
+		if is_interactive and is_visible:
 			elements.append(node)
 
 		for child in node.children:
 			self._collect_interactive_elements(child, elements)
 
 	def _has_interactive_descendants(self, node: SimplifiedNode) -> bool:
-		"""Check if a node has any interactive descendants using the unified indexable check.
-
-		NOTE: 'Interactive' means elements that would get an index (visibility + exceptions).
-		This matches _is_element_indexable, NOT just ClickableElementDetector.is_interactive.
-		"""
+		"""Check if a node has any interactive descendants (not including the node itself)."""
+		# Check children for interactivity
 		for child in node.children:
-			if self._is_element_indexable(child):
+			# Check if child itself is interactive
+			if self._is_interactive_cached(child.original_node):
 				return True
+			# Recursively check child's descendants
 			if self._has_interactive_descendants(child):
 				return True
 
@@ -739,28 +615,19 @@ class DOMTreeSerializer:
 		return False
 
 	def _assign_interactive_indices_and_mark_new_nodes(self, node: SimplifiedNode | None) -> None:
-		"""Assign interactive indices to elements using the unified indexability check.
-
-		All elements that get an index here will be in the selector_map, and will
-		show up with [i_X] markers in both LLM and eval serializers.
-
-		Two categories of elements get indices:
-		1. Regular interactive elements (via _is_element_indexable)
-		2. Scrollable containers with no interactive descendants (user needs to scroll them)
-		"""
+		"""Assign interactive indices to clickable elements that are also visible."""
 		if not node:
 			return
 
 		# Skip assigning index to excluded nodes, or ignored by paint order
-		# (but still process children - they might be visible despite parent being excluded)
 		if not node.excluded_by_parent and not node.ignored_by_paint_order:
-			# Use unified indexability check for regular interactive elements
-			is_regular_interactive = self._is_element_indexable(node)
+			# Regular interactive element assignment (including enhanced compound controls)
+			is_interactive_assign = self._is_interactive_cached(node.original_node)
+			is_visible = node.original_node.snapshot_node and node.original_node.is_visible
 			is_scrollable = node.original_node.is_actually_scrollable
 
 			# DIAGNOSTIC: Log when interactive elements don't have snapshot_node
-			# (useful for debugging shadow DOM and hidden element issues)
-			if not is_regular_interactive and self._is_interactive_cached(node.original_node) and not node.original_node.snapshot_node:
+			if is_interactive_assign and not node.original_node.snapshot_node:
 				import logging
 
 				logger = logging.getLogger('browser_use.dom.serializer')
@@ -782,8 +649,29 @@ class DOMTreeSerializer:
 						f'backendNodeId={node.original_node.backend_node_id} {attr_str}'
 					)
 
-			should_make_interactive = False
+			# EXCEPTION: File inputs are often hidden with opacity:0 but are still functional
+			# Bootstrap and other frameworks use this pattern with custom-styled file pickers
+			is_file_input = (
+				node.original_node.tag_name
+				and node.original_node.tag_name.lower() == 'input'
+				and node.original_node.attributes
+				and node.original_node.attributes.get('type') == 'file'
+			)
 
+			# EXCEPTION: Shadow DOM form elements may not have snapshot layout data from CDP's
+			# DOMSnapshot.captureSnapshot, but they're still functional/interactive.
+			# This handles login forms, custom web components, etc. inside shadow DOM.
+			is_shadow_dom_element = (
+				is_interactive_assign
+				and not node.original_node.snapshot_node
+				and node.original_node.tag_name
+				and node.original_node.tag_name.lower() in ['input', 'button', 'select', 'textarea', 'a']
+				and self._is_inside_shadow_dom(node)
+			)
+
+			# Check if scrollable container should be made interactive
+			# For scrollable elements, ONLY make them interactive if they have no interactive descendants
+			should_make_interactive = False
 			if is_scrollable:
 				# Check if this is a dropdown container that needs to be indexed regardless of descendants
 				attrs = node.original_node.attributes or {}
@@ -795,6 +683,7 @@ class DOMTreeSerializer:
 				# Detect dropdown containers by role, tag, or class
 				is_dropdown_by_role = role in ('listbox', 'menu', 'combobox', 'menubar', 'tree', 'grid')
 				is_dropdown_by_tag = tag_name == 'select'
+				# Match common dropdown class patterns
 				is_dropdown_by_class = (
 					'dropdown' in class_list
 					or 'dropdown-menu' in class_list
@@ -808,22 +697,21 @@ class DOMTreeSerializer:
 					should_make_interactive = True
 				else:
 					# For other scrollable elements, check if they have interactive children
-					# Only make scrollable container interactive if it has no interactive descendants
-					# (this ensures users can scroll areas with no clickable elements inside)
 					has_interactive_desc = self._has_interactive_descendants(node)
+					# Only make scrollable container interactive if it has no interactive descendants
 					if not has_interactive_desc:
 						should_make_interactive = True
-			elif is_regular_interactive:
-				# Non-scrollable but indexable element (visibility + exceptions handled by _is_element_indexable)
+			elif is_interactive_assign and (is_visible or is_file_input or is_shadow_dom_element):
+				# Non-scrollable interactive elements: make interactive if visible (or file input or shadow DOM form element)
 				should_make_interactive = True
 
 			# Add to selector map if element should be interactive
 			if should_make_interactive:
-				# Mark node as interactive (used by both serializers for [i_X] display)
+				# Mark node as interactive
 				node.is_interactive = True
-				# Store backend_node_id in selector map (single source of truth)
-				# All serializers and action execution use this same map
+				# Store backend_node_id in selector map (model outputs backend_node_id)
 				self._selector_map[node.original_node.backend_node_id] = node.original_node
+				self._interactive_counter += 1
 
 				# Mark compound components as new for visibility
 				if node.is_compound_component:
