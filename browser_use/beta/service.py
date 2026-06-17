@@ -4451,9 +4451,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		)
 		self.browser_no_viewport, self.browser_viewport = _extract_browser_viewport(self.browser_session, self.browser_profile)
 		self.browser_window_size = _extract_browser_window_size(self.browser_session, self.browser_profile)
-		self._browser_storage_state_source = _extract_browser_storage_state_source(self.browser_session, self.browser_profile)
-		self.browser_storage_state = self._browser_storage_state_source.value if self._browser_storage_state_source else None
-		self.browser_storage_state_path = self._browser_storage_state_source.path if self._browser_storage_state_source else None
 		self.sensitive_data_context = _sensitive_data_context(sensitive_data)
 		_warn_sensitive_data_domain_constraints(self.logger, sensitive_data, self.allowed_domains)
 		self.display_files_in_done_text = display_files_in_done_text
@@ -5422,6 +5419,31 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	def browser_profile(self) -> Any:
 		session_profile = getattr(self.browser_session, 'browser_profile', None)
 		return session_profile if session_profile is not None else self._browser_profile
+
+	@property
+	def _browser_storage_state_source(self) -> StorageStateSource | None:
+		"""Dynamic storage state source derived from current browser_profile.storage_state.
+
+		This ensures the value/path are never desynced from the actual profile
+		that will be used by BrowserSession and StorageStateWatchdog.
+		"""
+		return _extract_browser_storage_state_source(self.browser_session, self.browser_profile)
+
+	@property
+	def browser_storage_state(self) -> dict[str, Any] | None:
+		"""Parsed storage state dict (derived from browser_profile.storage_state)."""
+		source = self._browser_storage_state_source
+		return source.value if source is not None else None
+
+	@property
+	def browser_storage_state_path(self) -> Path | None:
+		"""Writable file path for storage state, or None if in-memory only.
+
+		Derived from browser_profile.storage_state — always reflects the actual
+		value that StorageStateWatchdog will see.
+		"""
+		source = self._browser_storage_state_source
+		return source.path if source is not None else None
 
 	@property
 	def message_manager(self) -> MessageManager:
@@ -6483,7 +6505,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		put('user_agent', self.browser_user_agent)
 		put('viewport', self.browser_viewport)
 		put('window_size', self.browser_window_size)
-		put('storage_state', self.browser_storage_state)
+		if self.browser_storage_state_path is not None:
+			put('storage_state', str(self.browser_storage_state_path))
+		else:
+			put('storage_state', self.browser_storage_state)
 		put('downloads_path', self.browser_downloads_path)
 		put('allowed_domains', self.allowed_domains or None)
 		put('blocked_domains', self.prohibited_domains or None)
@@ -6755,6 +6780,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			env['BU_BROWSER_NO_VIEWPORT'] = 'true' if self.browser_no_viewport else 'false'
 		if self.browser_viewport:
 			env['BU_BROWSER_VIEWPORT'] = json.dumps(self.browser_viewport)
+		if self.browser_storage_state_path is not None:
+			env['BU_BROWSER_STORAGE_STATE_PATH'] = str(self.browser_storage_state_path)
 		if self.browser_storage_state:
 			env['BU_BROWSER_STORAGE_STATE'] = json.dumps(self.browser_storage_state)
 		if self.managed_browser_env and _is_managed_browser_mode(browser_mode):

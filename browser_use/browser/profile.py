@@ -820,6 +820,38 @@ class BrowserProfile(BrowserConnectArgs, BrowserLaunchPersistentContextArgs, Bro
 		return self
 
 	@model_validator(mode='after')
+	def load_storage_state_from_env(self) -> Self:
+		"""Load storage_state from BU_BROWSER_STORAGE_STATE_PATH env var with highest priority.
+
+		This ensures managed browser workers launched by the Rust SDK receive
+		the original file path (not a flattened dict) so StorageStateWatchdog
+		can write updates back to the file.
+
+		Priority:
+		1. BU_BROWSER_STORAGE_STATE_PATH env var (always highest, even if
+		   storage_state was explicitly provided as dict)
+		2. Existing storage_state value (dict or path)
+		3. BU_BROWSER_STORAGE_STATE env var (JSON dict, fallback only)
+		"""
+		env_path = os.getenv('BU_BROWSER_STORAGE_STATE_PATH')
+		if env_path and str(env_path).strip():
+			# Use object.__setattr__ to bypass Pydantic validation and avoid
+			# infinite recursion when setting storage_state inside validator
+			object.__setattr__(self, 'storage_state', Path(env_path).expanduser())
+		elif self.storage_state is None:
+			# Only fall back to BU_BROWSER_STORAGE_STATE dict if no path exists
+			env_dict_str = os.getenv('BU_BROWSER_STORAGE_STATE')
+			if env_dict_str and str(env_dict_str).strip():
+				try:
+					import json
+					parsed = json.loads(env_dict_str)
+					if isinstance(parsed, dict):
+						object.__setattr__(self, 'storage_state', parsed)
+				except (json.JSONDecodeError, ValueError):
+					pass
+		return self
+
+	@model_validator(mode='after')
 	def validate_highlight_elements_conflict(self) -> Self:
 		"""Ensure highlight_elements and dom_highlight_elements are not both enabled, with dom_highlight_elements taking priority."""
 		if self.highlight_elements and self.dom_highlight_elements:
