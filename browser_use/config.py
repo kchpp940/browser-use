@@ -233,6 +233,14 @@ class FlatEnvConfig(BaseSettings):
 	BROWSER_USE_ALLOWED_DOMAINS: str | None = Field(default=None)
 	BROWSER_USE_LLM_MODEL: str | None = Field(default=None)
 
+	# Unified config env vars (set by sandbox/cloud remote bootstrap, or manually)
+	BROWSER_USE_LLM_PROVIDER: str | None = Field(default=None)
+	BROWSER_USE_LLM_BASE_URL: str | None = Field(default=None)
+	BROWSER_USE_LLM_TEMPERATURE: float | None = Field(default=None)
+	BROWSER_USE_DOWNLOADS_PATH: str | None = Field(default=None)
+	BROWSER_USE_CDP_URL: str | None = Field(default=None)
+	BROWSER_USE_EFFECTIVE_LLM_CONFIG_B64: str | None = Field(default=None)
+
 	# Proxy env vars
 	BROWSER_USE_PROXY_URL: str | None = Field(default=None)
 	BROWSER_USE_NO_PROXY: str | None = Field(default=None)

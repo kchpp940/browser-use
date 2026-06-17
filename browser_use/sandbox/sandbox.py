@@ -326,9 +326,117 @@ def sandbox(
 			else:
 				function_call = f'await {func.__name__}(browser=browser)'
 
-			# 6. Create wrapper code that unpickles params and calls function
+			# 6. Build the UNIFIED EffectiveConfig FIRST — the single source of truth
+			# This EXACT object drives BrowserSession, LLM init, AND the cloud payload.
+			from browser_use.browser.views import EffectiveConfig
+
+			sandbox_cli_args: dict[str, Any] = {}
+			if cloud_profile_id is not None:
+				sandbox_cli_args['cloud_profile_id'] = cloud_profile_id
+			if cloud_proxy_country_code is not None:
+				sandbox_cli_args['cloud_proxy_country_code'] = cloud_proxy_country_code
+			if cloud_timeout is not None:
+				sandbox_cli_args['cloud_timeout'] = cloud_timeout
+
+			# Merge ALL config sources — same exact factory used by every other entry point
+			effective = EffectiveConfig.from_config_sources(
+				direct_kwargs=None,
+				cli_args=sandbox_cli_args,
+				load_from_env=True,
+				load_from_config_file=True,
+			)
+
+			# Log effective config — this is the SAME signature the cloud receives
+			log_safe = effective.get_log_safe_dict()
+			logger.info(f'[Sandbox] Unified effective config: {log_safe}')
+
+			# 7. Build remote env-var injection from effective config.
+			# We inject the LLM/browser settings as BROWSER_USE_* env vars into the
+			# remote process so EffectiveConfig.from_config_sources() called by
+			# Agent / BrowserSession / build_llm() resolves IDENTICALLY to local.
+			remote_env_inject: dict[str, str] = {}
+			llm = effective.llm
+			if llm.provider:
+				remote_env_inject['BROWSER_USE_LLM_PROVIDER'] = llm.provider
+			if llm.model:
+				remote_env_inject['BROWSER_USE_LLM_MODEL'] = llm.model
+			if llm.api_key:
+				# Map to provider-specific env var names so each client picks it up
+				prov = (llm.provider or '').lower()
+				if prov in ('browser-use', 'bu'):
+					remote_env_inject['BROWSER_USE_API_KEY'] = llm.api_key
+				elif prov == 'openai':
+					remote_env_inject['OPENAI_API_KEY'] = llm.api_key
+				elif prov == 'anthropic':
+					remote_env_inject['ANTHROPIC_API_KEY'] = llm.api_key
+				elif prov == 'google':
+					remote_env_inject['GOOGLE_API_KEY'] = llm.api_key
+				elif prov == 'deepseek':
+					remote_env_inject['DEEPSEEK_API_KEY'] = llm.api_key
+				elif prov == 'mistral':
+					remote_env_inject['MISTRAL_API_KEY'] = llm.api_key
+			if llm.base_url:
+				remote_env_inject['BROWSER_USE_LLM_BASE_URL'] = llm.base_url
+			if llm.temperature is not None:
+				remote_env_inject['BROWSER_USE_LLM_TEMPERATURE'] = str(llm.temperature)
+
+			# Also inject browser-level env overrides from effective config
+			if effective.browser.get('headless') is not None:
+				remote_env_inject['BROWSER_USE_HEADLESS'] = str(effective.browser['headless']).lower()
+			if effective.browser.get('downloads_path'):
+				remote_env_inject['BROWSER_USE_DOWNLOADS_PATH'] = str(effective.browser['downloads_path'])
+			if effective.browser.get('cdp_url'):
+				remote_env_inject['BROWSER_USE_CDP_URL'] = str(effective.browser['cdp_url'])
+
+			# Serialise full llm config as base64 JSON so the remote side can rebuild
+			# LLMEffectiveConfig exactly (including provider_params, max_retries, etc.)
+			import json as _json
+
+			full_llm_config_json = _json.dumps(
+				{
+					k: v
+					for k, v in llm.model_dump(exclude_none=True).items()
+					# provider_params is a catch-all — include it fully
+					if True
+				}
+			)
+			remote_env_inject['BROWSER_USE_EFFECTIVE_LLM_CONFIG_B64'] = base64.b64encode(full_llm_config_json.encode()).decode()
+
+			# 8. Build env block that will be set BEFORE any user code runs.
+			# This guarantees every downstream call (Agent() without llm=,
+			# BrowserSession(), EffectiveConfig.from_config_sources()) sees the
+			# same unified config.
+			env_set_lines = []
+			for ek, ev in remote_env_inject.items():
+				# Escape single quotes for shell-safe injection via os.environ
+				escaped = ev.replace("'", "\\'")
+				env_set_lines.append(f"os.environ['{ek}'] = '{escaped}'")
+			env_setup_block = '\n'.join(env_set_lines) if env_set_lines else '# No unified config env overrides'
+
+			# 9. Create wrapper code — env setup runs FIRST, then user code.
 			execution_code = f"""import cloudpickle
 import base64
+import os
+
+# ============================================================
+# REMOTE SANDBOX UNIFIED CONFIG BOOTSTRAP
+# These env vars force EffectiveConfig.from_config_sources()
+# + every LLM / BrowserSession constructor to use the EXACT
+# same effective config the client resolved locally.
+# ============================================================
+{env_setup_block}
+
+# Also patch DEFAULT_LLM / provider-specific defaults from the
+# serialised LLMEffectiveConfig if present.
+import json as _json
+_llm_cfg_b64 = os.environ.get('BROWSER_USE_EFFECTIVE_LLM_CONFIG_B64')
+if _llm_cfg_b64:
+    try:
+        _llm_cfg = _json.loads(base64.b64decode(_llm_cfg_b64).decode())
+        if _llm_cfg.get('model'):
+            os.environ.setdefault('DEFAULT_LLM', _llm_cfg['model'])
+    except Exception:
+        pass
 
 # Imports used in function
 {needed_imports}
@@ -349,68 +457,56 @@ async def run(browser):
 
 """
 
-			# 9. Build the UNIFIED EffectiveConfig — the single source of truth
-			# This EXACT object is what drives BrowserSession, LLM init, AND the
-			# cloud payload, so logs, signature, and real startup params match.
-			from browser_use.browser.views import EffectiveConfig
+			# 10. Build cloud payload ONLY from EffectiveConfig.
+			# BrowserSession CDP / proxy / downloads / storage_state is already
+			# locked in via the unified config; cloud-level parameters are read
+			# from effective.browser.cloud_browser_params so the payload signature
+			# matches reality 1:1.
+			config_signature = effective.get_config_signature()
 
-			# Build CLI args from decorator parameters (these take precedence over env/config)
-			sandbox_cli_args: dict[str, Any] = {}
-			if cloud_profile_id is not None:
-				sandbox_cli_args['cloud_profile_id'] = cloud_profile_id
-			if cloud_proxy_country_code is not None:
-				sandbox_cli_args['cloud_proxy_country_code'] = cloud_proxy_country_code
-			if cloud_timeout is not None:
-				sandbox_cli_args['cloud_timeout'] = cloud_timeout
-
-			# Merge ALL config sources — same exact factory used by every other entry point
-			effective = EffectiveConfig.from_config_sources(
-				direct_kwargs=None,
-				cli_args=sandbox_cli_args,
-				load_from_env=True,
-				load_from_config_file=True,
-			)
-
-			# Extract cloud params from the unified config
+			# Cloud browser creation params — extracted ONLY from EffectiveConfig
 			cloud_params = effective.browser.get('cloud_browser_params')
 			resolved_profile_id = cloud_params.profile_id if cloud_params else None
 			resolved_proxy_code = cloud_params.proxy_country_code if cloud_params else None
 			resolved_timeout = cloud_params.timeout if cloud_params else None
-
-			# Log effective config — this is the SAME signature the cloud receives
-			log_safe = effective.get_log_safe_dict()
-			logger.info(f'[Sandbox] Unified effective config: {log_safe}')
-
-			# Get the ONE config_signature that represents the real startup params
-			config_signature = effective.get_config_signature()
+			resolved_enable_recording = cloud_params.enable_recording if cloud_params else False
 
 			# Send to server
 			payload: dict[str, Any] = {'code': base64.b64encode(execution_code.encode()).decode()}
 
 			combined_env: dict[str, str] = env_vars.copy() if env_vars else {}
 			combined_env['LOG_LEVEL'] = log_level.upper()
+			# Merge in our unified-config env vars too (belt + suspenders:
+			# execution_code also sets them, but the process-level env applies
+			# before any Python code runs)
+			combined_env.update(remote_env_inject)
 			payload['env'] = combined_env
 
-			# Add UNIFIED cloud parameters — derived from the same EffectiveConfig
+			# Cloud browser creation params — guaranteed to match the logged signature
 			if resolved_profile_id is not None:
 				payload['cloud_profile_id'] = str(resolved_profile_id)
 			if resolved_proxy_code is not None:
 				payload['cloud_proxy_country_code'] = resolved_proxy_code
 			if resolved_timeout is not None:
 				payload['cloud_timeout'] = resolved_timeout
+			if resolved_enable_recording:
+				payload['enable_recording'] = True
 
-			# THE config_signature — guaranteed to match what actually starts because
-			# BrowserSession and LLM are both constructed from this same EffectiveConfig
+			# THE config_signature — derived from the same EffectiveConfig object
+			# that produced cloud_profile_id / proxy / timeout AND the env vars
+			# that control LLM + other browser settings on the remote side.
 			payload['config_signature'] = config_signature
 
-			# Also send the full effective browser config (safe fields only) so the
-			# remote side can start the browser with identical parameters
-			payload['effective_browser_config'] = {
-				k: v
-				for k, v in effective.browser_profile_kwargs().items()
-				if k not in {'storage_state'}  # exclude opaque blobs
-			}
-			payload['effective_llm_config'] = effective.llm.get_log_safe_dict()
+			# Full effective configs for the remote host to validate / apply.
+			# cloud_browser_params IS the source of truth for the payload.
+			safe_browser = {k: v for k, v in effective.browser_profile_kwargs().items() if k not in {'storage_state'}}
+			payload['effective_browser_config'] = safe_browser
+			# Send FULL llm config (not just log-safe) so the remote side can
+			# rebuild LLMEffectiveConfig exactly — api_key is already masked on
+			# read via get_log_safe_dict() when logged, but the actual value is
+			# needed in the process env which we already set above.
+			payload['effective_llm_config'] = llm.model_dump(exclude_none=True, exclude={'api_key'})
+			payload['effective_llm_config_masked'] = llm.get_log_safe_dict()
 
 			url = server_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
 

@@ -503,6 +503,12 @@ class EffectiveConfig(BaseModel):
 				if env_config.BROWSER_USE_DISABLE_EXTENSIONS is not None:
 					env_browser['enable_default_extensions'] = not env_config.BROWSER_USE_DISABLE_EXTENSIONS
 
+				# Additional unified-config env vars (set by sandbox remote bootstrap)
+				if env_config.BROWSER_USE_DOWNLOADS_PATH:
+					env_browser['downloads_path'] = env_config.BROWSER_USE_DOWNLOADS_PATH
+				if env_config.BROWSER_USE_CDP_URL:
+					env_browser['cdp_url'] = env_config.BROWSER_USE_CDP_URL
+
 				# LLM env vars
 				if env_config.BROWSER_USE_LLM_MODEL:
 					env_llm['model'] = env_config.BROWSER_USE_LLM_MODEL
@@ -516,6 +522,31 @@ class EffectiveConfig(BaseModel):
 					env_llm['google_api_key'] = env_config.GOOGLE_API_KEY
 				if env_config.DEEPSEEK_API_KEY:
 					env_llm['deepseek_api_key'] = env_config.DEEPSEEK_API_KEY
+
+				# Extra LLM unified env vars (set by sandbox remote bootstrap)
+				if env_config.BROWSER_USE_LLM_PROVIDER:
+					env_llm['provider'] = env_config.BROWSER_USE_LLM_PROVIDER
+				if env_config.BROWSER_USE_LLM_BASE_URL:
+					env_llm['base_url'] = env_config.BROWSER_USE_LLM_BASE_URL
+				if env_config.BROWSER_USE_LLM_TEMPERATURE is not None:
+					env_llm['temperature'] = env_config.BROWSER_USE_LLM_TEMPERATURE
+
+				# HIGHEST-PRIORITY LLM env: full config encoded as b64 JSON.
+				# If this is present, the remote side serialised LLMEffectiveConfig
+				# verbatim and we should use those fields as the env baseline.
+				if env_config.BROWSER_USE_EFFECTIVE_LLM_CONFIG_B64:
+					import base64 as _b64
+					import json as _json
+
+					try:
+						_raw = _b64.b64decode(env_config.BROWSER_USE_EFFECTIVE_LLM_CONFIG_B64)
+						_llm_from_b64 = _json.loads(_raw.decode())
+						if isinstance(_llm_from_b64, dict):
+							env_llm.update(_llm_from_b64)
+					except Exception as e:
+						from browser_use.utils import logger
+
+						logger.warning(f'[EffectiveConfig] Failed to decode BROWSER_USE_EFFECTIVE_LLM_CONFIG_B64: {e}')
 			except Exception as e:
 				from browser_use.utils import logger
 
@@ -635,42 +666,51 @@ class EffectiveConfig(BaseModel):
 
 		Uses the same dispatch logic as ``browser_use.llm.models.get_llm_by_name`` but
 		runs only off the already-resolved EffectiveConfig so provider + model +
-		api_key are guaranteed to match the logged signature.
+		api_key + provider_params are guaranteed to match the logged signature.
 		"""
 		from browser_use.llm.anthropic.chat import ChatAnthropic
+		from browser_use.llm.azure.chat import ChatAzureOpenAI
 		from browser_use.llm.browser_use.chat import ChatBrowserUse
 		from browser_use.llm.cerebras.chat import ChatCerebras
+		from browser_use.llm.deepseek.chat import ChatDeepSeek
 		from browser_use.llm.google.chat import ChatGoogle
+		from browser_use.llm.groq.chat import ChatGroq
 		from browser_use.llm.mistral.chat import ChatMistral
+		from browser_use.llm.ollama.chat import ChatOllama
 		from browser_use.llm.openai.chat import ChatOpenAI
+		from browser_use.llm.openrouter.chat import ChatOpenRouter
 
 		provider = (self.llm.provider or 'browser-use').lower()
 		model = self.llm.model or 'bu-latest'
-		temperature = self.llm.temperature if self.llm.temperature is not None else 0.0
-		api_key = self.llm.api_key
-		base_url = self.llm.base_url
-		timeout = self.llm.timeout
 
-		common_kwargs: dict[str, Any] = {}
-		if api_key is not None:
-			common_kwargs['api_key'] = api_key
-		if base_url is not None:
-			common_kwargs['base_url'] = base_url
-		if timeout is not None:
-			common_kwargs['timeout'] = timeout
+		# Build the full llm kwargs — merges dedicated fields + provider_params catch-all
+		kwargs = self.llm.to_llm_kwargs()
+		# Ensure model is always set
+		kwargs.setdefault('model', model)
 
+		# Dispatch
 		if provider in ('browser-use', 'bu'):
-			return ChatBrowserUse(model=model, temperature=temperature, **common_kwargs)
+			return ChatBrowserUse(**kwargs)
 		elif provider == 'openai':
-			return ChatOpenAI(model=model, temperature=temperature, **common_kwargs)
+			return ChatOpenAI(**kwargs)
 		elif provider == 'anthropic':
-			return ChatAnthropic(model=model, temperature=temperature, **common_kwargs)
+			return ChatAnthropic(**kwargs)
 		elif provider == 'google':
-			return ChatGoogle(model=model, temperature=temperature, **common_kwargs)
+			return ChatGoogle(**kwargs)
 		elif provider == 'mistral':
-			return ChatMistral(model=model, temperature=temperature, **common_kwargs)
+			return ChatMistral(**kwargs)
 		elif provider == 'cerebras':
-			return ChatCerebras(model=model, temperature=temperature, **common_kwargs)
+			return ChatCerebras(**kwargs)
+		elif provider == 'deepseek':
+			return ChatDeepSeek(**kwargs)
+		elif provider == 'groq':
+			return ChatGroq(**kwargs)
+		elif provider == 'ollama':
+			return ChatOllama(**kwargs)
+		elif provider == 'openrouter':
+			return ChatOpenRouter(**kwargs)
+		elif provider == 'azure':
+			return ChatAzureOpenAI(**kwargs)
 		else:
 			# Fall back to ChatBrowserUse for unknown providers
-			return ChatBrowserUse(model=model, temperature=temperature, **common_kwargs)
+			return ChatBrowserUse(**kwargs)
