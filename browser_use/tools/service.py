@@ -1789,6 +1789,42 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			return ActionResult(extracted_content=result, long_term_memory=result)
 
 		@self.registry.action(
+			'List all files in the workspace with their properties (source, size, readable/uploadable flags, last action). '
+			'Use this when you need to see what files are available, check file sizes, or verify which files can be read or uploaded. '
+			'Filter by source (virtual, download, screenshot, pdf_save, user_provided, extracted) to narrow results.'
+		)
+		async def list_files(
+			file_system: FileSystem,
+			source: str | None = None,
+			readable_only: bool = False,
+			uploadable_only: bool = False,
+		):
+			"""List workspace files, filtered by criteria.
+
+			Args:
+				source: Optional filter by file source (virtual, download, screenshot, pdf_save, user_provided, extracted)
+				readable_only: If True, only show readable files
+				uploadable_only: If True, only show uploadable files
+			"""
+			if not file_system or not file_system.manifest:
+				return ActionResult(extracted_content='No workspace manifest available.')
+
+			from browser_use.filesystem.workspace_manifest import FileSource
+
+			include_sources = [FileSource(source)] if source else None
+			files = file_system.manifest.list_files(
+				include_sources=include_sources,
+				readable_only=readable_only,
+				uploadable_only=uploadable_only,
+			)
+
+			if not files:
+				return ActionResult(extracted_content='No files matching the criteria were found in the workspace.')
+
+			display = file_system.manifest.format_files_for_display(files, show_full_paths=False)
+			return ActionResult(extracted_content=display)
+
+		@self.registry.action(
 			'Read the complete content of a file. Use this to view file contents before editing or to retrieve data from files. Supports text files (txt, md, json, csv, jsonl), documents (pdf, docx), and images (jpg, png).'
 		)
 		async def read_file(file_name: str, available_file_paths: list[str], file_system: FileSystem):

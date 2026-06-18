@@ -2156,6 +2156,84 @@ def auth():
 	asyncio.run(run_auth_command())
 
 
+@main.group()
+def workspace():
+	"""Manage workspace files and manifests"""
+	pass
+
+
+@workspace.command(name='files')
+@click.option('--path', '-p', default='.browser_use/filesystem', help='Path to the filesystem directory')
+@click.option('--source', '-s', multiple=True, help='Filter by file source (virtual, download, screenshot, etc.)')
+@click.option('--readable', is_flag=True, help='Only show readable files')
+@click.option('--uploadable', is_flag=True, help='Only show uploadable files')
+@click.option('--no-paths', is_flag=True, help='Hide real disk paths, show only display names')
+def workspace_files(path, source, readable, uploadable, no_paths):
+	"""List all files in the workspace manifest"""
+	import os
+
+	from browser_use.filesystem.workspace_manifest import FileSource, WorkspaceManifest
+
+	manifest_path = os.path.join(path, 'manifest.json')
+
+	if not os.path.exists(manifest_path):
+		click.echo(f'No manifest found at {manifest_path}')
+		click.echo('Run an agent first to create a manifest.')
+		return
+
+	try:
+		manifest = WorkspaceManifest.load(manifest_path)
+	except Exception as e:
+		click.echo(f'Error loading manifest: {e}')
+		return
+
+	include_sources = [FileSource(s) for s in source] if source else None
+	files = manifest.list_files(
+		include_sources=include_sources,
+		readable_only=readable,
+		uploadable_only=uploadable,
+	)
+
+	click.echo(manifest.format_files_for_display(files, show_full_paths=not no_paths))
+
+
+@workspace.command(name='summary')
+@click.option('--path', '-p', default='.browser_use/filesystem', help='Path to the filesystem directory')
+@click.option('--max-items', '-n', default=20, help='Maximum number of files to show')
+@click.option('--source', '-s', multiple=True, help='Filter by file source')
+@click.option('--show-paths', is_flag=True, help='Show full real disk paths')
+def workspace_summary(path, max_items, source, show_paths):
+	"""Show a summary of the workspace manifest (as seen by the agent)"""
+	import os
+
+	from browser_use.filesystem.workspace_manifest import FileSource, WorkspaceManifest
+
+	manifest_path = os.path.join(path, 'manifest.json')
+
+	if not os.path.exists(manifest_path):
+		click.echo(f'No manifest found at {manifest_path}')
+		return
+
+	try:
+		manifest = WorkspaceManifest.load(manifest_path)
+	except Exception as e:
+		click.echo(f'Error loading manifest: {e}')
+		return
+
+	include_sources = [FileSource(s) for s in source] if source else None
+	summary = manifest.summary(
+		enabled=True,
+		max_items=max_items,
+		include_sources=include_sources,
+		show_full_paths=show_paths,
+	)
+
+	if summary:
+		click.echo(summary)
+	else:
+		click.echo('No files in workspace.')
+
+
 @main.command()
 def install():
 	"""Install Chromium browser with system dependencies"""

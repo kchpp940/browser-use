@@ -427,6 +427,174 @@ class TestWorkspaceManifest:
 		assert WorkspaceManifest._format_size(1024) == '1.0KB'
 		assert WorkspaceManifest._format_size(1048576) == '1.0MB'
 
+	def test_summary_enabled_flag(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='test.md',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			real_path='/tmp/test.md',
+			size_bytes=100,
+			readable=True,
+			uploadable=True,
+		)
+		assert manifest.summary(enabled=False) == ''
+		assert '<workspace_files>' in manifest.summary(enabled=True)
+
+	def test_summary_max_items(self):
+		manifest = WorkspaceManifest()
+		for i in range(10):
+			manifest.register(
+				display_name=f'file_{i}.md',
+				source=FileSource.VIRTUAL,
+				path_type=PathType.VIRTUAL_NAME,
+				real_path=f'/tmp/file_{i}.md',
+				size_bytes=100 * i,
+				readable=True,
+				uploadable=True,
+			)
+		summary = manifest.summary(max_items=5)
+		assert '... and 5 more file(s)' in summary
+		assert summary.count('[virtual]') == 5
+
+	def test_summary_filter_by_source(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='virtual.md',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			real_path='/tmp/virtual.md',
+			size_bytes=100,
+			readable=True,
+			uploadable=True,
+		)
+		manifest.register(
+			display_name='download.pdf',
+			source=FileSource.DOWNLOAD,
+			path_type=PathType.LOCAL_ABSOLUTE,
+			real_path='/tmp/download.pdf',
+			size_bytes=5000,
+			readable=True,
+			uploadable=True,
+		)
+		summary_virtual = manifest.summary(include_sources=[FileSource.VIRTUAL])
+		assert 'virtual.md' in summary_virtual
+		assert 'download.pdf' not in summary_virtual
+
+		summary_exclude_virtual = manifest.summary(exclude_sources=[FileSource.VIRTUAL])
+		assert 'virtual.md' not in summary_exclude_virtual
+		assert 'download.pdf' in summary_exclude_virtual
+
+	def test_summary_show_full_paths(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='data.csv',
+			source=FileSource.USER_PROVIDED,
+			path_type=PathType.LOCAL_ABSOLUTE,
+			real_path='/var/data/data.csv',
+			size_bytes=200,
+			readable=True,
+			uploadable=True,
+		)
+		summary_short = manifest.summary(show_full_paths=False)
+		assert 'data.csv' in summary_short
+		assert '/var/data/data.csv' not in summary_short
+
+		summary_full = manifest.summary(show_full_paths=True)
+		assert '/var/data/data.csv' in summary_full
+
+	def test_list_files_basic(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='test.md',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			real_path='/tmp/test.md',
+			size_bytes=150,
+			readable=True,
+			uploadable=True,
+			last_action='write',
+		)
+		files = manifest.list_files()
+		assert len(files) == 1
+		assert files[0]['display_name'] == 'test.md'
+		assert files[0]['source'] == 'virtual'
+		assert files[0]['size_bytes'] == 150
+		assert files[0]['readable'] is True
+		assert files[0]['uploadable'] is True
+		assert files[0]['last_action'] == 'write'
+
+	def test_list_files_filters(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='read_only.md',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			real_path='/tmp/ro.md',
+			size_bytes=100,
+			readable=True,
+			uploadable=False,
+		)
+		manifest.register(
+			display_name='upload_only.png',
+			source=FileSource.SCREENSHOT,
+			path_type=PathType.VIRTUAL_NAME,
+			real_path='/tmp/up.png',
+			size_bytes=200,
+			readable=False,
+			uploadable=True,
+		)
+		manifest.register(
+			display_name='internal.png',
+			source=FileSource.SCREENSHOT,
+			path_type=PathType.LOCAL_ABSOLUTE,
+			real_path='/tmp/internal.png',
+			size_bytes=300,
+			readable=True,
+			uploadable=False,
+		)
+
+		readable = manifest.list_files(readable_only=True)
+		assert len(readable) == 2
+		assert all(f['readable'] for f in readable)
+
+		uploadable = manifest.list_files(uploadable_only=True)
+		assert len(uploadable) == 1
+		assert uploadable[0]['display_name'] == 'upload_only.png'
+
+		virtual_only = manifest.list_files(include_sources=[FileSource.VIRTUAL])
+		assert len(virtual_only) == 1
+		assert virtual_only[0]['display_name'] == 'read_only.md'
+
+		exclude_screenshot = manifest.list_files(exclude_sources=[FileSource.SCREENSHOT])
+		assert len(exclude_screenshot) == 1
+		assert exclude_screenshot[0]['display_name'] == 'read_only.md'
+
+	def test_format_files_for_display(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='test.md',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			real_path='/tmp/test.md',
+			size_bytes=1024,
+			readable=True,
+			uploadable=True,
+			last_action='write',
+		)
+		files = manifest.list_files()
+		display = manifest.format_files_for_display(files)
+		assert 'Workspace Files (1 total)' in display
+		assert 'test.md' in display
+		assert '1.0KB' in display
+		assert 'R/U' in display
+		assert 'last:write' in display
+
+	def test_format_files_for_display_empty(self):
+		manifest = WorkspaceManifest()
+		display = manifest.format_files_for_display([])
+		assert display == 'No files in workspace.'
+
 
 class TestFileSystemManifestIntegration:
 	@pytest.fixture

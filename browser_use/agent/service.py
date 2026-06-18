@@ -208,6 +208,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		llm_screenshot_size: tuple[int, int] | None = None,
 		message_compaction: MessageCompactionSettings | bool | None = True,
 		max_clickable_elements_length: int = 40000,
+		# Workspace manifest settings
+		workspace_manifest_enabled: bool = True,
+		workspace_manifest_max_items: int = 20,
+		workspace_manifest_include_sources: list[FileSource] | None = None,
+		workspace_manifest_exclude_sources: list[FileSource] | None = None,
+		workspace_manifest_show_full_paths: bool = False,
+		workspace_manifest_show_in_prompt: bool = True,
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
 		**kwargs,
@@ -388,6 +395,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if isinstance(message_compaction, bool):
 			message_compaction = MessageCompactionSettings(enabled=message_compaction)
 
+		from browser_use.agent.views import WorkspaceManifestSettings
+
+		workspace_manifest_settings = WorkspaceManifestSettings(
+			enabled=workspace_manifest_enabled,
+			max_items=workspace_manifest_max_items,
+			include_sources=workspace_manifest_include_sources,
+			exclude_sources=workspace_manifest_exclude_sources,
+			show_full_paths=workspace_manifest_show_full_paths,
+			show_in_prompt=workspace_manifest_show_in_prompt,
+		)
+
 		self.settings = AgentSettings(
 			use_vision=use_vision,
 			vision_detail_level=vision_detail_level,
@@ -417,6 +435,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			loop_detection_enabled=loop_detection_enabled,
 			message_compaction=message_compaction,
 			max_clickable_elements_length=max_clickable_elements_length,
+			workspace_manifest=workspace_manifest_settings,
 		)
 
 		# Token cost service
@@ -530,6 +549,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			sample_images=self.sample_images,
 			llm_screenshot_size=llm_screenshot_size,
 			max_clickable_elements_length=self.settings.max_clickable_elements_length,
+			workspace_manifest_settings=self.settings.workspace_manifest,
 		)
 
 		if self.sensitive_data:

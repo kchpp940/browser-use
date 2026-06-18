@@ -13,6 +13,7 @@ from browser_use.agent.views import (
 	AgentStepInfo,
 	MessageCompactionSettings,
 	MessageManagerState,
+	WorkspaceManifestSettings,
 )
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.filesystem.file_system import FileSystem
@@ -120,6 +121,7 @@ class MessageManager:
 		sample_images: list[ContentPartTextParam | ContentPartImageParam] | None = None,
 		llm_screenshot_size: tuple[int, int] | None = None,
 		max_clickable_elements_length: int = 40000,
+		workspace_manifest_settings: 'WorkspaceManifestSettings | None' = None,
 	):
 		self.task = task
 		self.state = state
@@ -134,6 +136,7 @@ class MessageManager:
 		self.sample_images = sample_images
 		self.llm_screenshot_size = llm_screenshot_size
 		self.max_clickable_elements_length = max_clickable_elements_length
+		self.workspace_manifest_settings = workspace_manifest_settings
 
 		assert max_history_items is None or max_history_items > 5, 'max_history_items must be None or greater than 5'
 
@@ -496,6 +499,7 @@ class MessageManager:
 			llm_screenshot_size=self.llm_screenshot_size,
 			unavailable_skills_info=unavailable_skills_info,
 			plan_description=plan_description,
+			workspace_manifest_settings=self.workspace_manifest_settings,
 		).get_user_message(effective_use_vision)
 
 		# Store state message text for history

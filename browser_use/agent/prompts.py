@@ -2,6 +2,7 @@ import importlib.resources
 from datetime import datetime
 from typing import TYPE_CHECKING, Literal, Optional
 
+from browser_use.agent.views import WorkspaceManifestSettings
 from browser_use.browser.views import PLACEHOLDER_4PX_SCREENSHOT
 from browser_use.dom.views import NodeType, SimplifiedNode
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
@@ -125,6 +126,7 @@ class AgentMessagePrompt:
 		llm_screenshot_size: tuple[int, int] | None = None,
 		unavailable_skills_info: str | None = None,
 		plan_description: str | None = None,
+		workspace_manifest_settings: 'WorkspaceManifestSettings | None' = None,
 	):
 		self.browser_state: 'BrowserStateSummary' = browser_state_summary
 		self.file_system: 'FileSystem | None' = file_system
@@ -145,6 +147,7 @@ class AgentMessagePrompt:
 		self.unavailable_skills_info: str | None = unavailable_skills_info
 		self.plan_description: str | None = plan_description
 		self.llm_screenshot_size = llm_screenshot_size
+		self.workspace_manifest_settings = workspace_manifest_settings
 		assert self.browser_state
 
 	def _extract_page_statistics(self) -> dict[str, int]:
@@ -336,7 +339,17 @@ Available tabs:
 </todo_contents>
 """
 		if self.file_system and self.file_system.manifest:
-			manifest_summary = self.file_system.manifest.summary()
+			ms = self.workspace_manifest_settings
+			if ms and ms.enabled and ms.show_in_prompt:
+				manifest_summary = self.file_system.manifest.summary(
+					enabled=ms.enabled,
+					max_items=ms.max_items,
+					include_sources=ms.include_sources,
+					exclude_sources=ms.exclude_sources,
+					show_full_paths=ms.show_full_paths,
+				)
+			else:
+				manifest_summary = self.file_system.manifest.summary()
 			if manifest_summary:
 				agent_state += f'{manifest_summary}\n'
 
