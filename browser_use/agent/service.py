@@ -3,6 +3,7 @@ import gc
 import inspect
 import json
 import logging
+import os
 import re
 import tempfile
 import time
@@ -608,6 +609,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Trace export
 		self._trace_service: 'TraceService | None' = None
+		if trace_dir is None:
+			env_trace_dir = os.environ.get('BROWSER_USE_TRACE_DIR')
+			if env_trace_dir:
+				trace_dir = env_trace_dir
 		if trace_dir is not None:
 			from browser_use.agent.trace import TraceService
 
@@ -1112,6 +1117,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Check for new downloads after getting browser state (catches PDF auto-downloads and previous step downloads)
 		await self._check_and_update_downloads(f'Step {self.state.n_steps}: after getting browser state')
 
+		# Trace: mark step start with initial page state and download baseline
+		if self._trace_service is not None:
+			downloaded_files = []
+			if self.has_downloads_path and self.browser_session:
+				downloaded_files = self.browser_session.downloaded_files
+			self._trace_service.step_start(
+				step_number=self.state.n_steps,
+				browser_state_summary=browser_state_summary,
+				downloaded_files=downloaded_files,
+			)
+
 		self._log_step_context(browser_state_summary)
 		await self._check_stop_or_pause()
 
@@ -1364,6 +1380,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""Finalize the step with history, logging, and events"""
 		step_end_time = time.time()
 		if not self.state.last_result:
+			if self._trace_service is not None and self._trace_service._pending is not None:
+				self._trace_service.step_end(
+					model_output=self.state.last_model_output,
+					action_results=None,
+					browser_state_summary=browser_state_summary,
+					screenshot_path=None,
+					downloaded_files=self.browser_session.downloaded_files if (self.has_downloads_path and self.browser_session) else [],
+					error='Step interrupted before producing results',
+				)
 			return
 
 		if browser_state_summary:
@@ -1433,15 +1458,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			if self.state.last_result:
 				errors = [r.error for r in self.state.last_result if r.error]
 				step_error = errors[0] if errors else None
-			self._trace_service.record_step(
-				step_number=self.state.n_steps - 1,
+			self._trace_service.step_end(
 				model_output=self.state.last_model_output,
 				action_results=self.state.last_result,
 				browser_state_summary=browser_state_summary,
 				screenshot_path=screenshot_path,
 				downloaded_files=downloaded_files,
-				step_start_time=self.step_start_time,
-				step_end_time=step_end_time,
 				error=step_error,
 			)
 

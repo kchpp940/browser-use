@@ -221,6 +221,7 @@ def sandbox(
 	log_level: str = 'INFO',
 	quiet: bool = False,
 	headers: dict[str, str] | None = None,
+	trace_dir: str | None = None,
 	on_browser_created: Callable[[BrowserCreatedData], None]
 	| Callable[[BrowserCreatedData], Coroutine[Any, Any, None]]
 	| None = None,
@@ -353,6 +354,8 @@ async def run(browser):
 
 			combined_env: dict[str, str] = env_vars.copy() if env_vars else {}
 			combined_env['LOG_LEVEL'] = log_level.upper()
+			if trace_dir:
+				combined_env['BROWSER_USE_TRACE_DIR'] = str(trace_dir)
 			payload['env'] = combined_env
 
 			# Add cloud parameters if provided

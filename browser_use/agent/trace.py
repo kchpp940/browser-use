@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -130,13 +131,32 @@ class TraceFile(BaseModel):
 		return cls.model_validate(data)
 
 
+@dataclass
+class _PendingStepState:
+	"""Mutable state collected between step_start and step_end calls."""
+
+	step_number: int = 0
+	start_time: float = 0.0
+	initial_url: str | None = None
+	initial_title: str | None = None
+	initial_tabs: list[dict[str, Any]] = field(default_factory=list)
+	initial_dom_summary: str | None = None
+	initial_screenshot_path: str | None = None
+	initial_downloaded_files: set[str] = field(default_factory=set)
+	events: list[TraceBrowserEvent] = field(default_factory=list)
+
+
 class TraceService:
 	"""Collects step-level data from an :class:`Agent` and writes a trace file.
 
-    Usage::
+    The service uses an explicit two-phase lifecycle per step:
 
-        agent = Agent(task="...", llm=..., trace_dir="./traces")
-        await agent.run()
+    1. :meth:`step_start` — called at the beginning of a step, captures the
+       initial page state (URL, title, DOM summary, screenshot, current
+       download list) and begins buffering browser events for this step.
+    2. :meth:`step_end` — called after actions are executed, merges LLM
+       output, action results, new download deltas, buffered events and any
+       step error into a final :class:`TraceStep` and appends it to the trace.
 
     The trace is written incrementally after each step so that it is always
     available even if the process crashes.
@@ -158,10 +178,14 @@ class TraceService:
 			model=model,
 		)
 		self._trace_path = self.trace_dir / f'trace_{agent_id[:8]}.json'
-		self._step_events: list[TraceBrowserEvent] = []
+		self._pending: _PendingStepState | None = None
+
+	# ------------------------------------------------------------------
+	# Event bus integration
+	# ------------------------------------------------------------------
 
 	def register_event_bus(self, event_bus: Any) -> None:
-		"""Subscribe to all browser events for the current step."""
+		"""Subscribe to all browser events and route them to the active step."""
 		event_bus.on('*', self._on_browser_event)
 
 	def _on_browser_event(self, event: Any) -> None:
@@ -171,7 +195,13 @@ class TraceService:
 		except Exception:
 			data = {}
 		data = _sanitize_dict(data, self.sensitive_data)
-		self._step_events.append(TraceBrowserEvent(event_type=event_name, data=data))
+		trace_event = TraceBrowserEvent(event_type=event_name, data=data)
+		if self._pending is not None:
+			self._pending.events.append(trace_event)
+
+	# ------------------------------------------------------------------
+	# Helpers
+	# ------------------------------------------------------------------
 
 	def _sanitize_string(self, value: str) -> str:
 		sensitive_values = collect_sensitive_data_values(self.sensitive_data)
@@ -188,19 +218,80 @@ class TraceService:
 			result.append(TraceAction(name=action_name, params=params))
 		return result
 
-	def record_step(
+	# ------------------------------------------------------------------
+	# Step lifecycle
+	# ------------------------------------------------------------------
+
+	def step_start(
 		self,
 		step_number: int,
+		browser_state_summary: Any | None,
+		downloaded_files: list[str] | None = None,
+	) -> None:
+		"""Mark the start of a new step.
+
+        Captures the page state the agent is about to observe and establishes
+        the baseline for browser events and file downloads for this step.
+        """
+		start_time = time.time()
+
+		url = None
+		title = None
+		tabs: list[dict[str, Any]] = []
+		dom_interactive_summary = None
+		screenshot_path = None
+
+		if browser_state_summary is not None:
+			url = browser_state_summary.url
+			title = browser_state_summary.title
+			try:
+				tabs = [tab.model_dump() for tab in browser_state_summary.tabs]
+			except Exception:
+				tabs = []
+			if browser_state_summary.dom_state:
+				try:
+					dom_interactive_summary = browser_state_summary.dom_state.llm_representation()
+				except Exception:
+					dom_interactive_summary = None
+			if hasattr(browser_state_summary, 'screenshot_path'):
+				screenshot_path = browser_state_summary.screenshot_path
+
+		self._pending = _PendingStepState(
+			step_number=step_number,
+			start_time=start_time,
+			initial_url=url,
+			initial_title=title,
+			initial_tabs=tabs,
+			initial_dom_summary=dom_interactive_summary,
+			initial_screenshot_path=screenshot_path,
+			initial_downloaded_files=set(downloaded_files or []),
+			events=[],
+		)
+
+	def step_end(
+		self,
 		model_output: Any | None,
 		action_results: list[Any] | None,
 		browser_state_summary: Any | None,
 		screenshot_path: str | None,
 		downloaded_files: list[str],
-		step_start_time: float,
-		step_end_time: float,
 		error: str | None = None,
 	) -> None:
-		"""Collect data for a completed step and append to the trace."""
+		"""Finalize the current step and write it to the trace file.
+
+        Merges the data captured at :meth:`step_start` with the LLM decision,
+        action execution results, post-step page state, download deltas and
+        buffered browser events.
+        """
+		if self._pending is None:
+			logger.warning('step_end called without matching step_start, skipping')
+			return
+
+		pending = self._pending
+		self._pending = None
+		end_time = time.time()
+
+		# --- Extract LLM decision data -----------------------------------
 		goal = None
 		evaluation_previous_goal = None
 		thinking = None
@@ -209,13 +300,14 @@ class TraceService:
 		action_results_trace: list[TraceActionResult] = []
 
 		if model_output is not None:
-			goal = model_output.next_goal
-			evaluation_previous_goal = model_output.evaluation_previous_goal
+			goal = getattr(model_output, 'next_goal', None)
+			evaluation_previous_goal = getattr(model_output, 'evaluation_previous_goal', None)
 			thinking = getattr(model_output, 'thinking', None)
-			memory = model_output.memory
+			memory = getattr(model_output, 'memory', None)
 
-			if model_output.action:
-				action_dicts = [a.model_dump(exclude_unset=True, mode='json') for a in model_output.action]
+			model_actions = getattr(model_output, 'action', None)
+			if model_actions:
+				action_dicts = [a.model_dump(exclude_unset=True, mode='json') for a in model_actions]
 				actions = self._sanitize_actions(action_dicts)
 
 		if action_results:
@@ -231,30 +323,42 @@ class TraceService:
 					)
 				)
 
-		url = None
-		title = None
-		tabs: list[dict[str, Any]] = []
-		dom_interactive_summary = None
+		# --- Resolve final page state ------------------------------------
+		# Prefer the initial values (captured when the agent observed the
+		# page before making a decision), but fall back to the summary
+		# passed at step_end if step_start didn't capture them.
+		url = pending.initial_url
+		title = pending.initial_title
+		tabs = pending.initial_tabs
+		dom_interactive_summary = pending.initial_dom_summary
+		final_screenshot_path = screenshot_path or pending.initial_screenshot_path
 
-		if browser_state_summary is not None:
-			url = browser_state_summary.url
-			title = browser_state_summary.title
-			try:
-				tabs = [tab.model_dump() for tab in browser_state_summary.tabs]
-			except Exception:
-				tabs = []
-			if browser_state_summary.dom_state:
+		if (url is None or title is None or dom_interactive_summary is None) and browser_state_summary is not None:
+			if url is None:
+				url = browser_state_summary.url
+			if title is None:
+				title = browser_state_summary.title
+			if not tabs:
+				try:
+					tabs = [tab.model_dump() for tab in browser_state_summary.tabs]
+				except Exception:
+					tabs = []
+			if dom_interactive_summary is None and browser_state_summary.dom_state:
 				try:
 					dom_interactive_summary = browser_state_summary.dom_state.llm_representation()
 				except Exception:
 					dom_interactive_summary = None
 
-		browser_events = self._step_events
-		self._step_events = []
+		# --- Compute download delta (only new files since step_start) ----
+		current_downloads = set(downloaded_files)
+		new_downloads = sorted(current_downloads - pending.initial_downloaded_files)
+
+		# --- Assemble and write step -------------------------------------
+		browser_events = pending.events
 
 		step = TraceStep(
-			step_number=step_number,
-			timestamp=step_end_time,
+			step_number=pending.step_number,
+			timestamp=end_time,
 			goal=self._sanitize_string(goal) if goal else None,
 			evaluation_previous_goal=self._sanitize_string(evaluation_previous_goal) if evaluation_previous_goal else None,
 			thinking=self._sanitize_string(thinking) if thinking else None,
@@ -265,15 +369,19 @@ class TraceService:
 			title=title,
 			tabs=tabs,
 			dom_interactive_summary=dom_interactive_summary,
-			screenshot_path=screenshot_path,
-			downloaded_files=downloaded_files,
+			screenshot_path=final_screenshot_path,
+			downloaded_files=new_downloads,
 			browser_events=browser_events,
-			duration_seconds=step_end_time - step_start_time if step_start_time else None,
+			duration_seconds=end_time - pending.start_time,
 			error=self._sanitize_string(error) if error else None,
 		)
 
 		self.trace_file.steps.append(step)
 		self._flush()
+
+	# ------------------------------------------------------------------
+	# Persistence
+	# ------------------------------------------------------------------
 
 	def _flush(self) -> None:
 		"""Write the current trace to disk."""
@@ -284,5 +392,14 @@ class TraceService:
 
 	def finalize(self) -> Path:
 		"""Write final trace and return the path."""
+		if self._pending is not None:
+			self.step_end(
+				model_output=None,
+				action_results=None,
+				browser_state_summary=None,
+				screenshot_path=None,
+				downloaded_files=[],
+				error='Agent run terminated before step completed',
+			)
 		self._flush()
 		return self._trace_path

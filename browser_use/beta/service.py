@@ -4290,6 +4290,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		max_clickable_elements_length: int = 40000,
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
+		trace_dir: str | Path | None = None,
 		**kwargs,
 	):
 		if llm_screenshot_size is not None:
@@ -4531,6 +4532,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self._last_synced_history_id: int | None = None
 		self._last_step_callback_history_id: int | None = None
 		self._last_step_end_callback_history_id: int | None = None
+		self.trace_dir: Path | None = Path(trace_dir).expanduser() if trace_dir else None
+		if self.trace_dir is None:
+			env_trace_dir = os.environ.get('BROWSER_USE_TRACE_DIR')
+			if env_trace_dir:
+				self.trace_dir = Path(env_trace_dir).expanduser()
+		self._trace_service = None
 		self._external_pause_event = asyncio.Event()
 		self._external_pause_event.set()
 
@@ -6530,6 +6537,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			'max_actions_per_step': int(self.settings.max_actions_per_step),
 			'config_overrides': {'full_llm_input_events': True},
 		}
+		if self.trace_dir is not None:
+			params['trace_dir'] = str(self.trace_dir)
 		if self._sdk_agent_id:
 			params['agent_id'] = self._sdk_agent_id
 		if self._sdk_browser_id:

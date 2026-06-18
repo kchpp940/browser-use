@@ -426,6 +426,7 @@ def ensure_daemon(
 	cloud_profile_id: str | None = None,
 	cloud_proxy_country_code: str | None = None,
 	cloud_timeout: int | None = None,
+	trace_dir: str | None = None,
 ) -> None:
 	"""Start daemon if not running. Uses state file for phase-aware decisions."""
 	probe = _probe_session(session)
@@ -531,6 +532,9 @@ def ensure_daemon(
 		cli_api_key = get_config_value('api_key')
 		if cli_api_key:
 			env['BROWSER_USE_API_KEY'] = str(cli_api_key)
+
+	if trace_dir:
+		env['BROWSER_USE_TRACE_DIR'] = str(Path(trace_dir).expanduser().resolve())
 
 	# Start daemon as background process
 	if sys.platform == 'win32':
@@ -655,6 +659,7 @@ Setup:
 	parser.add_argument('--json', action='store_true', help='Output as JSON')
 	parser.add_argument('--mcp', action='store_true', help='Run as MCP server (JSON-RPC via stdin/stdout)')
 	parser.add_argument('--template', help='Generate template file (use with --output for custom path)')
+	parser.add_argument('--trace-dir', default=None, help='Directory to export structured trace files for step-by-step replay')
 
 	subparsers = parser.add_subparsers(dest='command', help='Command to execute')
 
@@ -965,6 +970,7 @@ def _handle_cloud_connect(cloud_args: list[str], args: argparse.Namespace, sessi
 		cloud_profile_id=cloud_profile_id,
 		cloud_proxy_country_code=_get_cloud_connect_proxy(),
 		cloud_timeout=_get_cloud_connect_timeout(),
+		trace_dir=getattr(args, 'trace_dir', None),
 	)
 
 	# Send connect command to force immediate session creation
@@ -1181,6 +1187,10 @@ def main() -> int:
 	"""Main entry point."""
 	parser = build_parser()
 	args = parser.parse_args()
+
+	# Propagate trace-dir to environment so it flows to daemon, Agents, etc.
+	if args.trace_dir:
+		os.environ['BROWSER_USE_TRACE_DIR'] = str(Path(args.trace_dir).expanduser().resolve())
 
 	if not args.command:
 		parser.print_help()
@@ -1426,7 +1436,7 @@ def main() -> int:
 			print(f'Error: {e}', file=sys.stderr)
 			return 1
 
-		ensure_daemon(args.headed, None, cdp_url=cdp_url, session=session, explicit_config=True)
+		ensure_daemon(args.headed, None, cdp_url=cdp_url, session=session, explicit_config=True, trace_dir=args.trace_dir)
 		response = send_command('connect', {}, session=session)
 
 		if args.json:
@@ -1452,7 +1462,7 @@ def main() -> int:
 
 	# Ensure daemon is running
 	explicit_config = any(flag in sys.argv for flag in ('--headed', '--profile', '--cdp-url'))
-	ensure_daemon(args.headed, args.profile, args.cdp_url, session=session, explicit_config=explicit_config)
+	ensure_daemon(args.headed, args.profile, args.cdp_url, session=session, explicit_config=explicit_config, trace_dir=args.trace_dir)
 
 	# Build params from args
 	params = {}

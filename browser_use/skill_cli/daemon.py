@@ -521,7 +521,11 @@ def main() -> None:
 	parser.add_argument('--cloud-profile-id', help='Cloud browser profile ID')
 	parser.add_argument('--cloud-proxy-country', help='Cloud browser proxy country code')
 	parser.add_argument('--cloud-timeout', type=int, help='Cloud browser timeout in minutes')
+	parser.add_argument('--trace-dir', help='Directory to export structured trace files')
 	args = parser.parse_args()
+
+	if args.trace_dir:
+		os.environ['BROWSER_USE_TRACE_DIR'] = str(Path(args.trace_dir).expanduser().resolve())
 
 	logger.info(
 		f'Starting daemon: session={args.session}, headed={args.headed}, profile={args.profile}, cdp_url={args.cdp_url}, use_cloud={args.use_cloud}'
