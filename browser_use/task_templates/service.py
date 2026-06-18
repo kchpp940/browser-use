@@ -468,8 +468,25 @@ class TemplateManager:
 			include = template.default_tools
 			if include is not None:
 				all_default = self._get_default_tool_names()
-				exclude.extend([n for n in all_default if n not in include])
+				# Compute the complement: keep only include + always preserve 'done'
+				effective_include = set(include) | {'done'}
+				exclude.extend([n for n in all_default if n not in effective_include])
+			# Safety: never allow 'done' to be excluded, as agent cannot terminate without it
+			if 'done' in exclude:
+				logger.warning("Template requested to exclude tool 'done' — ignoring (agent requires 'done' to complete)")
+				exclude = [x for x in exclude if x != 'done']
 			agent_tools = Tools(exclude_actions=exclude) if exclude else Tools()
+
+			# Debug: report which tools ended up available
+			try:
+				final_names = sorted(agent_tools.registry.registry.actions.keys())
+				logger.debug(
+					f'Template "{template.name}" tool filter: '
+					f'whitelist={template.default_tools!r}  blacklist={template.exclude_tools!r}  '
+					f'final_available({len(final_names)}): {final_names}'
+				)
+			except Exception:
+				pass
 
 		# ---- Browser profile --------------------------------------------
 		agent_browser = browser_session
@@ -520,7 +537,7 @@ class TemplateManager:
 			from browser_use.tools.service import Tools
 
 			t = Tools()
-			return list(t.registry.actions.keys())
+			return list(t.registry.registry.actions.keys())
 		except Exception:
 			return [
 				'search',

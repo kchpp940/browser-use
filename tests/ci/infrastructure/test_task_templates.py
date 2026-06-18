@@ -328,6 +328,90 @@ class TestTemplateManagerStorage:
 		assert mgr.templates_dir == tmp_path
 
 
+def _agent_tool_names_from_template(tpl: TaskTemplate) -> set[str]:
+	"""Replicate the _build_agent tool filtering logic and return resulting tools."""
+	from browser_use.tools.service import Tools
+
+	exclude = list(tpl.exclude_tools)
+	include = tpl.default_tools
+	if include is not None:
+		all_default = TemplateManager._get_default_tool_names()
+		effective_include = set(include) | {'done'}
+		exclude.extend([n for n in all_default if n not in effective_include])
+	if 'done' in exclude:
+		exclude = [x for x in exclude if x != 'done']
+	t = Tools(exclude_actions=exclude) if exclude else Tools()
+	return set(t.registry.registry.actions.keys())
+
+
+class TestAgentToolFiltering:
+	def test_whitelist_always_keeps_done(self):
+		tpl = TaskTemplate(
+			name='t',
+			prompt_template='...',
+			default_tools=['navigate', 'extract'],
+		)
+		tools = _agent_tool_names_from_template(tpl)
+		assert tools == {'navigate', 'extract', 'done'}
+
+	def test_whitelist_empty_still_keeps_done(self):
+		tpl = TaskTemplate(name='t', prompt_template='...', default_tools=[])
+		tools = _agent_tool_names_from_template(tpl)
+		assert tools == {'done'}
+
+	def test_blacklist_removes_only_named(self):
+		tpl = TaskTemplate(
+			name='t',
+			prompt_template='...',
+			exclude_tools=['write_file', 'read_file', 'replace_file'],
+		)
+		tools = _agent_tool_names_from_template(tpl)
+		assert 'write_file' not in tools
+		assert 'read_file' not in tools
+		assert 'replace_file' not in tools
+		assert 'done' in tools
+		assert 'navigate' in tools
+		# Default list has 24, minus 3 → 21 (including done)
+		assert len(tools) == 21
+
+	def test_explicit_done_in_exclude_is_ignored(self):
+		tpl = TaskTemplate(
+			name='t',
+			prompt_template='...',
+			exclude_tools=['done', 'search'],
+		)
+		tools = _agent_tool_names_from_template(tpl)
+		assert 'done' in tools
+		assert 'search' not in tools
+
+	def test_whitelist_and_blacklist_combined(self):
+		tpl = TaskTemplate(
+			name='t',
+			prompt_template='...',
+			default_tools=['search', 'navigate', 'click', 'input', 'extract', 'write_file'],
+			exclude_tools=['write_file'],
+		)
+		tools = _agent_tool_names_from_template(tpl)
+		assert tools == {'search', 'navigate', 'click', 'input', 'extract', 'done'}
+
+	def test_no_filter_returns_all_tools(self):
+		tpl = TaskTemplate(name='t', prompt_template='...')
+		# When neither default_tools nor exclude_tools is set, _build_agent
+		# passes no agent_tools to Agent (i.e. default Tools()) - simulate.
+		from browser_use.tools.service import Tools
+
+		default = set(Tools().registry.registry.actions.keys())
+		assert len(default) == 24
+		assert 'done' in default
+
+	def test_get_default_tool_names_has_24_tools(self):
+		names = TemplateManager._get_default_tool_names()
+		assert len(names) == 24
+		assert 'done' in names
+		assert 'navigate' in names
+		assert 'write_file' in names
+
+
 class TestRenderPrompt:
 	def test_render_applies_substitution(self, tmp_path):
 		mgr = TemplateManager(templates_dir=tmp_path)

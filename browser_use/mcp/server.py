@@ -501,6 +501,7 @@ class BrowserUseServer:
 						'required': ['name'],
 					},
 				),
+				*self._build_dynamic_template_tools(),
 			]
 
 		@self.server.list_resources()
@@ -565,7 +566,13 @@ class BrowserUseServer:
 		elif tool_name == 'browser_close_all':
 			return await self._close_all_sessions()
 
-		# Task template tools
+		# Dynamic per-template tools (MUST be checked before the generic template_* prefix
+		# because our prefix is 'tpl_' which does not collide, but keep them ordered for
+		# clarity and future-proofing)
+		elif tool_name.startswith(self.DYNAMIC_TEMPLATE_TOOL_PREFIX):
+			return await self._execute_dynamic_template_tool(tool_name, arguments)
+
+		# Task template management tools
 		elif tool_name.startswith('template_'):
 			if tool_name == 'template_list':
 				return await self._template_list(arguments.get('tags'))
@@ -1264,6 +1271,172 @@ class BrowserUseServer:
 			result += f'. Errors: {"; ".join(errors)}'
 
 		return result
+
+	# ------------------------------------------------------------------
+	# Dynamic per-template MCP tools
+	# ------------------------------------------------------------------
+
+	#: Prefix used for dynamically-generated per-template MCP tools
+	DYNAMIC_TEMPLATE_TOOL_PREFIX = 'tpl_'
+
+	def _build_dynamic_template_tools(self) -> list:
+		"""Build one MCP ``types.Tool`` per saved task template.
+
+		Each tool is named ``tpl_<template_name>`` so it does not collide
+		with the generic ``template_*`` management tools. The tool's input
+		schema is derived directly from the template's variable definitions
+		(type, required, default, choices), plus an optional ``max_steps``
+		override.
+
+		Returns a list (not a generator) because the caller unpacks with
+		``*`` and errors should surface eagerly.
+		"""
+		# Lazy import + suppress any early errors to avoid breaking MCP handshake
+		try:
+			from browser_use.task_templates.service import get_template_manager
+			from browser_use.task_templates.views import TemplateVariableType
+		except Exception as e:
+			logger.warning(f'Skipping dynamic template tools (import failed): {e}')
+			return []
+
+		try:
+			mgr = get_template_manager()
+			templates = mgr.list_templates()
+		except Exception as e:
+			logger.warning(f'Skipping dynamic template tools (manager failed): {e}')
+			return []
+
+		type_map = {
+			TemplateVariableType.STRING: 'string',
+			TemplateVariableType.INTEGER: 'integer',
+			TemplateVariableType.FLOAT: 'number',
+			TemplateVariableType.BOOLEAN: 'boolean',
+			TemplateVariableType.LIST: 'array',
+			TemplateVariableType.DICT: 'object',
+		}
+		try:
+			from mcp.server.fastmcp import types  # type: ignore
+		except Exception:
+			types = None
+
+		tools: list = []
+		for tpl in templates:
+			properties: dict[str, Any] = {}
+			required: list[str] = []
+
+			for var_name, var in tpl.variables.items():
+				schema: dict[str, Any] = {
+					'type': type_map.get(var.type, 'string'),
+					'description': var.description or f'Variable "{var_name}"',
+				}
+				if var.default is not None:
+					schema['default'] = var.default
+				if var.choices:
+					schema['enum'] = list(var.choices)
+				properties[var_name] = schema
+				if var.required and var.default is None:
+					required.append(var_name)
+
+			# Optional step override
+			properties['max_steps'] = {
+				'type': 'integer',
+				'description': (
+					f'Override the template\'s default maximum agent steps '
+					f'(default: {tpl.max_steps}).'
+				),
+				'minimum': 1,
+			}
+
+			# Build rich description
+			var_lines = []
+			for var_name, var in tpl.variables.items():
+				flag = 'required' if var.required and var.default is None else 'optional'
+				default = '' if var.default is None else f' (default: {var.default!r})'
+				var_lines.append(f'• `{var_name}` [{var.type.value}] — {flag}{default}: {var.description or ""}')
+			if tpl.tags:
+				var_lines.append(f'\nTags: {", ".join(tpl.tags)}')
+			if tpl.output_files:
+				rule_descs = [f'`{r.pattern}`' + (' (required)' if r.required else '') for r in tpl.output_files]
+				var_lines.append(f'\nExpected outputs: {", ".join(rule_descs)}')
+
+			full_description = (
+				f'[Task template] {tpl.description or tpl.name}\n\n'
+				f'Prompt blueprint:\n"""\n{tpl.prompt_template[:200]}'
+				f'{"…" if len(tpl.prompt_template) > 200 else ""}\n"""\n\n'
+				f'Variables ({len(tpl.variables)}):\n' + '\n'.join(var_lines)
+				if var_lines
+				else ''
+			).strip()
+
+			tool_name = f'{self.DYNAMIC_TEMPLATE_TOOL_PREFIX}{tpl.name}'
+			input_schema = {
+				'type': 'object',
+				'properties': properties,
+			}
+			if required:
+				input_schema['required'] = required
+
+			if types is not None:
+				try:
+					tools.append(
+						types.Tool(
+							name=tool_name,
+							description=full_description,
+							inputSchema=input_schema,
+						)
+					)
+					continue
+				except Exception:
+					pass
+			# Fallback: plain dict (should not normally be used)
+			tools.append(
+				{
+					'name': tool_name,
+					'description': full_description,
+					'inputSchema': input_schema,
+				}
+			)
+
+		logger.info(f'Dynamically generated {len(tools)} per-template MCP tools')
+		return tools
+
+	async def _execute_dynamic_template_tool(
+		self,
+		tool_name: str,
+		arguments: dict[str, Any],
+	) -> str:
+		"""Execute a ``tpl_<name>`` dynamic template tool."""
+		from browser_use.task_templates.service import get_template_manager
+
+		template_name = tool_name[len(self.DYNAMIC_TEMPLATE_TOOL_PREFIX) :]
+		mgr = get_template_manager()
+
+		# Strip the meta parameters (only max_steps for now); the rest are variables
+		variables = dict(arguments)
+		max_steps = variables.pop('max_steps', None)
+
+		result = await mgr.run(
+			template_name,
+			variables=variables,
+			max_steps=max_steps,
+		)
+
+		payload = {
+			'template_name': result.template_name,
+			'status': result.status.value,
+			'success': result.success,
+			'num_steps': result.num_steps,
+			'duration_seconds': round(result.duration_seconds, 3),
+			'variables_used': result.variables_used,
+			'extracted_content': result.extracted_content,
+			'structured_output': result.structured_output,
+			'output_files': result.output_files,
+			'missing_output_files': result.missing_output_files,
+			'urls_visited': result.urls_visited,
+			'error': result.error,
+			'error_type': result.error_type,
+		}
+		return json.dumps(payload, indent=2, ensure_ascii=False)
 
 	async def _template_list(self, tags: list[str] | None = None) -> str:
 		"""List saved task templates with optional tag filtering."""
