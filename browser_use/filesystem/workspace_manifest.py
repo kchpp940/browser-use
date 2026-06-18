@@ -107,8 +107,67 @@ class WorkspaceManifest:
 		for entry in self._entries.values():
 			if entry.display_name == name:
 				return entry
-			if entry.real_path and (entry.real_path.endswith(name) or name.endswith(entry.display_name)):
+			if entry.real_path and (entry.real_path == name or entry.real_path.endswith(name)):
 				return entry
+		return None
+
+	def resolve_read(self, name: str) -> tuple[ManifestEntry | None, str | None]:
+		"""
+		Resolve a file name for reading.
+		Returns (entry, error_message).
+		- If entry exists and is readable: (entry, None)
+		- If entry exists but not readable: (entry, error_message)
+		- If entry not found: (None, error_message with suggestions)
+		"""
+		entry = self.resolve(name)
+		if entry:
+			if entry.readable:
+				return entry, None
+			return entry, f"File '{entry.display_name}' is not readable (source: {entry.source.value})."
+
+		hint = self._find_alternative(name, readable=True)
+		if hint:
+			return None, f"File '{name}' not found in workspace. {hint}"
+		return None, f"File '{name}' not found and no readable files are available."
+
+	def resolve_upload(self, name: str) -> tuple[ManifestEntry | None, str | None]:
+		"""
+		Resolve a file name for uploading.
+		Returns (entry, error_message).
+		- If entry exists and is uploadable: (entry, None)
+		- If entry exists but not uploadable: (entry, error_message explaining why)
+		- If entry not found: (None, error_message with suggestions)
+		"""
+		entry = self.resolve(name)
+		if entry:
+			if entry.uploadable:
+				return entry, None
+			if entry.is_virtual:
+				if entry.real_path:
+					return entry, None
+				return (
+					entry,
+					f"File '{entry.display_name}' is a virtual file with no real disk path. "
+					f'It can be read with read_file but cannot be uploaded directly.',
+				)
+			return entry, f"File '{entry.display_name}' is marked as not uploadable (source: {entry.source.value})."
+
+		hint = self._find_alternative(name, uploadable=True)
+		if hint:
+			return None, f"File '{name}' not found in workspace. {hint}"
+		return None, f"File '{name}' not found and no uploadable files are available."
+
+	def _find_alternative(self, name: str, readable: bool = False, uploadable: bool = False) -> str | None:
+		closest = self._fuzzy_match(name)
+		if closest:
+			return f"Did you mean '{closest.display_name}'?"
+		available = [
+			e.display_name
+			for e in self.all_entries()
+			if (not readable or e.readable) and (not uploadable or e.uploadable)
+		]
+		if available:
+			return f'Available files: {", ".join(sorted(available))}'
 		return None
 
 	def remove(self, key: str) -> None:

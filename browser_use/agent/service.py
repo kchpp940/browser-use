@@ -67,6 +67,7 @@ from browser_use.browser.views import BrowserStateSummary
 from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
 from browser_use.filesystem.file_system import FileSystem
+from browser_use.filesystem.workspace_manifest import FileSource, PathType
 from browser_use.observability import observe, observe_debug
 from browser_use.telemetry.service import ProductTelemetry
 from browser_use.telemetry.views import AgentTelemetryEvent
@@ -1759,6 +1760,26 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			)
 			screenshot_path = await self.screenshot_service.store_screenshot(browser_state_summary.screenshot, self.state.n_steps)
 			self.logger.debug(f'📸 Screenshot stored at: {screenshot_path}')
+
+			# Register screenshot in workspace manifest
+			if self.file_system and screenshot_path:
+				import os
+
+				try:
+					size = os.path.getsize(screenshot_path)
+				except OSError:
+					size = 0
+				self.file_system.manifest.register(
+					display_name=os.path.basename(screenshot_path),
+					source=FileSource.SCREENSHOT,
+					path_type=PathType.LOCAL_ABSOLUTE,
+					real_path=screenshot_path,
+					size_bytes=size,
+					readable=True,
+					uploadable=False,
+					last_action='screenshot',
+					metadata={'step': self.state.n_steps},
+				)
 		else:
 			self.logger.debug(f'📸 No screenshot in browser_state_summary for step {self.state.n_steps}')
 

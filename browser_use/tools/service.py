@@ -32,6 +32,7 @@ from browser_use.browser.events import (
 from browser_use.browser.views import BrowserError
 from browser_use.dom.service import EnhancedDOMTreeNode
 from browser_use.filesystem.file_system import FileSystem
+from browser_use.filesystem.workspace_manifest import FileSource, PathType
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import SystemMessage, UserMessage
 from browser_use.observability import observe_debug
@@ -839,58 +840,81 @@ class Tools(Generic[Context]):
 		async def upload_file(
 			params: UploadFileAction, browser_session: BrowserSession, available_file_paths: list[str], file_system: FileSystem
 		):
-			# Check if file is in available_file_paths (user-provided or downloaded files)
-			# For remote browsers (is_local=False), we allow absolute remote paths even if not tracked locally
-			if params.path not in available_file_paths:
-				# Also check if it's a recently downloaded file that might not be in available_file_paths yet
-				downloaded_files = browser_session.downloaded_files
-				if params.path not in downloaded_files:
-					# Finally, check if it's a file in the FileSystem service.
-					# Only rewrite to the local FileSystem path on local sessions —
-					# on remote sessions, params.path is meant to address a file on
-					# the remote machine, and a coincidental basename collision with
-					# a local managed file (e.g. `/tmp/note.md` colliding with a
-					# local `note.md`) must not silently upload the local file.
-					if browser_session.is_local and file_system and file_system.get_dir():
-						# Check if the file is actually managed by the FileSystem service
-						# The path should be just the filename for FileSystem files
+			# Step 1: Resolve via workspace manifest for unified path resolution
+			manifest_entry = None
+			manifest_uploadable = False
+			if file_system and file_system.manifest:
+				manifest_entry, upload_error = file_system.manifest.resolve_upload(params.path)
+				manifest_uploadable = upload_error is None
+
+			# Step 2: Determine the actual upload path and validate access
+			resolved_path = params.path
+			path_is_valid = False
+
+			if manifest_entry and manifest_uploadable:
+				# File found in manifest and is uploadable
+				if manifest_entry.is_virtual:
+					# Virtual file with real disk path (managed by FileSystem)
+					if manifest_entry.real_path:
+						resolved_path = manifest_entry.real_path
+						path_is_valid = True
+				else:
+					# Real path file (download, user_provided, etc.)
+					resolved_path = manifest_entry.real_path or manifest_entry.display_name
+					path_is_valid = True
+			elif manifest_entry and not manifest_uploadable:
+				# File exists but is not uploadable - return clear error
+				_, upload_error = file_system.manifest.resolve_upload(params.path)
+				msg = f"Cannot upload '{params.path}': {upload_error}"
+				logger.error(f'❌ {msg}')
+				return ActionResult(error=msg)
+			else:
+				# Fallback to legacy logic for backward compatibility
+				if params.path in available_file_paths:
+					path_is_valid = True
+				else:
+					downloaded_files = browser_session.downloaded_files
+					if params.path in downloaded_files:
+						path_is_valid = True
+						# Auto-register in manifest for future reference
+						if file_system and file_system.manifest:
+							file_system.manifest.register_download(params.path)
+					elif browser_session.is_local and file_system and file_system.get_dir():
+						# Check if it's a file managed by FileSystem
 						file_obj = file_system.get_file(params.path)
 						if file_obj:
-							# Construct the upload path from the FileSystem-owned basename
-							# (file_obj.full_name), NOT from params.path. The agent-controlled
-							# params.path may contain '..' traversal sequences that escape
-							# data_dir when naively joined — get_file() matches by basename
-							# so a path like '../../../note.md' would otherwise resolve to a
-							# sibling file outside the FileSystem directory.
-							# GHSA-j9hj-92j8-jv9h.
 							file_system_path = str(file_system.get_dir() / file_obj.full_name)
-							# Defense in depth: refuse any path that resolves outside data_dir.
 							real_path = os.path.realpath(file_system_path)
 							real_dir = os.path.realpath(str(file_system.get_dir()))
 							if not (real_path == real_dir or real_path.startswith(real_dir + os.sep)):
 								msg = f'Upload of {params.path!r} escapes FileSystem directory; refusing.'
 								logger.error(f'❌ {msg}')
 								return ActionResult(error=msg)
-							params = UploadFileAction(index=params.index, path=file_system_path)
+							resolved_path = file_system_path
+							path_is_valid = True
 						else:
-							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
-							if file_system.manifest:
-								hint = file_system.manifest.suggest_for_upload(params.path)
-								if hint:
-									msg += f'\n{hint}'
-							logger.error(f'❌ {msg}')
-							return ActionResult(error=msg)
-					else:
-						# If browser is remote, allow passing a remote-accessible absolute path
-						if not browser_session.is_local:
-							pass
-						else:
+							# Not found anywhere - return error with manifest suggestions
 							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
 							if file_system and file_system.manifest:
-								hint = file_system.manifest.suggest_for_upload(params.path)
-								if hint:
-									msg += f'\n{hint}'
-							raise BrowserError(message=msg, long_term_memory=msg)
+								_, upload_suggestion = file_system.manifest.resolve_upload(params.path)
+								if upload_suggestion:
+									msg += f'\n{upload_suggestion}'
+							logger.error(f'❌ {msg}')
+							return ActionResult(error=msg)
+					elif not browser_session.is_local:
+						# Remote browser: allow passing remote-accessible absolute paths
+						path_is_valid = True
+					else:
+						msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
+						if file_system and file_system.manifest:
+							_, upload_suggestion = file_system.manifest.resolve_upload(params.path)
+							if upload_suggestion:
+								msg += f'\n{upload_suggestion}'
+						raise BrowserError(message=msg, long_term_memory=msg)
+
+			# Update params with resolved path
+			if resolved_path != params.path:
+				params = UploadFileAction(index=params.index, path=resolved_path)
 
 			# For local browsers, ensure the file exists and has content
 			if browser_session.is_local:
@@ -974,6 +998,13 @@ class Tools(Generic[Context]):
 				await event.event_result(raise_if_any=True, raise_if_none=False)
 				msg = f'Successfully uploaded file to index {params.index}'
 				logger.info(f'📁 {msg}')
+
+				# Update manifest last_action
+				if file_system and file_system.manifest:
+					entry = file_system.manifest.resolve(params.path)
+					if entry:
+						file_system.manifest.touch(entry.lookup_key, 'upload')
+
 				return ActionResult(
 					extracted_content=msg,
 					long_term_memory=f'Uploaded file {params.path} to element {params.index}',
@@ -1518,6 +1549,17 @@ You will be given a query and the markdown of a webpage that has been filtered t
 				file_path = file_system.get_dir() / file_name
 				file_path.write_bytes(screenshot_bytes)
 
+				file_system.manifest.register(
+					display_name=file_name,
+					source=FileSource.SCREENSHOT,
+					path_type=PathType.VIRTUAL_NAME,
+					real_path=str(file_path),
+					size_bytes=len(screenshot_bytes),
+					readable=True,
+					uploadable=True,
+					last_action='screenshot_save',
+				)
+
 				result = f'Screenshot saved to {file_name}'
 				logger.info(f'📸 {result}. Full path: {file_path}')
 				return ActionResult(
@@ -1750,18 +1792,46 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			'Read the complete content of a file. Use this to view file contents before editing or to retrieve data from files. Supports text files (txt, md, json, csv, jsonl), documents (pdf, docx), and images (jpg, png).'
 		)
 		async def read_file(file_name: str, available_file_paths: list[str], file_system: FileSystem):
-			if available_file_paths and file_name in available_file_paths:
-				structured_result = await file_system.read_file_structured(file_name, external_file=True)
+			# Step 1: Resolve via workspace manifest for unified path resolution
+			entry, resolve_error = None, None
+			if file_system and file_system.manifest:
+				entry, resolve_error = file_system.manifest.resolve_read(file_name)
+
+			# Step 2: Determine read path and mode
+			is_external = False
+			read_path = file_name
+
+			if entry and entry.readable:
+				# File found in manifest - use manifest info
+				if entry.is_virtual:
+					is_external = False
+					read_path = entry.display_name
+				else:
+					is_external = True
+					read_path = entry.real_path or entry.display_name
 			else:
-				structured_result = await file_system.read_file_structured(file_name)
+				# Fallback to legacy logic for backward compatibility
+				if available_file_paths and file_name in available_file_paths:
+					is_external = True
+				else:
+					is_external = False
+
+			# Step 3: Perform the actual read
+			structured_result = await file_system.read_file_structured(read_path, external_file=is_external)
 
 			result = structured_result['message']
 			images = structured_result.get('images')
 
-			if 'not found' in result.lower() and file_system.manifest:
-				hint = file_system.manifest.suggest_for_read(file_name)
-				if hint:
-					result += f'\n{hint}'
+			# Step 4: Update manifest and provide hints on failure
+			read_success = 'not found' not in result.lower()
+			if file_system and file_system.manifest:
+				if read_success and entry:
+					file_system.manifest.touch(entry.lookup_key, 'read')
+				elif not read_success:
+					# Use manifest-based suggestions if available
+					_, read_error = file_system.manifest.resolve_read(file_name)
+					if read_error:
+						result = f'{result}\n{read_error}'
 
 			MAX_MEMORY_SIZE = 1000
 			# For images, create a shorter memory message

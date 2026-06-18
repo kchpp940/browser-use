@@ -254,6 +254,103 @@ class TestWorkspaceManifest:
 		)
 		assert manifest.suggest_for_upload('data.csv') is None
 
+	def test_resolve_read_virtual_file(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='notes.md',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			real_path='/tmp/fs/notes.md',
+			readable=True,
+		)
+		entry, error = manifest.resolve_read('notes.md')
+		assert entry is not None
+		assert error is None
+		assert entry.is_virtual is True
+
+	def test_resolve_read_real_path(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='report.pdf',
+			source=FileSource.DOWNLOAD,
+			path_type=PathType.LOCAL_ABSOLUTE,
+			real_path='/tmp/downloads/report.pdf',
+			readable=True,
+		)
+		entry, error = manifest.resolve_read('/tmp/downloads/report.pdf')
+		assert entry is not None
+		assert error is None
+		assert entry.real_path == '/tmp/downloads/report.pdf'
+
+	def test_resolve_read_not_readable(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='secret.bin',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			readable=False,
+		)
+		entry, error = manifest.resolve_read('secret.bin')
+		assert entry is not None
+		assert error is not None
+		assert 'not readable' in error
+
+	def test_resolve_read_not_found(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='data.json',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			readable=True,
+		)
+		entry, error = manifest.resolve_read('missing.md')
+		assert entry is None
+		assert error is not None
+		assert 'not found' in error
+		assert 'data.json' in error
+
+	def test_resolve_upload_virtual_with_path(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='output.md',
+			source=FileSource.VIRTUAL,
+			path_type=PathType.VIRTUAL_NAME,
+			real_path='/tmp/fs/output.md',
+			uploadable=True,
+		)
+		entry, error = manifest.resolve_upload('output.md')
+		assert entry is not None
+		assert error is None
+		assert entry.real_path == '/tmp/fs/output.md'
+
+	def test_resolve_upload_not_uploadable(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='step_1.png',
+			source=FileSource.SCREENSHOT,
+			path_type=PathType.LOCAL_ABSOLUTE,
+			real_path='/tmp/screenshots/step_1.png',
+			uploadable=False,
+		)
+		entry, error = manifest.resolve_upload('step_1.png')
+		assert entry is not None
+		assert error is not None
+		assert 'not uploadable' in error
+
+	def test_resolve_upload_not_found_with_suggestions(self):
+		manifest = WorkspaceManifest()
+		manifest.register(
+			display_name='data.csv',
+			source=FileSource.DOWNLOAD,
+			path_type=PathType.LOCAL_ABSOLUTE,
+			real_path='/tmp/data.csv',
+			uploadable=True,
+		)
+		entry, error = manifest.resolve_upload('missing.csv')
+		assert entry is None
+		assert error is not None
+		assert 'data.csv' in error
+
 	def test_register_user_files(self):
 		manifest = WorkspaceManifest()
 		with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
