@@ -13,6 +13,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from browser_use.profiles.models import (
+	EffectiveProfileConfig,
 	ProfileLLMConfig,
 	ProfileDefinition,
 	ProfilesFile,
@@ -29,6 +30,10 @@ PROFILE_ENV_VAR = 'BROWSER_USE_PROFILE'
 
 # Environment variable for profile file path
 PROFILE_FILE_ENV_VAR = 'BROWSER_USE_PROFILES_FILE'
+
+# Sentinel value for "not explicitly set" - used to distinguish between
+# a parameter that was explicitly set to its default value vs not set at all
+_UNSET = object()
 
 
 def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -270,6 +275,229 @@ class ProfileManager:
 			llm=ProfileLLMConfig(**merged_llm_dict),
 			agent=merged_agent,
 		)
+
+	def _get_env_overrides(self) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+		"""Extract configuration overrides from environment variables.
+
+		Returns:
+		    Tuple of (browser_overrides, llm_overrides, agent_overrides)
+		"""
+		browser_overrides: dict[str, Any] = {}
+		llm_overrides: dict[str, Any] = {}
+		agent_overrides: dict[str, Any] = {}
+
+		# Browser-related env vars
+		if os.environ.get('BROWSER_USE_HEADLESS') is not None:
+			browser_overrides['headless'] = os.environ['BROWSER_USE_HEADLESS'].lower() in ('1', 'true', 'yes')
+		if os.environ.get('BROWSER_USE_CDP_URL'):
+			browser_overrides['cdp_url'] = os.environ['BROWSER_USE_CDP_URL']
+		if os.environ.get('BROWSER_USE_DOWNLOADS_PATH'):
+			browser_overrides['downloads_path'] = os.environ['BROWSER_USE_DOWNLOADS_PATH']
+		if os.environ.get('BROWSER_USE_USER_DATA_DIR'):
+			browser_overrides['user_data_dir'] = os.environ['BROWSER_USE_USER_DATA_DIR']
+		if os.environ.get('BROWSER_USE_CLOUD_PROFILE_ID'):
+			browser_overrides['cloud_profile_id'] = os.environ['BROWSER_USE_CLOUD_PROFILE_ID']
+		if os.environ.get('BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE'):
+			browser_overrides['cloud_proxy_country_code'] = os.environ['BROWSER_USE_CLOUD_PROXY_COUNTRY_CODE']
+		if os.environ.get('BROWSER_USE_CLOUD_TIMEOUT'):
+			try:
+				browser_overrides['cloud_timeout'] = int(os.environ['BROWSER_USE_CLOUD_TIMEOUT'])
+			except ValueError:
+				pass
+
+		# LLM-related env vars
+		if os.environ.get('BROWSER_USE_LLM_PROVIDER'):
+			llm_overrides['provider'] = os.environ['BROWSER_USE_LLM_PROVIDER']
+		if os.environ.get('BROWSER_USE_LLM_MODEL'):
+			llm_overrides['model'] = os.environ['BROWSER_USE_LLM_MODEL']
+		if os.environ.get('BROWSER_USE_LLM_TEMPERATURE') is not None:
+			try:
+				llm_overrides['temperature'] = float(os.environ['BROWSER_USE_LLM_TEMPERATURE'])
+			except ValueError:
+				pass
+		if os.environ.get('BROWSER_USE_LLM_API_KEY'):
+			llm_overrides['api_key'] = os.environ['BROWSER_USE_LLM_API_KEY']
+		if os.environ.get('BROWSER_USE_LLM_API_BASE'):
+			llm_overrides['api_base'] = os.environ['BROWSER_USE_LLM_API_BASE']
+
+		# Agent-related env vars
+		if os.environ.get('BROWSER_USE_MAX_STEPS'):
+			try:
+				agent_overrides['max_steps'] = int(os.environ['BROWSER_USE_MAX_STEPS'])
+			except ValueError:
+				pass
+		if os.environ.get('BROWSER_USE_FLASH_MODE') is not None:
+			agent_overrides['flash_mode'] = os.environ['BROWSER_USE_FLASH_MODE'].lower() in ('1', 'true', 'yes')
+		if os.environ.get('BROWSER_USE_USE_VISION') is not None:
+			val = os.environ['BROWSER_USE_USE_VISION'].lower()
+			if val == 'auto':
+				agent_overrides['use_vision'] = 'auto'
+			else:
+				agent_overrides['use_vision'] = val in ('1', 'true', 'yes')
+		if os.environ.get('BROWSER_USE_MAX_FAILURES'):
+			try:
+				agent_overrides['max_failures'] = int(os.environ['BROWSER_USE_MAX_FAILURES'])
+			except ValueError:
+				pass
+
+		return browser_overrides, llm_overrides, agent_overrides
+
+	def build_effective_config(
+		self,
+		profile_name: str | None = None,
+		*,
+		browser_overrides: dict[str, Any] | None = None,
+		llm_overrides: dict[str, Any] | None = None,
+		agent_overrides: dict[str, Any] | None = None,
+		source: str = 'api',
+	) -> EffectiveProfileConfig:
+		"""Build the final effective profile configuration.
+
+		Applies overrides in order of priority (lowest to highest):
+		1. Profile preset (from profiles.json)
+		2. Environment variables
+		3. Explicit CLI/API parameters
+
+		Args:
+		    profile_name: Name of the profile to load, or None for default.
+		    browser_overrides: Browser settings from explicit parameters.
+		    llm_overrides: LLM settings from explicit parameters.
+		    agent_overrides: Agent settings from explicit parameters.
+		    source: Source identifier for the config (e.g., "api", "cli", "sandbox").
+
+		Returns:
+		    EffectiveProfileConfig with all overrides applied.
+		"""
+		# Step 1: Load profile preset (base layer)
+		resolved_profile = self.get_profile(profile_name)
+		has_profile = resolved_profile.name != 'empty'
+
+		# Step 2: Apply environment variable overrides
+		env_browser, env_llm, env_agent = self._get_env_overrides()
+		has_env_overrides = bool(env_browser or env_llm or env_agent)
+
+		# Step 3: Apply explicit parameter overrides
+		has_explicit_overrides = bool(browser_overrides or llm_overrides or agent_overrides)
+
+		# Merge all layers
+		# Profile -> env -> explicit
+		merged_browser = resolved_profile.browser.copy()
+		if env_browser:
+			merged_browser = _deep_merge(merged_browser, env_browser)
+		if browser_overrides:
+			merged_browser = _deep_merge(merged_browser, browser_overrides)
+
+		merged_agent = resolved_profile.agent.copy()
+		if env_agent:
+			merged_agent = _deep_merge(merged_agent, env_agent)
+		if agent_overrides:
+			merged_agent = _deep_merge(merged_agent, agent_overrides)
+
+		# LLM merging
+		llm_dict = resolved_profile.llm.model_dump(exclude_none=True)
+		if env_llm:
+			llm_dict = _deep_merge(llm_dict, env_llm)
+		if llm_overrides:
+			llm_dict = _deep_merge(llm_dict, llm_overrides)
+
+		# Determine source
+		if has_explicit_overrides:
+			final_source = source
+		elif has_env_overrides:
+			final_source = 'env'
+		elif has_profile:
+			final_source = 'profile'
+		else:
+			final_source = 'defaults'
+
+		return EffectiveProfileConfig(
+			profile_name=resolved_profile.name if has_profile else None,
+			source=final_source,
+			browser=merged_browser,
+			llm=ProfileLLMConfig(**llm_dict),
+			agent=merged_agent,
+		)
+
+	def create_browser_profile_from_effective(self, effective: EffectiveProfileConfig):
+		"""Create a BrowserProfile instance from an effective config.
+
+		Args:
+		    effective: The effective profile config.
+
+		Returns:
+		    BrowserProfile instance
+		"""
+		from browser_use.browser.profile import BrowserProfile
+
+		return BrowserProfile(**effective.browser)
+
+	def create_llm_from_effective(self, effective: EffectiveProfileConfig):
+		"""Create an LLM chat model from an effective config.
+
+		Args:
+		    effective: The effective profile config.
+
+		Returns:
+		    Chat model instance, or None if no LLM config is provided.
+		"""
+		# Reuse the existing create_llm logic by wrapping in a ResolvedProfile-like object
+		resolved = ResolvedProfile(
+			name=effective.profile_name or 'effective',
+			browser=effective.browser,
+			llm=effective.llm,
+			agent=effective.agent,
+		)
+		return self.create_llm(resolved)
+
+	def log_effective_profile_info(self, effective: EffectiveProfileConfig) -> None:
+		"""Log effective profile information for debugging/verification.
+
+		Args:
+		    effective: The effective profile config to log.
+		"""
+		if effective.profile_name:
+			logger.info(f'📋 Profile loaded: {effective.profile_name}')
+		else:
+			logger.info('📋 No profile preset loaded')
+		logger.info(f'   Source: {effective.source}')
+		logger.info(f'   Signature: {effective.signature()}')
+
+		# Log browser settings summary
+		browser_summary = []
+		if effective.browser:
+			for key in [
+				'headless', 'use_cloud', 'cdp_url', 'user_data_dir',
+				'profile_directory', 'downloads_path', 'window_size',
+				'cloud_profile_id', 'cloud_proxy_country_code', 'cloud_timeout',
+			]:
+				if key in effective.browser and effective.browser[key] is not None:
+					val = effective.browser[key]
+					if key == 'window_size' and isinstance(val, dict):
+						browser_summary.append(f'{key}={val.get("width")}x{val.get("height")}')
+					else:
+						browser_summary.append(f'{key}={val}')
+		if browser_summary:
+			logger.info(f'   Browser: {", ".join(browser_summary)}')
+
+		# Log LLM summary
+		llm_summary = []
+		if effective.llm.provider:
+			llm_summary.append(f'provider={effective.llm.provider}')
+		if effective.llm.model:
+			llm_summary.append(f'model={effective.llm.model}')
+		if effective.llm.temperature is not None:
+			llm_summary.append(f'temperature={effective.llm.temperature}')
+		if llm_summary:
+			logger.info(f'   LLM: {", ".join(llm_summary)}')
+
+		# Log agent settings summary
+		agent_summary = []
+		if effective.agent:
+			for key in ['flash_mode', 'use_vision', 'max_failures', 'max_actions_per_step', 'use_thinking']:
+				if key in effective.agent and effective.agent[key] is not None:
+					agent_summary.append(f'{key}={effective.agent[key]}')
+		if agent_summary:
+			logger.info(f'   Agent: {", ".join(agent_summary)}')
 
 	def create_browser_profile(self, resolved: ResolvedProfile):
 		"""Create a BrowserProfile instance from a resolved profile.
