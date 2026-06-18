@@ -248,7 +248,7 @@ class TraceService:
 				tabs = [tab.model_dump() for tab in browser_state_summary.tabs]
 			except Exception:
 				tabs = []
-			if browser_state_summary.dom_state:
+			if hasattr(browser_state_summary, 'dom_state') and browser_state_summary.dom_state:
 				try:
 					dom_interactive_summary = browser_state_summary.dom_state.llm_representation()
 				except Exception:
@@ -343,7 +343,7 @@ class TraceService:
 					tabs = [tab.model_dump() for tab in browser_state_summary.tabs]
 				except Exception:
 					tabs = []
-			if dom_interactive_summary is None and browser_state_summary.dom_state:
+			if dom_interactive_summary is None and hasattr(browser_state_summary, "dom_state") and browser_state_summary.dom_state:
 				try:
 					dom_interactive_summary = browser_state_summary.dom_state.llm_representation()
 				except Exception:

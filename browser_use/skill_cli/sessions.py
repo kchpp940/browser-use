@@ -28,6 +28,7 @@ class SessionInfo:
 	actions: ActionHandler | None = None
 	python_session: PythonSession = field(default_factory=PythonSession)
 	use_cloud: bool = False
+	trace_dir: str | None = None
 
 
 async def create_browser_session(

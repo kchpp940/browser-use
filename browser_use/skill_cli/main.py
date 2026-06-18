@@ -519,6 +519,8 @@ def ensure_daemon(
 		cmd.extend(['--cloud-proxy-country', cloud_proxy_country_code])
 	if cloud_timeout is not None:
 		cmd.extend(['--cloud-timeout', str(cloud_timeout)])
+	if trace_dir is not None:
+		cmd.extend(['--trace-dir', str(Path(trace_dir).expanduser().resolve())])
 
 	# Set up environment
 	env = os.environ.copy()
