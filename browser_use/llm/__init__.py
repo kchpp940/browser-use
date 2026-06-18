@@ -8,7 +8,14 @@ from typing import TYPE_CHECKING
 
 # Lightweight imports that are commonly used
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod, get_default_capabilities
+from browser_use.llm.capabilities import (
+	ProviderCapabilities,
+	StructuredOutputMethod,
+	build_prompt_text_schema_instruction,
+	extract_json_candidates,
+	get_default_capabilities,
+	parse_structured_output_from_text,
+)
 from browser_use.llm.messages import (
 	AssistantMessage,
 	BaseMessage,
@@ -146,6 +153,9 @@ __all__ = [
 	'ProviderCapabilities',
 	'StructuredOutputMethod',
 	'get_default_capabilities',
+	'extract_json_candidates',
+	'parse_structured_output_from_text',
+	'build_prompt_text_schema_instruction',
 	# Chat models
 	'BaseChatModel',
 	'ChatOpenAI',

@@ -1,4 +1,4 @@
-import json
+import logging
 from dataclasses import dataclass
 from os import getenv
 from typing import TYPE_CHECKING, Any, TypeVar, overload
@@ -7,11 +7,18 @@ from pydantic import BaseModel
 
 from browser_use.llm.aws.serializer import AWSBedrockMessageSerializer
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod
+from browser_use.llm.capabilities import (
+	ProviderCapabilities,
+	StructuredOutputMethod,
+	build_prompt_text_schema_instruction,
+	parse_structured_output_from_text,
+)
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
-from browser_use.llm.messages import BaseMessage
+from browser_use.llm.messages import BaseMessage, ContentPartTextParam
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
 	from boto3 import client as AwsClient  # type: ignore
@@ -166,6 +173,31 @@ class ChatAWSBedrock(BaseChatModel):
 	@overload
 	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
 
+	def _extract_text_from_content(self, content: list[dict[str, Any]]) -> str:
+		text_content = []
+		for item in content:
+			if 'text' in item:
+				text_content.append(item['text'])
+		return '\n'.join(text_content) if text_content else ''
+
+	def _extract_tool_use_from_content(self, content: list[dict[str, Any]], output_format: type[T]) -> T | None:
+		import json as _json
+
+		for item in content:
+			if 'toolUse' in item:
+				tool_use = item['toolUse']
+				tool_input = tool_use.get('input', {})
+				try:
+					return output_format.model_validate(tool_input)
+				except Exception:
+					if isinstance(tool_input, str):
+						try:
+							data = _json.loads(tool_input)
+							return output_format.model_validate(data)
+						except _json.JSONDecodeError:
+							pass
+		return None
+
 	async def ainvoke(
 		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
@@ -186,98 +218,111 @@ class ChatAWSBedrock(BaseChatModel):
 				'`boto3` not installed. Please install using `pip install browser-use[aws] or pip install browser-use[all]`'
 			)
 
-		bedrock_messages, system_message = AWSBedrockMessageSerializer.serialize_messages(messages)
-
 		try:
-			# Prepare the request body
-			body: dict[str, Any] = {}
-
-			if system_message:
-				body['system'] = system_message
-
-			inference_config = self._get_inference_config()
-			if inference_config:
-				body['inferenceConfig'] = inference_config
-
-			# Handle structured output via tool calling
-			if output_format is not None:
-				tools = self._format_tools_for_request(output_format)
-				body['toolConfig'] = {'tools': tools}
-
-			# Add any additional request parameters
-			if self.request_params:
-				body.update(self.request_params)
-
-			# Filter out None values
-			body = {k: v for k, v in body.items() if v is not None}
-
-			# Make the API call
-			client = self._get_client()
-			response = client.converse(modelId=self.model, messages=bedrock_messages, **body)
-
-			usage = self._get_usage(response)
-
-			# Extract the response content
-			if 'output' in response and 'message' in response['output']:
-				message = response['output']['message']
-				content = message.get('content', [])
-
-				if output_format is None:
-					# Return text response
-					text_content = []
-					for item in content:
-						if 'text' in item:
-							text_content.append(item['text'])
-
-					response_text = '\n'.join(text_content) if text_content else ''
-					return ChatInvokeCompletion(
-						completion=response_text,
-						usage=usage,
-					)
-				else:
-					# Handle structured output from tool calls
-					for item in content:
-						if 'toolUse' in item:
-							tool_use = item['toolUse']
-							tool_input = tool_use.get('input', {})
-
-							try:
-								# Validate and return the structured output
-								return ChatInvokeCompletion(
-									completion=output_format.model_validate(tool_input),
-									usage=usage,
-								)
-							except Exception as e:
-								# If validation fails, try to parse as JSON first
-								if isinstance(tool_input, str):
-									try:
-										data = json.loads(tool_input)
-										return ChatInvokeCompletion(
-											completion=output_format.model_validate(data),
-											usage=usage,
-										)
-									except json.JSONDecodeError:
-										pass
-								raise ModelProviderError(
-									message=f'Failed to validate structured output: {str(e)}',
-									model=self.name,
-								) from e
-
-					# If no tool use found but output_format was requested
-					raise ModelProviderError(
-						message='Expected structured output but no tool use found in response',
-						model=self.name,
-					)
-
-			# If no valid content found
 			if output_format is None:
-				return ChatInvokeCompletion(
-					completion='',
-					usage=usage,
-				)
+				bedrock_messages, system_message = AWSBedrockMessageSerializer.serialize_messages(messages)
+				body: dict[str, Any] = {}
+				if system_message:
+					body['system'] = system_message
+				inference_config = self._get_inference_config()
+				if inference_config:
+					body['inferenceConfig'] = inference_config
+				if self.request_params:
+					body.update(self.request_params)
+				body = {k: v for k, v in body.items() if v is not None}
+
+				client = self._get_client()
+				response = client.converse(modelId=self.model, messages=bedrock_messages, **body)
+				usage = self._get_usage(response)
+
+				response_text = ''
+				if 'output' in response and 'message' in response['output']:
+					content = response['output']['message'].get('content', [])
+					response_text = self._extract_text_from_content(content)
+
+				return ChatInvokeCompletion(completion=response_text, usage=usage)
+
 			else:
+				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
+				last_error: Exception | None = None
+
+				for strategy in strategy_chain:
+					try:
+						if strategy == StructuredOutputMethod.TOOL_CALLING:
+							bedrock_messages, system_message = AWSBedrockMessageSerializer.serialize_messages(messages)
+							tools = self._format_tools_for_request(output_format)
+							body = {'toolConfig': {'tools': tools}}
+							if system_message:
+								body['system'] = system_message
+							inference_config = self._get_inference_config()
+							if inference_config:
+								body['inferenceConfig'] = inference_config
+							if self.request_params:
+								body.update(self.request_params)
+							body = {k: v for k, v in body.items() if v is not None}
+
+							client = self._get_client()
+							response = client.converse(modelId=self.model, messages=bedrock_messages, **body)
+							usage = self._get_usage(response)
+
+							if 'output' in response and 'message' in response['output']:
+								content = response['output']['message'].get('content', [])
+								parsed = self._extract_tool_use_from_content(content, output_format)
+								if parsed is not None:
+									return ChatInvokeCompletion(completion=parsed, usage=usage)
+							raise ValueError('Expected tool use in response but none found')
+
+						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+							modified_messages = [m.model_copy(deep=True) for m in messages]
+							instruction_added = False
+							if modified_messages and isinstance(modified_messages[-1].content, str):
+								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+								instruction_added = True
+							elif modified_messages and isinstance(modified_messages[-1].content, list):
+								modified_messages[-1].content.append(
+									ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
+								)
+								instruction_added = True
+							if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
+								modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
+
+							bedrock_messages, system_message = AWSBedrockMessageSerializer.serialize_messages(modified_messages)
+							body: dict[str, Any] = {}
+							if system_message:
+								body['system'] = system_message
+							inference_config = self._get_inference_config()
+							if inference_config:
+								body['inferenceConfig'] = inference_config
+							if self.request_params:
+								body.update(self.request_params)
+							body = {k: v for k, v in body.items() if v is not None}
+
+							client = self._get_client()
+							response = client.converse(modelId=self.model, messages=bedrock_messages, **body)
+							usage = self._get_usage(response)
+
+							response_text = ''
+							if 'output' in response and 'message' in response['output']:
+								content = response['output']['message'].get('content', [])
+								response_text = self._extract_text_from_content(content)
+
+							parsed = parse_structured_output_from_text(response_text, output_format)
+							if parsed is not None:
+								return ChatInvokeCompletion(completion=parsed, usage=usage)
+							raise ValueError('Failed to parse structured output from prompt text response')
+
+					except Exception as e:
+						last_error = e
+						logger.debug(f'AWS Bedrock structured output strategy {strategy} failed: {e}')
+						continue
+
+				if last_error is not None:
+					raise ModelProviderError(
+						message=f'All structured output strategies failed. Last error: {last_error}',
+						model=self.name,
+					) from last_error
 				raise ModelProviderError(
-					message='No valid content found in response',
+					message='No valid structured output strategy available for AWS Bedrock',
 					model=self.name,
 				)
 
@@ -289,5 +334,7 @@ class ChatAWSBedrock(BaseChatModel):
 				raise ModelRateLimitError(message=error_message, model=self.name) from e
 			else:
 				raise ModelProviderError(message=error_message, model=self.name) from e
+		except ModelProviderError:
+			raise
 		except Exception as e:
 			raise ModelProviderError(message=str(e), model=self.name) from e

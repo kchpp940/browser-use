@@ -1,4 +1,4 @@
-import json
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar, overload
@@ -17,10 +17,18 @@ from pydantic import BaseModel
 
 from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
 from browser_use.llm.aws.chat_bedrock import ChatAWSBedrock
-from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod
+from browser_use.llm.capabilities import (
+	ProviderCapabilities,
+	StructuredOutputMethod,
+	build_prompt_text_schema_instruction,
+	parse_structured_output_from_text,
+)
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
-from browser_use.llm.messages import BaseMessage
+from browser_use.llm.messages import BaseMessage, ContentPartTextParam
+from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
 	from boto3.session import Session  # pyright: ignore
@@ -173,6 +181,38 @@ class ChatAnthropicBedrock(ChatAWSBedrock):
 		)
 		return usage
 
+	def _extract_text_from_response(self, response: Message) -> str:
+		first_content = response.content[0]
+		if isinstance(first_content, TextBlock):
+			return first_content.text
+		elif hasattr(first_content, 'type') and first_content.type == 'text':
+			return getattr(first_content, 'text', '')
+		return str(first_content)
+
+	def _parse_tool_use_input(self, content_block: Any, output_format: type[T]) -> T:
+		import json as _json
+
+		try:
+			return output_format.model_validate(content_block.input)
+		except Exception:
+			_input = content_block.input
+			if isinstance(_input, str):
+				_input = _json.loads(_input)
+			elif isinstance(_input, dict):
+				for key, value in _input.items():
+					if isinstance(value, str) and value.startswith(('[', '{')):
+						try:
+							_input[key] = _json.loads(value)
+						except _json.JSONDecodeError:
+							cleaned = value.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+							try:
+								_input[key] = _json.loads(cleaned)
+							except _json.JSONDecodeError:
+								pass
+			else:
+				raise
+			return output_format.model_validate(_input)
+
 	@overload
 	async def ainvoke(
 		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
@@ -188,92 +228,94 @@ class ChatAnthropicBedrock(ChatAWSBedrock):
 
 		try:
 			if output_format is None:
-				# Normal completion without structured output
 				response = await self.get_client().messages.create(
 					model=self.model,
 					messages=anthropic_messages,
 					system=system_prompt or omit,
 					**self._get_client_params_for_invoke(),
 				)
-
 				usage = self._get_usage(response)
-
-				# Extract text from the first content block
-				first_content = response.content[0]
-				if isinstance(first_content, TextBlock):
-					response_text = first_content.text
-				else:
-					# If it's not a text block, convert to string
-					response_text = str(first_content)
-
-				return ChatInvokeCompletion(
-					completion=response_text,
-					usage=usage,
-				)
+				response_text = self._extract_text_from_response(response)
+				return ChatInvokeCompletion(completion=response_text, usage=usage)
 
 			else:
-				# Use tool calling for structured output
-				# Create a tool that represents the output format
-				tool_name = output_format.__name__
-				schema = output_format.model_json_schema()
+				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
+				last_error: Exception | None = None
 
-				# Remove title from schema if present (Anthropic doesn't like it in parameters)
-				if 'title' in schema:
-					del schema['title']
+				for strategy in strategy_chain:
+					try:
+						if strategy == StructuredOutputMethod.TOOL_CALLING:
+							tool_name = output_format.__name__
+							schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+							if 'title' in schema:
+								del schema['title']
 
-				tool = ToolParam(
-					name=tool_name,
-					description=f'Extract information in the format of {tool_name}',
-					input_schema=schema,
-					cache_control=CacheControlEphemeralParam(type='ephemeral'),
-				)
-
-				# Force the model to use this tool
-				tool_choice = ToolChoiceToolParam(type='tool', name=tool_name)
-
-				response = await self.get_client().messages.create(
-					model=self.model,
-					messages=anthropic_messages,
-					tools=[tool],
-					system=system_prompt or omit,
-					tool_choice=tool_choice,
-					**self._get_client_params_for_invoke(),
-				)
-
-				usage = self._get_usage(response)
-
-				# Extract the tool use block
-				for content_block in response.content:
-					if hasattr(content_block, 'type') and content_block.type == 'tool_use':
-						# Parse the tool input as the structured output
-						try:
-							return ChatInvokeCompletion(completion=output_format.model_validate(content_block.input), usage=usage)
-						except Exception as e:
-							# If validation fails, try to fix common model output issues
-							_input = content_block.input
-							if isinstance(_input, str):
-								_input = json.loads(_input)
-							elif isinstance(_input, dict):
-								# Model sometimes double-serializes fields
-								for key, value in _input.items():
-									if isinstance(value, str) and value.startswith(('[', '{')):
-										try:
-											_input[key] = json.loads(value)
-										except json.JSONDecodeError:
-											cleaned = value.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-											try:
-												_input[key] = json.loads(cleaned)
-											except json.JSONDecodeError:
-												pass
-							else:
-								raise
-							return ChatInvokeCompletion(
-								completion=output_format.model_validate(_input),
-								usage=usage,
+							tool = ToolParam(
+								name=tool_name,
+								description=f'Extract information in the format of {tool_name}',
+								input_schema=schema,
+								cache_control=CacheControlEphemeralParam(type='ephemeral'),
 							)
+							tool_choice = ToolChoiceToolParam(type='tool', name=tool_name)
 
-				# If no tool use block found, raise an error
-				raise ValueError('Expected tool use in response but none found')
+							response = await self.get_client().messages.create(
+								model=self.model,
+								messages=anthropic_messages,
+								tools=[tool],
+								system=system_prompt or omit,
+								tool_choice=tool_choice,
+								**self._get_client_params_for_invoke(),
+							)
+							usage = self._get_usage(response)
+
+							for content_block in response.content:
+								if hasattr(content_block, 'type') and content_block.type == 'tool_use':
+									parsed = self._parse_tool_use_input(content_block, output_format)
+									return ChatInvokeCompletion(completion=parsed, usage=usage)
+							raise ValueError('Expected tool use in response but none found')
+
+						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+							modified_messages = [m.model_copy(deep=True) for m in messages]
+							instruction_added = False
+							if modified_messages and isinstance(modified_messages[-1].content, str):
+								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+								instruction_added = True
+							elif modified_messages and isinstance(modified_messages[-1].content, list):
+								modified_messages[-1].content.append(
+									ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
+								)
+								instruction_added = True
+							if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
+								modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
+
+							fallback_msgs, fallback_system = AnthropicMessageSerializer.serialize_messages(modified_messages)
+							response = await self.get_client().messages.create(
+								model=self.model,
+								messages=fallback_msgs,
+								system=fallback_system or omit,
+								**self._get_client_params_for_invoke(),
+							)
+							usage = self._get_usage(response)
+							response_text = self._extract_text_from_response(response)
+							parsed = parse_structured_output_from_text(response_text, output_format)
+							if parsed is not None:
+								return ChatInvokeCompletion(completion=parsed, usage=usage)
+							raise ValueError('Failed to parse structured output from prompt text response')
+
+					except Exception as e:
+						last_error = e
+						logger.debug(f'Anthropic Bedrock structured output strategy {strategy} failed: {e}')
+						continue
+
+				if last_error is not None:
+					raise ModelProviderError(
+						message=f'All structured output strategies failed. Last error: {last_error}',
+						model=self.name,
+					) from last_error
+				raise ModelProviderError(
+					message='No valid structured output strategy available for Anthropic Bedrock',
+					model=self.name,
+				)
 
 		except APIConnectionError as e:
 			raise ModelProviderError(message=e.message, model=self.name) from e
@@ -281,5 +323,7 @@ class ChatAnthropicBedrock(ChatAWSBedrock):
 			raise ModelRateLimitError(message=e.message, model=self.name) from e
 		except APIStatusError as e:
 			raise ModelProviderError(message=e.message, status_code=e.status_code, model=self.name) from e
+		except ModelProviderError:
+			raise
 		except Exception as e:
 			raise ModelProviderError(message=str(e), model=self.name) from e

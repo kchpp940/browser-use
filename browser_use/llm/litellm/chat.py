@@ -14,9 +14,15 @@ from typing import Any, TypeVar, overload
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod, get_default_capabilities
+from browser_use.llm.capabilities import (
+	ProviderCapabilities,
+	StructuredOutputMethod,
+	build_prompt_text_schema_instruction,
+	get_default_capabilities,
+	parse_structured_output_from_text,
+)
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
-from browser_use.llm.messages import BaseMessage
+from browser_use.llm.messages import BaseMessage, ContentPartTextParam
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
@@ -128,24 +134,12 @@ class ChatLiteLLM(BaseChatModel):
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T]: ...
 
-	async def ainvoke(
-		self,
-		messages: list[BaseMessage],
-		output_format: type[T] | None = None,
-		**kwargs: Any,
-	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
-		from litellm import acompletion  # type: ignore[reportMissingImports]
-		from litellm.exceptions import APIConnectionError, APIError, RateLimitError, Timeout  # type: ignore[reportMissingImports]
-		from litellm.types.utils import ModelResponse  # type: ignore[reportMissingImports]
-
-		litellm_messages = LiteLLMMessageSerializer.serialize(messages)
-
+	def _build_base_params(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
 		params: dict[str, Any] = {
 			'model': self.model,
-			'messages': litellm_messages,
+			'messages': messages,
 			'num_retries': self.max_retries,
 		}
-
 		if self.temperature is not None:
 			params['temperature'] = self.temperature
 		if self.max_tokens is not None:
@@ -156,89 +150,186 @@ class ChatLiteLLM(BaseChatModel):
 			params['api_base'] = self.api_base
 		if self.metadata:
 			params['metadata'] = self.metadata
+		return params
 
-		if output_format is not None:
-			schema = SchemaOptimizer.create_optimized_json_schema(output_format)
-			params['response_format'] = {
-				'type': 'json_schema',
-				'json_schema': {
-					'name': 'agent_output',
-					'strict': True,
-					'schema': schema,
-				},
-			}
+	async def ainvoke(
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		**kwargs: Any,
+	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
+		from litellm import acompletion  # type: ignore[reportMissingImports]
+		from litellm.exceptions import APIConnectionError, APIError, RateLimitError, Timeout  # type: ignore[reportMissingImports]
+		from litellm.types.utils import ModelResponse  # type: ignore[reportMissingImports]
+
+		base_litellm_messages = LiteLLMMessageSerializer.serialize(messages)
 
 		try:
-			raw_response = await acompletion(**params)
+			if output_format is None:
+				params = self._build_base_params(base_litellm_messages)
+				raw_response = await acompletion(**params)
+				assert isinstance(raw_response, ModelResponse), f'Expected ModelResponse, got {type(raw_response)}'
+				response: ModelResponse = raw_response
+
+				choice = response.choices[0] if response.choices else None
+				if choice is None:
+					raise ModelProviderError(
+						message='Empty response: no choices returned by the model',
+						status_code=502,
+						model=self.name,
+					)
+				content = choice.message.content or ''
+				usage = self._parse_usage(response)
+				stop_reason = choice.finish_reason
+				thinking: str | None = None
+				reasoning = getattr(choice.message, 'reasoning_content', None)
+				if reasoning:
+					thinking = str(reasoning)
+				return ChatInvokeCompletion(
+					completion=content,
+					thinking=thinking,
+					usage=usage,
+					stop_reason=stop_reason,
+				)
+
+			else:
+				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
+				last_error: Exception | None = None
+
+				for strategy in strategy_chain:
+					try:
+						if strategy == StructuredOutputMethod.JSON_SCHEMA:
+							schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+							params = self._build_base_params(base_litellm_messages)
+							params['response_format'] = {
+								'type': 'json_schema',
+								'json_schema': {
+									'name': output_format.__name__,
+									'strict': True,
+									'schema': schema,
+								},
+							}
+							raw_response = await acompletion(**params)
+							assert isinstance(raw_response, ModelResponse)
+							choice = raw_response.choices[0] if raw_response.choices else None
+							if choice is None or not (choice.message.content or ''):
+								raise ValueError('Empty response for JSON_SCHEMA strategy')
+							content = choice.message.content or ''
+							usage = self._parse_usage(raw_response)
+							stop_reason = choice.finish_reason
+							thinking: str | None = None
+							reasoning = getattr(choice.message, 'reasoning_content', None)
+							if reasoning:
+								thinking = str(reasoning)
+							parsed = output_format.model_validate_json(content)
+							return ChatInvokeCompletion(
+								completion=parsed,
+								thinking=thinking,
+								usage=usage,
+								stop_reason=stop_reason,
+							)
+
+						elif strategy == StructuredOutputMethod.TOOL_CALLING:
+							schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+							tool_spec = {
+								'type': 'function',
+								'function': {
+									'name': output_format.__name__,
+									'description': f'Extract information in the format of {output_format.__name__}',
+									'strict': True,
+									'parameters': schema,
+								},
+							}
+							params = self._build_base_params(base_litellm_messages)
+							params['tools'] = [tool_spec]
+							params['tool_choice'] = {'type': 'function', 'function': {'name': output_format.__name__}}
+							raw_response = await acompletion(**params)
+							assert isinstance(raw_response, ModelResponse)
+							choice = raw_response.choices[0] if raw_response.choices else None
+							if choice is None:
+								raise ValueError('Empty response for TOOL_CALLING strategy')
+							msg = choice.message
+							usage = self._parse_usage(raw_response)
+							stop_reason = choice.finish_reason
+							thinking: str | None = None
+							reasoning = getattr(msg, 'reasoning_content', None)
+							if reasoning:
+								thinking = str(reasoning)
+							tool_calls = getattr(msg, 'tool_calls', None)
+							if tool_calls and len(tool_calls) > 0:
+								args_str = getattr(tool_calls[0].function, 'arguments', '')
+								parsed = output_format.model_validate_json(args_str)
+								return ChatInvokeCompletion(
+									completion=parsed,
+									thinking=thinking,
+									usage=usage,
+									stop_reason=stop_reason,
+								)
+							raise ValueError('No tool calls found in response')
+
+						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+							modified_messages = [m.model_copy(deep=True) for m in messages]
+							instruction_added = False
+							if modified_messages and isinstance(modified_messages[-1].content, str):
+								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+								instruction_added = True
+							elif modified_messages and isinstance(modified_messages[-1].content, list):
+								modified_messages[-1].content.append(
+									ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
+								)
+								instruction_added = True
+							if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
+								modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
+
+							fallback_litellm_messages = LiteLLMMessageSerializer.serialize(modified_messages)
+							params = self._build_base_params(fallback_litellm_messages)
+							raw_response = await acompletion(**params)
+							assert isinstance(raw_response, ModelResponse)
+							choice = raw_response.choices[0] if raw_response.choices else None
+							if choice is None or not (choice.message.content or ''):
+								raise ValueError('Empty response for PROMPT_TEXT strategy')
+							content = choice.message.content or ''
+							usage = self._parse_usage(raw_response)
+							stop_reason = choice.finish_reason
+							thinking: str | None = None
+							reasoning = getattr(choice.message, 'reasoning_content', None)
+							if reasoning:
+								thinking = str(reasoning)
+							parsed = parse_structured_output_from_text(content, output_format)
+							if parsed is not None:
+								return ChatInvokeCompletion(
+									completion=parsed,
+									thinking=thinking,
+									usage=usage,
+									stop_reason=stop_reason,
+								)
+							raise ValueError('Failed to parse structured output from prompt text response')
+
+					except Exception as e:
+						last_error = e
+						logger.debug(f'LiteLLM structured output strategy {strategy} failed: {e}')
+						continue
+
+				if last_error is not None:
+					raise ModelProviderError(
+						message=f'All structured output strategies failed. Last error: {last_error}',
+						model=self.name,
+					) from last_error
+				raise ModelProviderError(
+					message='No valid structured output strategy available for LiteLLM',
+					model=self.name,
+				)
+
 		except RateLimitError as e:
-			raise ModelRateLimitError(
-				message=str(e),
-				model=self.name,
-			) from e
+			raise ModelRateLimitError(message=str(e), model=self.name) from e
 		except Timeout as e:
-			raise ModelProviderError(
-				message=f'Request timed out: {e}',
-				model=self.name,
-			) from e
+			raise ModelProviderError(message=f'Request timed out: {e}', model=self.name) from e
 		except APIConnectionError as e:
-			raise ModelProviderError(
-				message=str(e),
-				model=self.name,
-			) from e
+			raise ModelProviderError(message=str(e), model=self.name) from e
 		except APIError as e:
 			status = getattr(e, 'status_code', 502) or 502
-			raise ModelProviderError(
-				message=str(e),
-				status_code=status,
-				model=self.name,
-			) from e
+			raise ModelProviderError(message=str(e), status_code=status, model=self.name) from e
 		except ModelProviderError:
 			raise
 		except Exception as e:
-			raise ModelProviderError(
-				message=str(e),
-				model=self.name,
-			) from e
-
-		assert isinstance(raw_response, ModelResponse), f'Expected ModelResponse, got {type(raw_response)}'
-		response: ModelResponse = raw_response
-
-		choice = response.choices[0] if response.choices else None
-		if choice is None:
-			raise ModelProviderError(
-				message='Empty response: no choices returned by the model',
-				status_code=502,
-				model=self.name,
-			)
-
-		content = choice.message.content or ''
-		usage = self._parse_usage(response)
-		stop_reason = choice.finish_reason
-
-		thinking: str | None = None
-		msg_obj = choice.message
-		reasoning = getattr(msg_obj, 'reasoning_content', None)
-		if reasoning:
-			thinking = str(reasoning)
-
-		if output_format is not None:
-			if not content:
-				raise ModelProviderError(
-					message='Model returned empty content for structured output request',
-					status_code=500,
-					model=self.name,
-				)
-			parsed = output_format.model_validate_json(content)
-			return ChatInvokeCompletion(
-				completion=parsed,
-				thinking=thinking,
-				usage=usage,
-				stop_reason=stop_reason,
-			)
-
-		return ChatInvokeCompletion(
-			completion=content,
-			thinking=thinking,
-			usage=usage,
-			stop_reason=stop_reason,
-		)
+			raise ModelProviderError(message=str(e), model=self.name) from e
