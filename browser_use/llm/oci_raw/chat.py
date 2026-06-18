@@ -6,6 +6,7 @@ Generative AI service using raw API calls without Langchain dependencies.
 """
 
 import asyncio
+import json
 from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
@@ -21,15 +22,9 @@ from oci.generative_ai_inference.models import (
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.capabilities import (
-	ProviderCapabilities,
-	StructuredOutputMethod,
-	build_prompt_text_schema_instruction,
-	get_default_capabilities,
-	parse_structured_output_from_text,
-)
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
+from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
 from .serializer import OCIRawMessageSerializer
@@ -86,10 +81,6 @@ class ChatOCIRaw(BaseChatModel):
 	@property
 	def provider_name(self) -> str:
 		return 'oci-raw'
-
-	@property
-	def capabilities(self) -> ProviderCapabilities:
-		return get_default_capabilities('oci-raw')
 
 	@property
 	def name(self) -> str:
@@ -332,28 +323,14 @@ class ChatOCIRaw(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self,
-		messages: list[BaseMessage],
-		output_format: None = None,
-		structured_output_method: StructuredOutputMethod | None = None,
-		**kwargs: Any,
+		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(
-		self,
-		messages: list[BaseMessage],
-		output_format: type[T],
-		structured_output_method: StructuredOutputMethod | None = None,
-		**kwargs: Any,
-	) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self,
-		messages: list[BaseMessage],
-		output_format: type[T] | None = None,
-		structured_output_method: StructuredOutputMethod | None = None,
-		**kwargs: Any,
+		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the OCI GenAI model with the given messages using raw API.
@@ -377,30 +354,81 @@ class ChatOCIRaw(BaseChatModel):
 					usage=usage,
 				)
 			else:
-				# Structured output — resolve strategy
-				if structured_output_method is None:
-					strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-					strategy = strategy_chain[0]
-				else:
-					strategy = structured_output_method
+				# For structured output, add JSON schema instructions
+				optimized_schema = SchemaOptimizer.create_optimized_json_schema(output_format)
 
-				if strategy == StructuredOutputMethod.PROMPT_TEXT:
-					modified_messages = [m.model_copy(deep=True) for m in messages]
-					if modified_messages and isinstance(modified_messages[-1].content, str):
-						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+				# Add JSON schema instruction to messages
+				system_instruction = f"""
+You must respond with ONLY a valid JSON object that matches this exact schema:
+{json.dumps(optimized_schema, indent=2)}
 
-					response = await self._make_request(modified_messages)
-					response_text = self._extract_content(response)
-					parsed = parse_structured_output_from_text(response_text, output_format)
-					if parsed is not None:
-						usage = self._extract_usage(response)
-						return ChatInvokeCompletion(
-							completion=parsed,
-							usage=usage,
-						)
-					raise ValueError(f'Failed to parse JSON from text: {response_text[:200]}')
+IMPORTANT: 
+- Your response must be ONLY the JSON object, no additional text
+- The JSON must be valid and parseable
+- All required fields must be present
+- No extra fields are allowed
+- Use proper JSON syntax with double quotes
+"""
+
+				# Clone messages and add system instruction
+				modified_messages = messages.copy()
+
+				# Add or modify system message
+				from browser_use.llm.messages import SystemMessage
+
+				if modified_messages and hasattr(modified_messages[0], 'role') and modified_messages[0].role == 'system':
+					# Modify existing system message
+					existing_content = modified_messages[0].content
+					if isinstance(existing_content, str):
+						modified_messages[0].content = existing_content + '\n\n' + system_instruction
+					else:
+						# Handle list content
+						modified_messages[0].content = str(existing_content) + '\n\n' + system_instruction
 				else:
-					raise ValueError(f'Unsupported structured output strategy: {strategy}')
+					# Insert new system message at the beginning
+					modified_messages.insert(0, SystemMessage(content=system_instruction))
+
+				response = await self._make_request(modified_messages)
+				response_text = self._extract_content(response)
+
+				# Clean and parse the JSON response
+				try:
+					# Clean the response text
+					cleaned_text = response_text.strip()
+
+					# Remove markdown code blocks if present
+					if cleaned_text.startswith('```json'):
+						cleaned_text = cleaned_text[7:]
+					if cleaned_text.startswith('```'):
+						cleaned_text = cleaned_text[3:]
+					if cleaned_text.endswith('```'):
+						cleaned_text = cleaned_text[:-3]
+
+					cleaned_text = cleaned_text.strip()
+
+					# Try to find JSON object in the response
+					if not cleaned_text.startswith('{'):
+						start_idx = cleaned_text.find('{')
+						end_idx = cleaned_text.rfind('}')
+						if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
+							cleaned_text = cleaned_text[start_idx : end_idx + 1]
+
+					# Parse the JSON
+					parsed_data = json.loads(cleaned_text)
+					parsed = output_format.model_validate(parsed_data)
+
+					usage = self._extract_usage(response)
+					return ChatInvokeCompletion(
+						completion=parsed,
+						usage=usage,
+					)
+
+				except (json.JSONDecodeError, ValueError) as e:
+					raise ModelProviderError(
+						message=f'Failed to parse structured output: {str(e)}. Response was: {response_text[:200]}...',
+						status_code=500,
+						model=self.name,
+					) from e
 
 		except ModelRateLimitError:
 			# Re-raise rate limit errors as-is

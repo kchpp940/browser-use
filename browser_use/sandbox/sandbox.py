@@ -221,6 +221,7 @@ def sandbox(
 	log_level: str = 'INFO',
 	quiet: bool = False,
 	headers: dict[str, str] | None = None,
+	profile: str | None = None,
 	on_browser_created: Callable[[BrowserCreatedData], None]
 	| Callable[[BrowserCreatedData], Coroutine[Any, Any, None]]
 	| None = None,
@@ -245,6 +246,7 @@ def sandbox(
 	    log_level: Logging level (INFO, DEBUG, WARNING, ERROR)
 	    quiet: Suppress console output
 	    headers: Additional HTTP headers to send with the request
+	    profile: Profile preset to load (from profiles.json). Provides defaults for cloud settings.
 	    on_browser_created: Callback when browser is created
 	    on_instance_ready: Callback when instance is ready
 	    on_log: Callback for log events
@@ -265,6 +267,11 @@ def sandbox(
 	    # With cloud parameters:
 	    @sandbox(cloud_proxy_country_code='us', cloud_timeout=60)
 	    async def task_with_proxy(browser: Browser) -> str:
+	        ...
+
+	    # With profile preset:
+	    @sandbox(profile='cloud-us')
+	    async def task_with_profile(browser: Browser) -> str:
 	        ...
 	"""
 
@@ -288,6 +295,34 @@ def sandbox(
 			api_key = BROWSER_USE_API_KEY or os.getenv('BROWSER_USE_API_KEY')
 			if not api_key:
 				raise SandboxError('BROWSER_USE_API_KEY is required')
+
+			# 1b. Load profile preset if specified
+			resolved_profile = None
+			profile_cloud_profile_id = None
+			profile_cloud_proxy_country_code = None
+			profile_cloud_timeout = None
+			if profile is not None:
+				from browser_use.profiles.manager import get_profile_manager
+
+				manager = get_profile_manager()
+				resolved_profile = manager.get_profile(profile)
+				manager.log_profile_info(resolved_profile)
+
+				# Extract cloud settings from profile
+				profile_browser = resolved_profile.browser
+				if 'cloud_profile_id' in profile_browser and profile_browser['cloud_profile_id'] is not None:
+					profile_cloud_profile_id = profile_browser['cloud_profile_id']
+				if 'cloud_proxy_country_code' in profile_browser and profile_browser['cloud_proxy_country_code'] is not None:
+					profile_cloud_proxy_country_code = profile_browser['cloud_proxy_country_code']
+				if 'cloud_timeout' in profile_browser and profile_browser['cloud_timeout'] is not None:
+					profile_cloud_timeout = profile_browser['cloud_timeout']
+
+			# Apply profile settings as defaults (direct params override profile)
+			effective_cloud_profile_id = cloud_profile_id if cloud_profile_id is not None else profile_cloud_profile_id
+			effective_cloud_proxy_country_code = (
+				cloud_proxy_country_code if cloud_proxy_country_code is not None else profile_cloud_proxy_country_code
+			)
+			effective_cloud_timeout = cloud_timeout if cloud_timeout is not None else profile_cloud_timeout
 
 			# 2. Extract all parameters (explicit + closure)
 			all_params = _extract_all_params(func, args, kwargs)
@@ -356,12 +391,12 @@ async def run(browser):
 			payload['env'] = combined_env
 
 			# Add cloud parameters if provided
-			if cloud_profile_id is not None:
-				payload['cloud_profile_id'] = cloud_profile_id
-			if cloud_proxy_country_code is not None:
-				payload['cloud_proxy_country_code'] = cloud_proxy_country_code
-			if cloud_timeout is not None:
-				payload['cloud_timeout'] = cloud_timeout
+			if effective_cloud_profile_id is not None:
+				payload['cloud_profile_id'] = effective_cloud_profile_id
+			if effective_cloud_proxy_country_code is not None:
+				payload['cloud_proxy_country_code'] = effective_cloud_proxy_country_code
+			if effective_cloud_timeout is not None:
+				payload['cloud_timeout'] = effective_cloud_timeout
 
 			url = server_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
 

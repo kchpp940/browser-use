@@ -1,4 +1,3 @@
-import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar, overload
@@ -13,20 +12,12 @@ from openai.types.shared_params.response_format_json_schema import (
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.capabilities import (
-	ProviderCapabilities,
-	StructuredOutputMethod,
-	build_prompt_text_schema_instruction,
-	get_default_capabilities,
-	parse_structured_output_from_text,
-)
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
-from browser_use.llm.messages import BaseMessage, ContentPartTextParam
+from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openrouter.serializer import OpenRouterMessageSerializer
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
-logger = logging.getLogger(__name__)
 T = TypeVar('T', bound=BaseModel)
 
 
@@ -63,10 +54,6 @@ class ChatOpenRouter(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'openrouter'
-
-	@property
-	def capabilities(self) -> ProviderCapabilities:
-		return get_default_capabilities('openrouter')
 
 	def _get_client_params(self) -> dict[str, Any]:
 		"""Prepare client parameters dictionary."""
@@ -128,26 +115,14 @@ class ChatOpenRouter(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any
+		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any) -> ChatInvokeCompletion[T]: ...
-
-	def _build_model_params(self, extra_headers: dict[str, str]) -> dict[str, Any]:
-		model_params: dict[str, Any] = {'extra_headers': extra_headers}
-		if self.temperature is not None:
-			model_params['temperature'] = self.temperature
-		if self.top_p is not None:
-			model_params['top_p'] = self.top_p
-		if self.seed is not None:
-			model_params['seed'] = self.seed
-		if self.extra_body:
-			model_params.update(self.extra_body)
-		return model_params
+	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any
+		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the model with the given messages through OpenRouter.
@@ -161,18 +136,22 @@ class ChatOpenRouter(BaseChatModel):
 		"""
 		openrouter_messages = OpenRouterMessageSerializer.serialize_messages(messages)
 
+		# Set up extra headers for OpenRouter
 		extra_headers = {}
 		if self.http_referer:
 			extra_headers['HTTP-Referer'] = self.http_referer
 
-		model_params = self._build_model_params(extra_headers)
-
 		try:
 			if output_format is None:
+				# Return string response
 				response = await self.get_client().chat.completions.create(
 					model=self.model,
 					messages=openrouter_messages,
-					**model_params,
+					temperature=self.temperature,
+					top_p=self.top_p,
+					seed=self.seed,
+					extra_headers=extra_headers,
+					**(self.extra_body or {}),
 				)
 
 				usage = self._get_usage(response)
@@ -182,72 +161,44 @@ class ChatOpenRouter(BaseChatModel):
 				)
 
 			else:
-				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-				strategy = structured_output_method if structured_output_method is not None else strategy_chain[0]
+				# Create a JSON schema for structured output
+				schema = SchemaOptimizer.create_optimized_json_schema(output_format)
 
-				if strategy == StructuredOutputMethod.JSON_SCHEMA:
-					schema = SchemaOptimizer.create_optimized_json_schema(output_format)
-					response_format_schema: JSONSchema = {
-						'name': 'agent_output',
-						'strict': True,
-						'schema': schema,
-					}
+				response_format_schema: JSONSchema = {
+					'name': 'agent_output',
+					'strict': True,
+					'schema': schema,
+				}
 
-					response = await self.get_client().chat.completions.create(
-						model=self.model,
-						messages=openrouter_messages,
-						response_format=ResponseFormatJSONSchema(
-							json_schema=response_format_schema,
-							type='json_schema',
-						),
-						**model_params,
+				# Return structured response
+				response = await self.get_client().chat.completions.create(
+					model=self.model,
+					messages=openrouter_messages,
+					temperature=self.temperature,
+					top_p=self.top_p,
+					seed=self.seed,
+					response_format=ResponseFormatJSONSchema(
+						json_schema=response_format_schema,
+						type='json_schema',
+					),
+					extra_headers=extra_headers,
+					**(self.extra_body or {}),
+				)
+
+				if response.choices[0].message.content is None:
+					raise ModelProviderError(
+						message='Failed to parse structured output from model response',
+						status_code=500,
+						model=self.name,
 					)
+				usage = self._get_usage(response)
 
-					if response.choices[0].message.content is None:
-						raise ValueError('Empty content in JSON schema response')
+				parsed = output_format.model_validate_json(response.choices[0].message.content)
 
-					usage = self._get_usage(response)
-					parsed = output_format.model_validate_json(response.choices[0].message.content)
-					return ChatInvokeCompletion(
-						completion=parsed,
-						usage=usage,
-					)
-
-				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-					modified_messages = [m.model_copy(deep=True) for m in messages]
-					instruction_added = False
-					if modified_messages and isinstance(modified_messages[0].content, str):
-						modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
-						instruction_added = True
-					elif modified_messages and isinstance(modified_messages[0].content, list):
-						modified_messages[0].content.append(
-							ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
-						)
-						instruction_added = True
-					if not instruction_added and modified_messages and isinstance(modified_messages[-1].content, str):
-						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-						instruction_added = True
-
-					modified_openrouter_messages = OpenRouterMessageSerializer.serialize_messages(modified_messages)
-
-					response = await self.get_client().chat.completions.create(
-						model=self.model,
-						messages=modified_openrouter_messages,
-						**model_params,
-					)
-
-					usage = self._get_usage(response)
-					content = response.choices[0].message.content or ''
-					parsed = parse_structured_output_from_text(content, output_format)
-					if parsed is not None:
-						return ChatInvokeCompletion(
-							completion=parsed,
-							usage=usage,
-						)
-					raise ValueError('Failed to parse structured output from prompt text response')
-
-				else:
-					raise ValueError(f'Unsupported structured output strategy: {strategy}')
+				return ChatInvokeCompletion(
+					completion=parsed,
+					usage=usage,
+				)
 
 		except RateLimitError as e:
 			raise ModelRateLimitError(message=e.message, model=self.name) from e

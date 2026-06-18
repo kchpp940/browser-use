@@ -301,6 +301,45 @@ def save_user_config(config: dict[str, Any]) -> None:
 			json.dump(history, f, indent=2, ensure_ascii=False)
 
 
+def apply_profile_to_config(config: dict[str, Any], profile_name: str) -> dict[str, Any]:
+	"""Apply profile preset settings to configuration dictionary.
+
+	Profile settings override existing config values, except for command_history.
+	CLI arguments will be applied on top of profile settings.
+	"""
+	from browser_use.profiles.manager import get_profile_manager
+
+	manager = get_profile_manager()
+	resolved_profile = manager.get_profile(profile_name)
+	manager.log_profile_info(resolved_profile)
+
+	# Apply LLM settings
+	if resolved_profile.llm.provider or resolved_profile.llm.model:
+		if 'model' not in config:
+			config['model'] = {}
+		if resolved_profile.llm.model:
+			config['model']['name'] = resolved_profile.llm.model
+		if resolved_profile.llm.temperature is not None:
+			config['model']['temperature'] = resolved_profile.llm.temperature
+
+	# Apply browser settings
+	if resolved_profile.browser:
+		if 'browser' not in config:
+			config['browser'] = {}
+		for key, value in resolved_profile.browser.items():
+			if value is not None:
+				config['browser'][key] = value
+
+	# Apply agent settings
+	if resolved_profile.agent:
+		config['agent'] = resolved_profile.agent
+
+	# Store profile name in config for reference
+	config['profile_name'] = profile_name
+
+	return config
+
+
 def update_config_with_click_args(config: dict[str, Any], ctx: click.Context) -> dict[str, Any]:
 	"""Update configuration with command-line arguments."""
 	# Ensure required sections exist
@@ -1507,6 +1546,12 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 	try:
 		# Load config
 		config = load_user_config()
+
+		# Apply profile if specified
+		if ctx.params.get('profile'):
+			config = apply_profile_to_config(config, ctx.params['profile'])
+
+		# Apply CLI arguments (override profile settings)
 		config = update_config_with_click_args(config, ctx)
 
 		# Get LLM
@@ -2012,6 +2057,7 @@ async def run_auth_command():
 @click.option('--proxy-password', type=str, help='Proxy auth password')
 @click.option('-p', '--prompt', type=str, help='Run a single task without the TUI (headless mode)')
 @click.option('--mcp', is_flag=True, help='Run as MCP server (exposes JSON RPC via stdin/stdout)')
+@click.option('--profile', type=str, help='Profile preset to use (from profiles.json)')
 @click.pass_context
 def main(ctx: click.Context, debug: bool = False, **kwargs):
 	"""Browser Use - AI Agent for Web Automation
@@ -2099,6 +2145,17 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 		print(f'Error loading configuration: {str(e)}')
 		sys.exit(1)
 
+	# Apply profile if specified
+	if kwargs.get('profile'):
+		logger.debug(f'Applying profile: {kwargs["profile"]}')
+		try:
+			config = apply_profile_to_config(config, kwargs['profile'])
+			logger.debug('Profile applied successfully')
+		except Exception as e:
+			logger.error(f'Error applying profile: {str(e)}', exc_info=True)
+			print(f'Error applying profile: {str(e)}')
+			sys.exit(1)
+
 	# Update config with command-line arguments
 	logger.debug('Updating configuration with command line arguments...')
 	try:
@@ -2179,6 +2236,102 @@ def install():
 	else:
 		print('\n❌ Installation failed')
 		sys.exit(1)
+
+
+@main.group()
+def profiles():
+	"""Manage profile presets"""
+	pass
+
+
+@profiles.command('list')
+def profiles_list():
+	"""List all available profile presets"""
+	from browser_use.profiles.manager import get_profile_manager
+
+	manager = get_profile_manager()
+	profile_list = manager.list_profiles()
+	default_profile = manager.get_default_profile_name()
+
+	if not profile_list:
+		click.echo('No profiles found. Create a profiles.json file to define profiles.')
+		click.echo(f'Config file location: {manager.profiles_file}')
+		return
+
+	click.echo(f'Available profiles ({len(profile_list)}):')
+	for name in sorted(profile_list):
+		marker = ' (default)' if name == default_profile else ''
+		click.echo(f'  • {name}{marker}')
+
+	click.echo()
+	click.echo(f'Config file: {manager.profiles_file}')
+
+
+@profiles.command('show')
+@click.argument('name', required=False)
+@click.option('--json', 'as_json', is_flag=True, help='Output as JSON')
+def profiles_show(name: str | None = None, as_json: bool = False):
+	"""Show details of a profile preset"""
+	import json
+
+	from browser_use.profiles.manager import get_profile_manager
+
+	manager = get_profile_manager()
+
+	if name is None:
+		name = manager.get_default_profile_name()
+		if name is None:
+			click.echo('Error: No profile specified and no default profile set.', err=True)
+			click.echo('Usage: browser-use profiles show <profile-name>', err=True)
+			sys.exit(1)
+
+	try:
+		resolved = manager.get_profile(name)
+	except ValueError as e:
+		click.echo(f'Error: {e}', err=True)
+		sys.exit(1)
+
+	if as_json:
+		output = {
+			'name': resolved.name,
+			'description': resolved.description,
+			'browser': resolved.browser,
+			'llm': resolved.llm.model_dump(exclude_none=True),
+			'agent': resolved.agent,
+			'signature': resolved.signature(),
+		}
+		click.echo(json.dumps(output, indent=2, default=str))
+		return
+
+	click.echo(f'Profile: {resolved.name}')
+	if resolved.description:
+		click.echo(f'Description: {resolved.description}')
+	click.echo(f'Signature: {resolved.signature()}')
+	click.echo()
+
+	click.echo('Browser settings:')
+	if resolved.browser:
+		for key, value in sorted(resolved.browser.items()):
+			click.echo(f'  {key}: {value}')
+	else:
+		click.echo('  (none)')
+	click.echo()
+
+	click.echo('LLM settings:')
+	llm_dict = resolved.llm.model_dump(exclude_none=True)
+	if llm_dict:
+		for key, value in sorted(llm_dict.items()):
+			click.echo(f'  {key}: {value}')
+	else:
+		click.echo('  (none)')
+	click.echo()
+
+	click.echo('Agent settings:')
+	if resolved.agent:
+		for key, value in sorted(resolved.agent.items()):
+			click.echo(f'  {key}: {value}')
+	else:
+		click.echo('  (none)')
 
 
 # ============================================================================

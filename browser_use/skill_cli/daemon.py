@@ -41,6 +41,7 @@ class Daemon:
 		cloud_proxy_country_code: str | None = None,
 		cloud_timeout: int | None = None,
 		session: str = 'default',
+		preset: str | None = None,
 	) -> None:
 		from browser_use.skill_cli.utils import validate_session_name
 
@@ -53,6 +54,7 @@ class Daemon:
 		self.cloud_profile_id = cloud_profile_id
 		self.cloud_proxy_country_code = cloud_proxy_country_code
 		self.cloud_timeout = cloud_timeout
+		self.preset = preset
 		self.running = True
 		self._server: asyncio.Server | None = None
 		self._shutdown_event = asyncio.Event()
@@ -81,6 +83,7 @@ class Daemon:
 				'profile': self.profile,
 				'cdp_url': self.cdp_url,
 				'use_cloud': self.use_cloud,
+				'preset': self.preset,
 			},
 		}
 		state_path = get_home_dir() / f'{self.session}.state.json'
@@ -127,6 +130,7 @@ class Daemon:
 				cloud_profile_id=self.cloud_profile_id,
 				cloud_proxy_country_code=self.cloud_proxy_country_code,
 				cloud_timeout=self.cloud_timeout,
+				preset=self.preset,
 			)
 
 			try:
@@ -290,6 +294,7 @@ class Daemon:
 						'profile': self.profile,
 						'cdp_url': live_cdp_url,
 						'use_cloud': self.use_cloud,
+						'preset': self.preset,
 					},
 				}
 
@@ -521,10 +526,12 @@ def main() -> None:
 	parser.add_argument('--cloud-profile-id', help='Cloud browser profile ID')
 	parser.add_argument('--cloud-proxy-country', help='Cloud browser proxy country code')
 	parser.add_argument('--cloud-timeout', type=int, help='Cloud browser timeout in minutes')
+	parser.add_argument('--preset', help='Profile preset to load (from profiles.json)')
 	args = parser.parse_args()
 
 	logger.info(
-		f'Starting daemon: session={args.session}, headed={args.headed}, profile={args.profile}, cdp_url={args.cdp_url}, use_cloud={args.use_cloud}'
+		f'Starting daemon: session={args.session}, headed={args.headed}, profile={args.profile}, '
+		f'cdp_url={args.cdp_url}, use_cloud={args.use_cloud}, preset={args.preset}'
 	)
 
 	daemon = Daemon(
@@ -536,6 +543,7 @@ def main() -> None:
 		cloud_proxy_country_code=args.cloud_proxy_country,
 		cloud_timeout=args.cloud_timeout,
 		session=args.session,
+		preset=args.preset,
 	)
 
 	exit_code = 0

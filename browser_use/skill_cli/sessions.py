@@ -28,6 +28,7 @@ class SessionInfo:
 	actions: ActionHandler | None = None
 	python_session: PythonSession = field(default_factory=PythonSession)
 	use_cloud: bool = False
+	preset: str | None = None
 
 
 async def create_browser_session(
@@ -38,6 +39,7 @@ async def create_browser_session(
 	cloud_profile_id: str | None = None,
 	cloud_proxy_country_code: str | None = None,
 	cloud_timeout: int | None = None,
+	preset: str | None = None,
 ) -> CLIBrowserSession:
 	"""Create BrowserSession based on connection mode.
 
@@ -45,6 +47,7 @@ async def create_browser_session(
 	- Cloud: Provision a cloud browser via BrowserSession(use_cloud=True)
 	- With profile: User's real Chrome with the specified profile
 	- No profile: Playwright-managed Chromium (default)
+	- Preset: Load configuration from a profile preset (overrides other settings)
 	"""
 	if cdp_url is not None:
 		return CLIBrowserSession(cdp_url=cdp_url)  # type: ignore[call-arg]
@@ -57,9 +60,13 @@ async def create_browser_session(
 			kwargs['cloud_proxy_country_code'] = cloud_proxy_country_code
 		if cloud_timeout is not None:
 			kwargs['cloud_timeout'] = cloud_timeout
+		if preset is not None:
+			kwargs['profile'] = preset
 		return CLIBrowserSession(**kwargs)  # type: ignore[call-arg]
 
 	if profile is None:
+		if preset is not None:
+			return CLIBrowserSession(headless=not headed, profile=preset)  # type: ignore[call-arg]
 		return CLIBrowserSession(headless=not headed)  # type: ignore[call-arg]
 
 	from browser_use.skill_cli.utils import find_chrome_executable, get_chrome_profile_path, list_chrome_profiles
@@ -100,9 +107,13 @@ async def create_browser_session(
 				lines.append(f'  "{p["name"]}" ({p["directory"]})')
 			raise RuntimeError('\n'.join(lines))
 
-	return CLIBrowserSession(
-		executable_path=chrome_path,  # type: ignore[call-arg]
-		user_data_dir=user_data_dir,  # type: ignore[call-arg]
-		profile_directory=profile_directory,  # type: ignore[call-arg]
-		headless=not headed,  # type: ignore[call-arg]
-	)
+	browser_kwargs = {
+		'executable_path': chrome_path,
+		'user_data_dir': user_data_dir,
+		'profile_directory': profile_directory,
+		'headless': not headed,
+	}
+	if preset is not None:
+		browser_kwargs['profile'] = preset
+
+	return CLIBrowserSession(**browser_kwargs)  # type: ignore[call-arg]

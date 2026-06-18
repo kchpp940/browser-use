@@ -25,7 +25,6 @@ from browser_use.agent.cloud_events import (
 )
 from browser_use.agent.message_manager.utils import save_conversation
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.capabilities import StructuredOutputMethod
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage, ContentPartImageParam, ContentPartTextParam, UserMessage
 from browser_use.tokens.service import TokenCost
@@ -137,6 +136,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self,
 		task: str,
 		llm: BaseChatModel | None = None,
+		# Profile preset
+		profile: str | None = None,
 		# Optional parameters
 		browser_profile: BrowserProfile | None = None,
 		browser_session: BrowserSession | None = None,
@@ -212,6 +213,43 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		enable_signal_handler: bool = True,
 		**kwargs,
 	):
+		# Load profile preset if specified
+		self._profile_name = profile
+		self._resolved_profile = None
+		profile_agent_settings: dict[str, Any] = {}
+		if profile is not None:
+			from browser_use.profiles.manager import get_profile_manager
+
+			manager = get_profile_manager()
+			resolved_profile = manager.get_profile(profile)
+			self._resolved_profile = resolved_profile
+			profile_agent_settings = resolved_profile.agent
+			manager.log_profile_info(resolved_profile)
+
+			# Create LLM from profile if not provided
+			if llm is None and (resolved_profile.llm.provider or resolved_profile.llm.model):
+				llm = manager.create_llm(resolved_profile)
+
+			# Apply profile settings to early-used parameters
+			# (only if they're still at code defaults - direct params take precedence)
+			_default_agent_settings = AgentSettings()
+			if 'flash_mode' in profile_agent_settings and flash_mode == _default_agent_settings.flash_mode:
+				flash_mode = profile_agent_settings['flash_mode']
+			if 'use_vision' in profile_agent_settings and use_vision == _default_agent_settings.use_vision:
+				use_vision = profile_agent_settings['use_vision']
+			if 'max_failures' in profile_agent_settings and max_failures == _default_agent_settings.max_failures:
+				max_failures = profile_agent_settings['max_failures']
+			if 'max_actions_per_step' in profile_agent_settings and max_actions_per_step == _default_agent_settings.max_actions_per_step:
+				max_actions_per_step = profile_agent_settings['max_actions_per_step']
+			if 'use_thinking' in profile_agent_settings and use_thinking == _default_agent_settings.use_thinking:
+				use_thinking = profile_agent_settings['use_thinking']
+			if 'llm_timeout' in profile_agent_settings and llm_timeout is None:
+				llm_timeout = profile_agent_settings['llm_timeout']
+			if 'step_timeout' in profile_agent_settings and step_timeout == _default_agent_settings.step_timeout:
+				step_timeout = profile_agent_settings['step_timeout']
+			if 'flash_mode' in profile_agent_settings and flash_mode:
+				enable_planning = False
+
 		# Validate llm_screenshot_size
 		if llm_screenshot_size is not None:
 			if not isinstance(llm_screenshot_size, tuple) or len(llm_screenshot_size) != 2:
@@ -296,6 +334,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			browser_session.browser_profile = browser_session.browser_profile.model_copy(update={'demo_mode': demo_mode})
 
 		self.browser_session = browser_session or BrowserSession(
+			profile=profile,
 			browser_profile=browser_profile,
 			id=uuid7str()[:-4] + self.id[-4:],  # re-use the same 4-char suffix so they show up together in logs
 		)
@@ -388,7 +427,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if isinstance(message_compaction, bool):
 			message_compaction = MessageCompactionSettings(enabled=message_compaction)
 
-		self.settings = AgentSettings(
+		# Create base settings from direct parameters
+		direct_settings = AgentSettings(
 			use_vision=use_vision,
 			vision_detail_level=vision_detail_level,
 			save_conversation_path=save_conversation_path,
@@ -418,6 +458,21 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			message_compaction=message_compaction,
 			max_clickable_elements_length=max_clickable_elements_length,
 		)
+
+		# Merge profile settings with priority: code defaults < profile < direct params
+		if profile_agent_settings:
+			default_settings = AgentSettings()
+			default_dict = default_settings.model_dump()
+			direct_dict = direct_settings.model_dump()
+			merged_dict = direct_dict.copy()
+
+			for key, profile_value in profile_agent_settings.items():
+				if key in direct_dict and direct_dict[key] == default_dict.get(key):
+					merged_dict[key] = profile_value
+
+			self.settings = AgentSettings(**merged_dict)
+		else:
+			self.settings = direct_settings
 
 		# Token cost service
 		self.token_cost_service = TokenCost(include_cost=calculate_cost, pricing_url=pricing_url)
@@ -469,10 +524,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Verify we can connect to the model
 		self._verify_and_setup_llm()
 
-		capabilities = self.llm.capabilities
+		# TODO: move this logic to the LLMs
+		# Handle users trying to use use_vision=True with DeepSeek models
+		if 'deepseek' in self.llm.model.lower():
+			self.logger.warning('⚠️ DeepSeek models do not support use_vision=True yet. Setting use_vision=False for now...')
+			self.settings.use_vision = False
 
-		if self.settings.use_vision and not capabilities.supports_vision:
-			self.logger.warning(f'⚠️ {self.llm.model} does not support vision. Setting use_vision=False...')
+		# Handle users trying to use use_vision=True with XAI models that don't support it
+		# grok-3 variants and grok-code don't support vision; grok-2 and grok-4 do
+		model_lower = self.llm.model.lower()
+		if 'grok-3' in model_lower or 'grok-code' in model_lower:
+			self.logger.warning('⚠️ This XAI model does not support use_vision=True yet. Setting use_vision=False for now...')
 			self.settings.use_vision = False
 
 		logger.debug(
@@ -481,11 +543,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			f'{" +file_system" if self.file_system else ""}'
 		)
 
+		# Store llm_screenshot_size in browser_session so tools can access it
 		self.browser_session.llm_screenshot_size = llm_screenshot_size
 
-		is_anthropic = capabilities.prompt_format == 'anthropic'
+		# Check if LLM is ChatAnthropic instance
+		from browser_use.llm.anthropic.chat import ChatAnthropic
 
-		is_browser_use_model = capabilities.prompt_format == 'browser_use'
+		is_anthropic = isinstance(self.llm, ChatAnthropic)
+
+		# Check if model is a browser-use fine-tuned model (uses simplified prompts)
+		is_browser_use_model = 'browser-use/' in self.llm.model.lower()
 
 		# Initialize message manager with state
 		# Initial system prompt with all actions - will be updated during each step
@@ -1590,20 +1657,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		)
 
 		# Call LLM with JudgementResult as output format
-		extra_kwargs: dict = {}
+		kwargs: dict = {'output_format': JudgementResult}
 
 		# Only pass request_type for ChatBrowserUse (other providers don't support it)
 		if self.judge_llm.provider == 'browser-use':
-			extra_kwargs['request_type'] = 'judge'
-			extra_kwargs['session_id'] = self.session_id
+			kwargs['request_type'] = 'judge'
+			kwargs['session_id'] = self.session_id
 
 		try:
-			response = await self._ainvoke_with_strategy_fallback(
-				self.judge_llm,
-				input_messages,
-				output_format=JudgementResult,
-				**extra_kwargs,
-			)
+			response = await self.judge_llm.ainvoke(input_messages, **kwargs)
 			judgement: JudgementResult = response.completion  # type: ignore[assignment]
 			return judgement
 		except Exception as e:
@@ -1926,53 +1988,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	# endregion - URL replacement
 
-	async def _ainvoke_with_strategy_fallback(
-		self,
-		llm: BaseChatModel,
-		messages: list[BaseMessage],
-		output_format: type[BaseModel],
-		**kwargs: Any,
-	):
-		"""
-		Invoke the LLM with structured output strategy fallback driven by llm.capabilities.
-
-		Strategy chain is generated by `llm.capabilities.get_structured_output_strategy_chain()`,
-		and this method loops through strategies in order, falling back to the next on
-		failure, with PROMPT_TEXT guaranteed as the final fallback.
-		"""
-		from browser_use.llm.views import ChatInvokeCompletion
-
-		strategy_chain = llm.capabilities.get_structured_output_strategy_chain()
-		last_error: Exception | None = None
-
-		for strategy in strategy_chain:
-			try:
-				self.logger.debug(f'🧠 Trying structured output strategy: {strategy.value}')
-				response = await llm.ainvoke(
-					messages,
-					output_format=output_format,
-					structured_output_method=strategy,
-					**kwargs,
-				)
-				return response
-			except (ModelRateLimitError, ModelProviderError):
-				raise
-			except Exception as e:
-				last_error = e
-				self.logger.debug(f'   Strategy {strategy.value} failed: {e}')
-				continue
-
-		model_name = getattr(llm, 'name', None) or str(getattr(llm, 'model', 'unknown'))
-		if last_error is not None:
-			raise ModelProviderError(
-				message=f'All structured output strategies failed for provider={llm.provider}. Last error: {last_error}',
-				model=model_name,
-			) from last_error
-		raise ModelProviderError(
-			message=f'No valid structured output strategy available for provider={llm.provider}',
-			model=model_name,
-		)
-
 	@time_execution_async('--get_next_action')
 	@observe_debug(ignore_input=True, ignore_output=True, name='get_model_output')
 	async def get_model_output(self, input_messages: list[BaseMessage]) -> AgentOutput:
@@ -1980,13 +1995,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		urls_replaced = self._process_messsages_and_replace_long_urls_shorter_ones(input_messages)
 
+		# Build kwargs for ainvoke
+		# Note: ChatBrowserUse will automatically generate action descriptions from output_format schema
+		kwargs: dict = {'output_format': self.AgentOutput, 'session_id': self.session_id}
+
 		try:
-			response = await self._ainvoke_with_strategy_fallback(
-				self.llm,
-				input_messages,
-				output_format=self.AgentOutput,
-				session_id=self.session_id,
-			)
+			response = await self.llm.ainvoke(input_messages, **kwargs)
 			parsed: AgentOutput = response.completion  # type: ignore[assignment]
 
 			# Replace any shortened URLs in the LLM response back to original URLs
@@ -2984,11 +2998,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Try calling with structured output first
 			self.logger.debug(f'Calling LLM for rerun summary with {len(messages)} message(s)')
 			try:
-				response = await self._ainvoke_with_strategy_fallback(
-					summary_llm,
-					messages,
-					output_format=RerunSummaryAction,
-				)
+				kwargs: dict = {'output_format': RerunSummaryAction}
+				response = await summary_llm.ainvoke(messages, **kwargs)
 				summary: RerunSummaryAction = response.completion  # type: ignore[assignment]
 				self.logger.debug(f'LLM response type: {type(summary)}')
 				self.logger.debug(f'LLM response: {summary}')

@@ -137,6 +137,8 @@ class BrowserSession(BaseModel):
 	def __init__(
 		self,
 		*,
+		# Profile preset
+		profile: str | None = None,
 		# Cloud browser params - use these for cloud mode
 		cloud_profile_id: UUID | str | None = None,
 		cloud_proxy_country_code: ProxyCountryCode | None = None,
@@ -173,6 +175,8 @@ class BrowserSession(BaseModel):
 	def __init__(
 		self,
 		*,
+		# Profile preset
+		profile: str | None = None,
 		# Core configuration for local
 		id: str | None = None,
 		cdp_url: str | None = None,
@@ -238,6 +242,8 @@ class BrowserSession(BaseModel):
 		cdp_url: str | None = None,
 		is_local: bool = False,
 		browser_profile: BrowserProfile | None = None,
+		# Profile preset
+		profile: str | None = None,
 		# Cloud browser params (don't mix with local browser params)
 		cloud_profile_id: UUID | str | None = None,
 		cloud_proxy_country_code: ProxyCountryCode | None = _UNSET,  # type: ignore[assignment]
@@ -310,6 +316,17 @@ class BrowserSession(BaseModel):
 		max_iframes: int | None = None,
 		max_iframe_depth: int | None = None,
 	):
+		# Load profile preset if specified
+		profile_browser_dict: dict[str, Any] = {}
+		profile_logger = logging.getLogger('browser_use')
+		if profile is not None:
+			from browser_use.profiles.manager import get_profile_manager
+
+			manager = get_profile_manager()
+			resolved_profile = manager.get_profile(profile)
+			profile_browser_dict = resolved_profile.browser
+			manager.log_profile_info(resolved_profile)
+
 		# Following the same pattern as AgentSettings in service.py
 		# Only pass non-None values to avoid validation errors
 		# Also filter _UNSET sentinel values (used for proxy params)
@@ -320,6 +337,9 @@ class BrowserSession(BaseModel):
 			not in [
 				'self',
 				'browser_profile',
+				'profile',
+				'profile_browser_dict',
+				'profile_logger',
 				'id',
 				'cloud_profile_id',
 				'cloud_proxy_country_code',
@@ -375,13 +395,16 @@ class BrowserSession(BaseModel):
 		if not cdp_url and not use_cloud:
 			profile_kwargs['is_local'] = True
 
-		# Create browser profile from direct parameters or use provided one
+		# Create browser profile from profile preset, browser_profile param, and direct parameters
+		# Priority (lowest to highest): profile preset → browser_profile param → direct kwargs
+		merged_kwargs = profile_browser_dict.copy()
+
 		if browser_profile is not None:
-			# Merge any direct kwargs into the provided browser_profile (direct kwargs take precedence)
-			merged_kwargs = {**browser_profile.model_dump(exclude_unset=True), **profile_kwargs}
-			resolved_browser_profile = BrowserProfile(**merged_kwargs)
-		else:
-			resolved_browser_profile = BrowserProfile(**profile_kwargs)
+			merged_kwargs = {**merged_kwargs, **browser_profile.model_dump(exclude_unset=True)}
+
+		merged_kwargs = {**merged_kwargs, **profile_kwargs}
+
+		resolved_browser_profile = BrowserProfile(**merged_kwargs)
 
 		# Initialize the Pydantic model
 		super().__init__(

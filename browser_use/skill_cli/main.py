@@ -426,6 +426,7 @@ def ensure_daemon(
 	cloud_profile_id: str | None = None,
 	cloud_proxy_country_code: str | None = None,
 	cloud_timeout: int | None = None,
+	preset: str | None = None,
 ) -> None:
 	"""Start daemon if not running. Uses state file for phase-aware decisions."""
 	probe = _probe_session(session)
@@ -435,7 +436,7 @@ def ensure_daemon(
 		if not explicit_config:
 			return  # Reuse it
 
-		# User explicitly set --headed/--profile/--cdp-url — check config matches
+		# User explicitly set --headed/--profile/--cdp-url/--preset — check config matches
 		try:
 			response = send_command('ping', {}, session=session)
 			if response.get('success'):
@@ -445,6 +446,7 @@ def ensure_daemon(
 					and data.get('profile') == profile
 					and data.get('cdp_url') == cdp_url
 					and data.get('use_cloud') == use_cloud
+					and data.get('preset') == preset
 				):
 					return  # Already running with correct config
 
@@ -518,6 +520,8 @@ def ensure_daemon(
 		cmd.extend(['--cloud-proxy-country', cloud_proxy_country_code])
 	if cloud_timeout is not None:
 		cmd.extend(['--cloud-timeout', str(cloud_timeout)])
+	if preset is not None:
+		cmd.extend(['--preset', preset])
 
 	# Set up environment
 	env = os.environ.copy()
@@ -639,6 +643,11 @@ Setup:
 		const='Default',
 		default=None,
 		help='Use real Chrome with profile (bare --profile uses "Default")',
+	)
+	parser.add_argument(
+		'--preset',
+		default=None,
+		help='Profile preset to load (from profiles.json)',
 	)
 	parser.add_argument(
 		'--cdp-url',
@@ -965,6 +974,7 @@ def _handle_cloud_connect(cloud_args: list[str], args: argparse.Namespace, sessi
 		cloud_profile_id=cloud_profile_id,
 		cloud_proxy_country_code=_get_cloud_connect_proxy(),
 		cloud_timeout=_get_cloud_connect_timeout(),
+		preset=args.preset,
 	)
 
 	# Send connect command to force immediate session creation
@@ -1426,7 +1436,7 @@ def main() -> int:
 			print(f'Error: {e}', file=sys.stderr)
 			return 1
 
-		ensure_daemon(args.headed, None, cdp_url=cdp_url, session=session, explicit_config=True)
+		ensure_daemon(args.headed, None, cdp_url=cdp_url, session=session, explicit_config=True, preset=args.preset)
 		response = send_command('connect', {}, session=session)
 
 		if args.json:
@@ -1451,8 +1461,8 @@ def main() -> int:
 	_migrate_legacy_files()
 
 	# Ensure daemon is running
-	explicit_config = any(flag in sys.argv for flag in ('--headed', '--profile', '--cdp-url'))
-	ensure_daemon(args.headed, args.profile, args.cdp_url, session=session, explicit_config=explicit_config)
+	explicit_config = any(flag in sys.argv for flag in ('--headed', '--profile', '--cdp-url', '--preset'))
+	ensure_daemon(args.headed, args.profile, args.cdp_url, session=session, explicit_config=explicit_config, preset=args.preset)
 
 	# Build params from args
 	params = {}

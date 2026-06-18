@@ -1,34 +1,23 @@
-import logging
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, overload
 
 import httpx
 from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
-from openai.types.chat import ChatCompletionContentPartTextParam, ChatCompletionToolParam
+from openai.types.chat import ChatCompletionContentPartTextParam
 from openai.types.chat.chat_completion import ChatCompletion
-from openai.types.chat.chat_completion_tool_choice_option_param import ChatCompletionToolChoiceOptionParam
 from openai.types.shared.chat_model import ChatModel
 from openai.types.shared_params.reasoning_effort import ReasoningEffort
 from openai.types.shared_params.response_format_json_schema import JSONSchema, ResponseFormatJSONSchema
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.capabilities import (
-	ProviderCapabilities,
-	StructuredOutputMethod,
-	build_prompt_text_schema_instruction,
-	get_default_capabilities,
-	parse_structured_output_from_text,
-)
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
-from browser_use.llm.messages import ContentPartTextParam as MsgContentPartTextParam
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer
 from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
-logger = logging.getLogger(__name__)
 T = TypeVar('T', bound=BaseModel)
 
 
@@ -91,13 +80,6 @@ class ChatOpenAI(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'openai'
-
-	@property
-	def capabilities(self) -> ProviderCapabilities:
-		base = get_default_capabilities('openai')
-		if self.reasoning_models and any(str(m).lower() in str(self.model).lower() for m in self.reasoning_models):
-			return base.model_copy(update={'supports_thinking': True})
-		return base
 
 	def _get_client_params(self) -> dict[str, Any]:
 		"""Prepare client parameters dictionary."""
@@ -167,57 +149,8 @@ class ChatOpenAI(BaseChatModel):
 	@overload
 	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
 
-	def _build_model_params(self) -> dict[str, Any]:
-		model_params: dict[str, Any] = {}
-
-		if self.temperature is not None:
-			model_params['temperature'] = self.temperature
-
-		if self.frequency_penalty is not None:
-			model_params['frequency_penalty'] = self.frequency_penalty
-
-		if self.max_completion_tokens is not None:
-			model_params['max_completion_tokens'] = self.max_completion_tokens
-
-		if self.top_p is not None:
-			model_params['top_p'] = self.top_p
-
-		if self.seed is not None:
-			model_params['seed'] = self.seed
-
-		if self.service_tier is not None:
-			model_params['service_tier'] = self.service_tier
-
-		if self.reasoning_models and any(str(m).lower() in str(self.model).lower() for m in self.reasoning_models):
-			model_params['reasoning_effort'] = self.reasoning_effort
-			model_params.pop('temperature', None)
-			model_params.pop('frequency_penalty', None)
-
-		return model_params
-
-	def _validate_response_choices(self, response: ChatCompletion) -> Any:
-		choice = response.choices[0] if response.choices else None
-		if choice is None:
-			base_url = str(self.base_url) if self.base_url is not None else None
-			hint = f' (base_url={base_url})' if base_url is not None else ''
-			raise ModelProviderError(
-				message=(
-					'Invalid OpenAI chat completion response: missing or empty `choices`.'
-					' If you are using a proxy via `base_url`, ensure it implements the OpenAI'
-					' `/v1/chat/completions` schema and returns `choices` as a non-empty list.'
-					f'{hint}'
-				),
-				status_code=502,
-				model=self.name,
-			)
-		return choice
-
 	async def ainvoke(
-		self,
-		messages: list[BaseMessage],
-		output_format: type[T] | None = None,
-		structured_output_method: StructuredOutputMethod | None = None,
-		**kwargs: Any,
+		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the model with the given messages.
@@ -225,25 +158,62 @@ class ChatOpenAI(BaseChatModel):
 		Args:
 			messages: List of chat messages
 			output_format: Optional Pydantic model class for structured output
-			structured_output_method: Specific structured output strategy to use.
-				If None, uses the provider's primary strategy from capabilities.
 
 		Returns:
 			Either a string response or an instance of output_format
 		"""
 
 		openai_messages = OpenAIMessageSerializer.serialize_messages(messages)
-		model_params = self._build_model_params()
 
 		try:
+			model_params: dict[str, Any] = {}
+
+			if self.temperature is not None:
+				model_params['temperature'] = self.temperature
+
+			if self.frequency_penalty is not None:
+				model_params['frequency_penalty'] = self.frequency_penalty
+
+			if self.max_completion_tokens is not None:
+				model_params['max_completion_tokens'] = self.max_completion_tokens
+
+			if self.top_p is not None:
+				model_params['top_p'] = self.top_p
+
+			if self.seed is not None:
+				model_params['seed'] = self.seed
+
+			if self.service_tier is not None:
+				model_params['service_tier'] = self.service_tier
+
+			if self.reasoning_models and any(str(m).lower() in str(self.model).lower() for m in self.reasoning_models):
+				model_params['reasoning_effort'] = self.reasoning_effort
+				model_params.pop('temperature', None)
+				model_params.pop('frequency_penalty', None)
+
 			if output_format is None:
+				# Return string response
 				response = await self.get_client().chat.completions.create(
 					model=self.model,
 					messages=openai_messages,
 					**model_params,
 				)
 
-				choice = self._validate_response_choices(response)
+				choice = response.choices[0] if response.choices else None
+				if choice is None:
+					base_url = str(self.base_url) if self.base_url is not None else None
+					hint = f' (base_url={base_url})' if base_url is not None else ''
+					raise ModelProviderError(
+						message=(
+							'Invalid OpenAI chat completion response: missing or empty `choices`.'
+							' If you are using a proxy via `base_url`, ensure it implements the OpenAI'
+							' `/v1/chat/completions` schema and returns `choices` as a non-empty list.'
+							f'{hint}'
+						),
+						status_code=502,
+						model=self.name,
+					)
+
 				usage = self._get_usage(response)
 				return ChatInvokeCompletion(
 					completion=choice.message.content or '',
@@ -252,37 +222,34 @@ class ChatOpenAI(BaseChatModel):
 				)
 
 			else:
-				# Resolve which strategy to execute
-				if structured_output_method is None:
-					strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-					if self.dont_force_structured_output:
-						strategy_chain = [s for s in strategy_chain if s != StructuredOutputMethod.JSON_SCHEMA] or [
-							StructuredOutputMethod.PROMPT_TEXT
+				response_format: JSONSchema = {
+					'name': 'agent_output',
+					'strict': True,
+					'schema': SchemaOptimizer.create_optimized_json_schema(
+						output_format,
+						remove_min_items=self.remove_min_items_from_schema,
+						remove_defaults=self.remove_defaults_from_schema,
+					),
+				}
+
+				# Add JSON schema to system prompt if requested
+				if self.add_schema_to_system_prompt and openai_messages and openai_messages[0]['role'] == 'system':
+					schema_text = f'\n<json_schema>\n{response_format}\n</json_schema>'
+					if isinstance(openai_messages[0]['content'], str):
+						openai_messages[0]['content'] += schema_text
+					elif isinstance(openai_messages[0]['content'], Iterable):
+						openai_messages[0]['content'] = list(openai_messages[0]['content']) + [
+							ChatCompletionContentPartTextParam(text=schema_text, type='text')
 						]
-					strategy = strategy_chain[0]
+
+				if self.dont_force_structured_output:
+					response = await self.get_client().chat.completions.create(
+						model=self.model,
+						messages=openai_messages,
+						**model_params,
+					)
 				else:
-					strategy = structured_output_method
-
-				if strategy == StructuredOutputMethod.JSON_SCHEMA:
-					response_format: JSONSchema = {
-						'name': output_format.__name__,
-						'strict': True,
-						'schema': SchemaOptimizer.create_optimized_json_schema(
-							output_format,
-							remove_min_items=self.remove_min_items_from_schema,
-							remove_defaults=self.remove_defaults_from_schema,
-						),
-					}
-
-					if self.add_schema_to_system_prompt and openai_messages and openai_messages[0]['role'] == 'system':
-						schema_text = f'\n<json_schema>\n{response_format}\n</json_schema>'
-						if isinstance(openai_messages[0]['content'], str):
-							openai_messages[0]['content'] += schema_text
-						elif isinstance(openai_messages[0]['content'], Iterable):
-							openai_messages[0]['content'] = list(openai_messages[0]['content']) + [
-								ChatCompletionContentPartTextParam(text=schema_text, type='text')
-							]
-
+					# Return structured response
 					response = await self.get_client().chat.completions.create(
 						model=self.model,
 						messages=openai_messages,
@@ -290,114 +257,40 @@ class ChatOpenAI(BaseChatModel):
 						**model_params,
 					)
 
-					choice = self._validate_response_choices(response)
-					if choice.message.content is None:
-						raise ValueError('Empty content in structured JSON schema response')
-
-					usage = self._get_usage(response)
-					parsed = output_format.model_validate_json(choice.message.content)
-					return ChatInvokeCompletion(
-						completion=parsed,
-						usage=usage,
-						stop_reason=choice.finish_reason,
+				choice = response.choices[0] if response.choices else None
+				if choice is None:
+					base_url = str(self.base_url) if self.base_url is not None else None
+					hint = f' (base_url={base_url})' if base_url is not None else ''
+					raise ModelProviderError(
+						message=(
+							'Invalid OpenAI chat completion response: missing or empty `choices`.'
+							' If you are using a proxy via `base_url`, ensure it implements the OpenAI'
+							' `/v1/chat/completions` schema and returns `choices` as a non-empty list.'
+							f'{hint}'
+						),
+						status_code=502,
+						model=self.name,
 					)
 
-				elif strategy == StructuredOutputMethod.TOOL_CALLING:
-					tool_name = output_format.__name__
-					schema = SchemaOptimizer.create_optimized_json_schema(
-						output_format,
-						remove_min_items=self.remove_min_items_from_schema,
-						remove_defaults=self.remove_defaults_from_schema,
-					)
-					tools: list[ChatCompletionToolParam] = [
-						{
-							'type': 'function',
-							'function': {
-								'name': tool_name,
-								'description': f'Extract structured output as {tool_name}',
-								'parameters': schema,
-							},
-						}
-					]
-					tool_choice: ChatCompletionToolChoiceOptionParam = {
-						'type': 'function',
-						'function': {'name': tool_name},
-					}
-
-					response = await self.get_client().chat.completions.create(
-						model=self.model,
-						messages=openai_messages,
-						tools=tools,
-						tool_choice=tool_choice,
-						**model_params,
+				if choice.message.content is None:
+					raise ModelProviderError(
+						message='Failed to parse structured output from model response',
+						status_code=500,
+						model=self.name,
 					)
 
-					choice = self._validate_response_choices(response)
-					usage = self._get_usage(response)
+				usage = self._get_usage(response)
 
-					if choice.message.tool_calls:
-						for tc in choice.message.tool_calls:
-							try:
-								parsed = output_format.model_validate_json(tc.function.arguments)
-								return ChatInvokeCompletion(
-									completion=parsed,
-									usage=usage,
-									stop_reason=choice.finish_reason,
-								)
-							except Exception:
-								continue
+				parsed = output_format.model_validate_json(choice.message.content)
 
-					if choice.message.content:
-						parsed = parse_structured_output_from_text(choice.message.content, output_format)
-						if parsed is not None:
-							return ChatInvokeCompletion(
-								completion=parsed,
-								usage=usage,
-								stop_reason=choice.finish_reason,
-							)
-
-					raise ValueError('No tool call or parseable content in TOOL_CALLING response')
-
-				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-					modified_messages = [m.model_copy(deep=True) for m in messages]
-					instruction_added = False
-					if modified_messages and isinstance(modified_messages[0].content, str):
-						modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
-						instruction_added = True
-					elif modified_messages and isinstance(modified_messages[0].content, list):
-						modified_messages[0].content.append(
-							MsgContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
-						)
-						instruction_added = True
-					if not instruction_added and modified_messages and isinstance(modified_messages[-1].content, str):
-						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-						instruction_added = True
-
-					modified_openai_messages = OpenAIMessageSerializer.serialize_messages(modified_messages)
-
-					response = await self.get_client().chat.completions.create(
-						model=self.model,
-						messages=modified_openai_messages,
-						**model_params,
-					)
-
-					choice = self._validate_response_choices(response)
-					usage = self._get_usage(response)
-					content = choice.message.content or ''
-
-					parsed = parse_structured_output_from_text(content, output_format)
-					if parsed is not None:
-						return ChatInvokeCompletion(
-							completion=parsed,
-							usage=usage,
-							stop_reason=choice.finish_reason,
-						)
-					raise ValueError('Failed to parse structured output from prompt text response')
-
-				else:
-					raise ValueError(f'Unsupported structured_output_method: {strategy}')
+				return ChatInvokeCompletion(
+					completion=parsed,
+					usage=usage,
+					stop_reason=choice.finish_reason,
+				)
 
 		except ModelProviderError:
+			# Preserve status_code and message from validation errors
 			raise
 
 		except RateLimitError as e:
