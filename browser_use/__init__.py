@@ -47,7 +47,6 @@ base_subprocess.BaseSubprocessTransport.__del__ = _patched_del
 if TYPE_CHECKING:
 	from browser_use.agent.prompts import SystemPrompt
 	from browser_use.agent.service import Agent
-	from browser_use.agent.trace import TraceFile, TraceService, TraceStep
 	from browser_use.agent.views import ActionModel, ActionResult, AgentHistoryList
 	from browser_use.browser import BrowserProfile, BrowserSession
 	from browser_use.browser import BrowserSession as Browser
@@ -101,10 +100,6 @@ _LAZY_IMPORTS = {
 	'models': ('browser_use.llm.models', None),
 	# Sandbox execution
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
-	# Trace export
-	'TraceFile': ('browser_use.agent.trace', 'TraceFile'),
-	'TraceStep': ('browser_use.agent.trace', 'TraceStep'),
-	'TraceService': ('browser_use.agent.trace', 'TraceService'),
 }
 
 
@@ -159,8 +154,4 @@ __all__ = [
 	'models',
 	# Sandbox execution
 	'sandbox',
-	# Trace export
-	'TraceFile',
-	'TraceStep',
-	'TraceService',
 ]

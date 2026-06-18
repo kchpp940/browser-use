@@ -22,6 +22,7 @@ from oci.generative_ai_inference.models import (
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.schema import SchemaOptimizer
@@ -81,6 +82,10 @@ class ChatOCIRaw(BaseChatModel):
 	@property
 	def provider_name(self) -> str:
 		return 'oci-raw'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		return get_default_capabilities('oci-raw')
 
 	@property
 	def name(self) -> str:

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 # Lightweight imports that are commonly used
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod, get_default_capabilities
 from browser_use.llm.messages import (
 	AssistantMessage,
 	BaseMessage,
@@ -141,6 +142,10 @@ __all__ = [
 	'ContentText',
 	'ContentRefusal',
 	'ContentImage',
+	# Capabilities
+	'ProviderCapabilities',
+	'StructuredOutputMethod',
+	'get_default_capabilities',
 	# Chat models
 	'BaseChatModel',
 	'ChatOpenAI',

@@ -16,6 +16,7 @@ from openai import (
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, get_default_capabilities
 from browser_use.llm.deepseek.serializer import DeepSeekMessageSerializer
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
@@ -46,6 +47,10 @@ class ChatDeepSeek(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'deepseek'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		return get_default_capabilities('deepseek')
 
 	def _client(self) -> AsyncOpenAI:
 		return AsyncOpenAI(

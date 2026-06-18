@@ -16,6 +16,7 @@ from openai.types.chat import ChatCompletion
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, get_default_capabilities
 from browser_use.llm.cerebras.serializer import CerebrasMessageSerializer
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
@@ -45,6 +46,10 @@ class ChatCerebras(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'cerebras'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		return get_default_capabilities('cerebras')
 
 	def _client(self) -> AsyncOpenAI:
 		return AsyncOpenAI(

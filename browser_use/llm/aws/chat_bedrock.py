@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from browser_use.llm.aws.serializer import AWSBedrockMessageSerializer
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.schema import SchemaOptimizer
@@ -60,6 +61,19 @@ class ChatAWSBedrock(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'aws_bedrock'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		return ProviderCapabilities(
+			structured_output=StructuredOutputMethod.TOOL_CALLING,
+			supports_vision=True,
+			supports_thinking=False,
+			supports_json_schema_response_format=False,
+			supports_tool_calling=True,
+			supports_image_input=True,
+			max_retries=3,
+			prompt_format='aws_bedrock',
+		)
 
 	def _get_client(self) -> 'AwsClient':  # type: ignore
 		"""Get the AWS Bedrock client."""

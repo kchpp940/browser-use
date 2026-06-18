@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
 from browser_use.llm.aws.chat_bedrock import ChatAWSBedrock
+from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
@@ -62,6 +63,20 @@ class ChatAnthropicBedrock(ChatAWSBedrock):
 	@property
 	def provider(self) -> str:
 		return 'anthropic_bedrock'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		return ProviderCapabilities(
+			structured_output=StructuredOutputMethod.TOOL_CALLING,
+			structured_output_fallback=StructuredOutputMethod.PROMPT_TEXT,
+			supports_vision=True,
+			supports_thinking=False,
+			supports_json_schema_response_format=False,
+			supports_tool_calling=True,
+			supports_image_input=True,
+			max_retries=10,
+			prompt_format='anthropic',
+		)
 
 	def _get_client_params(self) -> dict[str, Any]:
 		"""Prepare client parameters dictionary for Bedrock."""

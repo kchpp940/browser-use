@@ -11,6 +11,7 @@ import httpx
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.mistral.schema import MistralSchemaOptimizer
@@ -46,6 +47,10 @@ class ChatMistral(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'mistral'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		return get_default_capabilities('mistral')
 
 	@property
 	def name(self) -> str:

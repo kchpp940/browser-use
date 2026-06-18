@@ -324,8 +324,6 @@ def update_config_with_click_args(config: dict[str, Any], ctx: click.Context) ->
 		config['browser']['profile_directory'] = ctx.params['profile_directory']
 	if ctx.params.get('cdp_url'):
 		config['browser']['cdp_url'] = ctx.params['cdp_url']
-	if ctx.params.get('trace_dir'):
-		config['trace_dir'] = ctx.params['trace_dir']
 
 	# Consolidated proxy dict
 	proxy: dict[str, str] = {}
@@ -1004,17 +1002,14 @@ class BrowserUseApp(App):
 		if self.agent is None:
 			if not self.llm:
 				raise RuntimeError('LLM not initialized')
-			agent_kwargs: dict[str, Any] = {
-				'task': task,
-				'llm': self.llm,
-				'controller': self.controller if self.controller else Controller(),
-				'browser_session': self.browser_session,
-				'source': 'cli',
+			self.agent = Agent(
+				task=task,
+				llm=self.llm,
+				controller=self.controller if self.controller else Controller(),
+				browser_session=self.browser_session,
+				source='cli',
 				**agent_settings.model_dump(),
-			}
-			if self.config.get('trace_dir'):
-				agent_kwargs['trace_dir'] = self.config['trace_dir']
-			self.agent = Agent(**agent_kwargs)
+			)
 			# Update our browser_session reference to point to the agent's
 			if hasattr(self.agent, 'browser_session'):
 				self.browser_session = self.agent.browser_session
@@ -1542,16 +1537,13 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 		)
 
 		# Create and run agent
-		agent_kwargs: dict[str, Any] = {
-			'task': prompt,
-			'llm': llm,
-			'browser_session': browser_session,
-			'source': 'cli',
+		agent = Agent(
+			task=prompt,
+			llm=llm,
+			browser_session=browser_session,
+			source='cli',
 			**agent_settings.model_dump(),
-		}
-		if config.get('trace_dir'):
-			agent_kwargs['trace_dir'] = config['trace_dir']
-		agent = Agent(**agent_kwargs)
+		)
 
 		await agent.run()
 
@@ -2020,7 +2012,6 @@ async def run_auth_command():
 @click.option('--proxy-password', type=str, help='Proxy auth password')
 @click.option('-p', '--prompt', type=str, help='Run a single task without the TUI (headless mode)')
 @click.option('--mcp', is_flag=True, help='Run as MCP server (exposes JSON RPC via stdin/stdout)')
-@click.option('--trace-dir', type=str, help='Directory to export structured trace files for step-by-step replay')
 @click.pass_context
 def main(ctx: click.Context, debug: bool = False, **kwargs):
 	"""Browser Use - AI Agent for Web Automation

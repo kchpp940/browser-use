@@ -14,6 +14,7 @@ from openai.types.shared_params.response_format_json_schema import (
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage, ContentPartTextParam, SystemMessage
 from browser_use.llm.schema import SchemaOptimizer
@@ -344,6 +345,22 @@ class ChatVercel(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'vercel'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		base = get_default_capabilities('vercel')
+		model_lower = str(self.model).lower()
+		is_google = model_lower.startswith('google/')
+		is_anthropic = model_lower.startswith('anthropic/')
+		is_reasoning = self.reasoning_models and any(
+			str(p).lower() in model_lower for p in self.reasoning_models
+		)
+		if is_google or is_anthropic or is_reasoning:
+			return base.model_copy(update={
+				'structured_output': StructuredOutputMethod.PROMPT_TEXT,
+				'supports_json_schema_response_format': False,
+			})
+		return base
 
 	def _get_client_params(self) -> dict[str, Any]:
 		"""Prepare client parameters dictionary."""

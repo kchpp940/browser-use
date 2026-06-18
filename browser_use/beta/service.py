@@ -39,7 +39,6 @@ from browser_use.agent.judge import construct_judge_messages
 from browser_use.agent.message_manager.service import MessageManager
 from browser_use.agent.message_manager.utils import save_conversation
 from browser_use.agent.prompts import SystemPrompt
-from browser_use.agent.trace import TraceService
 from browser_use.agent.views import (
 	ActionResult,
 	AgentError,
@@ -2657,93 +2656,6 @@ def _event_time_seconds(event: dict[str, Any], fallback: float) -> float:
 	return fallback
 
 
-def _trace_from_events(
-	trace_service: TraceService,
-	events: list[dict[str, Any]],
-	*,
-	started: float,
-	finished: float,
-) -> None:
-	"""Convert Rust SDK events to TraceFile format using step_start/step_end lifecycle."""
-	events = _events_after_terminal_rollbacks(_events_after_terminal_compaction(events))
-	spans = _terminal_turn_spans(events)
-	if not spans:
-		return
-
-	downloaded_files: set[str] = set()
-	for step_number, (start_index, end_index) in enumerate(spans, start=1):
-		step_events = events[start_index:end_index]
-		if not step_events:
-			continue
-
-		state_events_before = events[:start_index]
-		state_events_after = events[:end_index]
-
-		browser_state_before = _browser_state_from_events(state_events_before)
-		browser_state_after = _browser_state_from_events(state_events_after)
-
-		tool_calls = _tool_calls_with_final_done(
-			_tool_started_calls(step_events),
-			final_result=None,
-			attachments=None,
-			is_done=False,
-		)
-		model_output = _model_output_from_tool_calls(tool_calls, step_events)
-		action_results = _action_results_from_tool_calls(
-			tool_calls,
-			step_events,
-			final_result=None,
-			attachments=None,
-			failure=None,
-			is_done=False,
-		)
-
-		screenshot_path = None
-		if browser_state_after.screenshot_path:
-			screenshot_path = browser_state_after.screenshot_path
-		elif browser_state_before.screenshot_path:
-			screenshot_path = browser_state_before.screenshot_path
-
-		trace_service.step_start(
-			step_number=step_number,
-			browser_state_summary=browser_state_before,
-			downloaded_files=list(downloaded_files),
-		)
-
-		new_downloads = _downloads_from_events(step_events)
-		downloaded_files.update(new_downloads)
-
-		error = None
-		for event in step_events:
-			if _event_type(event) in ('tool.call.failed', 'step.failed', 'task.failed'):
-				error = str(event.get('error') or event.get('message') or 'Step failed')
-				break
-
-		trace_service.step_end(
-			model_output=model_output,
-			action_results=action_results,
-			browser_state_summary=browser_state_after,
-			screenshot_path=screenshot_path,
-			downloaded_files=list(downloaded_files),
-			error=error,
-		)
-
-
-def _downloads_from_events(events: list[dict[str, Any]]) -> set[str]:
-	"""Extract downloaded file paths from events."""
-	downloads: set[str] = set()
-	for event in events:
-		if _event_type(event) == 'download.completed':
-			path = event.get('path')
-			if isinstance(path, str) and path:
-				downloads.add(path)
-		elif _event_type(event) == 'file.written':
-			path = event.get('path')
-			if isinstance(path, str) and path:
-				downloads.add(path)
-	return downloads
-
-
 def _history_items_from_terminal_turns(
 	events: list[dict[str, Any]],
 	*,
@@ -4378,7 +4290,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		max_clickable_elements_length: int = 40000,
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
-		trace_dir: str | Path | None = None,
 		**kwargs,
 	):
 		if llm_screenshot_size is not None:
@@ -4620,19 +4531,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self._last_synced_history_id: int | None = None
 		self._last_step_callback_history_id: int | None = None
 		self._last_step_end_callback_history_id: int | None = None
-		self.trace_dir: Path | None = Path(trace_dir).expanduser() if trace_dir else None
-		if self.trace_dir is None:
-			env_trace_dir = os.environ.get('BROWSER_USE_TRACE_DIR')
-			if env_trace_dir:
-				self.trace_dir = Path(env_trace_dir).expanduser()
-		self._trace_service: TraceService | None = None
-		if self.trace_dir is not None:
-			self._trace_service = TraceService(
-				trace_dir=self.trace_dir,
-				agent_id=self.id,
-				task=self.task,
-				model=_model_name(self.llm),
-			)
 		self._external_pause_event = asyncio.Event()
 		self._external_pause_event.set()
 
@@ -5072,8 +4970,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 	async def _finalize_run_cleanup(self) -> None:
 		"""Mirror Browser Use run cleanup ordering."""
 		self._unregister_run_signal_handler()
-		if self._trace_service is not None:
-			self._trace_service.finalize()
 		await self._stop_eventbus_after_run()
 		await self._close_browser_resources()
 		await self._close_sdk_client_if_not_keep_alive()
@@ -5425,13 +5321,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.result.history = [*self._pending_history_prefix, *self.result.history]
 			self._pending_history_prefix = []
 		self.history = self.result
-		if self._trace_service is not None and events:
-			_trace_from_events(
-				self._trace_service,
-				events,
-				started=started,
-				finished=finished,
-			)
 		await self._apply_terminal_usage_costs(self.last_usage_events)
 		self._sync_state_from_history()
 		await self._log_run_usage_summary()
@@ -5488,13 +5377,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.result.history = [*self._pending_history_prefix, *self.result.history]
 			self._pending_history_prefix = []
 		self.history = self.result
-		if self._trace_service is not None and events:
-			_trace_from_events(
-				self._trace_service,
-				events,
-				started=started,
-				finished=finished,
-			)
 		await self._apply_terminal_usage_costs(self.last_usage_events)
 		self._sync_state_from_history()
 
@@ -6648,8 +6530,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			'max_actions_per_step': int(self.settings.max_actions_per_step),
 			'config_overrides': {'full_llm_input_events': True},
 		}
-		if self.trace_dir is not None:
-			params['trace_dir'] = str(self.trace_dir)
 		if self._sdk_agent_id:
 			params['agent_id'] = self._sdk_agent_id
 		if self._sdk_browser_id:

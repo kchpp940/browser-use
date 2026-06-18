@@ -8,6 +8,7 @@ from ollama import Options
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.ollama.serializer import OllamaMessageSerializer
@@ -38,6 +39,10 @@ class ChatOllama(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'ollama'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		return get_default_capabilities('ollama')
 
 	def _get_client_params(self) -> dict[str, Any]:
 		"""Prepare client parameters dictionary."""

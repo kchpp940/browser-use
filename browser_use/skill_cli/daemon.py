@@ -40,7 +40,6 @@ class Daemon:
 		cloud_profile_id: str | None = None,
 		cloud_proxy_country_code: str | None = None,
 		cloud_timeout: int | None = None,
-		trace_dir: str | None = None,
 		session: str = 'default',
 	) -> None:
 		from browser_use.skill_cli.utils import validate_session_name
@@ -54,7 +53,6 @@ class Daemon:
 		self.cloud_profile_id = cloud_profile_id
 		self.cloud_proxy_country_code = cloud_proxy_country_code
 		self.cloud_timeout = cloud_timeout
-		self.trace_dir = trace_dir
 		self.running = True
 		self._server: asyncio.Server | None = None
 		self._shutdown_event = asyncio.Event()
@@ -83,7 +81,6 @@ class Daemon:
 				'profile': self.profile,
 				'cdp_url': self.cdp_url,
 				'use_cloud': self.use_cloud,
-				'trace_dir': self.trace_dir,
 			},
 		}
 		state_path = get_home_dir() / f'{self.session}.state.json'
@@ -155,7 +152,6 @@ class Daemon:
 					browser_session=bs,
 					actions=actions,
 					use_cloud=self.use_cloud,
-					trace_dir=self.trace_dir,
 				)
 				self._browser_watchdog_task = asyncio.create_task(self._watch_browser())
 
@@ -525,11 +521,7 @@ def main() -> None:
 	parser.add_argument('--cloud-profile-id', help='Cloud browser profile ID')
 	parser.add_argument('--cloud-proxy-country', help='Cloud browser proxy country code')
 	parser.add_argument('--cloud-timeout', type=int, help='Cloud browser timeout in minutes')
-	parser.add_argument('--trace-dir', help='Directory to export structured trace files')
 	args = parser.parse_args()
-
-	if args.trace_dir:
-		os.environ['BROWSER_USE_TRACE_DIR'] = str(Path(args.trace_dir).expanduser().resolve())
 
 	logger.info(
 		f'Starting daemon: session={args.session}, headed={args.headed}, profile={args.profile}, cdp_url={args.cdp_url}, use_cloud={args.use_cloud}'
@@ -543,7 +535,6 @@ def main() -> None:
 		cloud_profile_id=args.cloud_profile_id,
 		cloud_proxy_country_code=args.cloud_proxy_country,
 		cloud_timeout=args.cloud_timeout,
-		trace_dir=args.trace_dir,
 		session=args.session,
 	)
 

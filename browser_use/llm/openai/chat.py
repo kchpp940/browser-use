@@ -12,6 +12,7 @@ from openai.types.shared_params.response_format_json_schema import JSONSchema, R
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer
@@ -80,6 +81,13 @@ class ChatOpenAI(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'openai'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		base = get_default_capabilities('openai')
+		if self.reasoning_models and any(str(m).lower() in str(self.model).lower() for m in self.reasoning_models):
+			return base.model_copy(update={'supports_thinking': True})
+		return base
 
 	def _get_client_params(self) -> dict[str, Any]:
 		"""Prepare client parameters dictionary."""

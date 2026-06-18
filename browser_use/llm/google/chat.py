@@ -14,6 +14,7 @@ from google.genai.types import MediaModality
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
+from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError
 from browser_use.llm.google.serializer import GoogleMessageSerializer
 from browser_use.llm.messages import BaseMessage
@@ -119,6 +120,15 @@ class ChatGoogle(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'google'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		base = get_default_capabilities('google')
+		return base.model_copy(update={
+			'supports_json_schema_response_format': self.supports_structured_output,
+			'structured_output': StructuredOutputMethod.JSON_SCHEMA if self.supports_structured_output else StructuredOutputMethod.PROMPT_TEXT,
+			'structured_output_fallback': StructuredOutputMethod.PROMPT_TEXT if self.supports_structured_output else None,
+		})
 
 	@property
 	def logger(self) -> logging.Logger:

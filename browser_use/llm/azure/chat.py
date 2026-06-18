@@ -9,6 +9,7 @@ from openai.types.responses import Response
 from openai.types.shared import ChatModel
 from pydantic import BaseModel
 
+from browser_use.llm.capabilities import ProviderCapabilities, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openai.like import ChatOpenAILike
@@ -66,6 +67,10 @@ class ChatAzureOpenAI(ChatOpenAILike):
 	@property
 	def provider(self) -> str:
 		return 'azure'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		return get_default_capabilities('azure')
 
 	def _get_client_params(self) -> dict[str, Any]:
 		_client_params: dict[str, Any] = {}

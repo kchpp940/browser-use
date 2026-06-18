@@ -20,6 +20,7 @@ from httpx import URL
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel, ChatInvokeCompletion
+from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.groq.parser import try_parse_groq_failed_generation
 from browser_use.llm.groq.serializer import GroqMessageSerializer
@@ -79,6 +80,16 @@ class ChatGroq(BaseChatModel):
 	@property
 	def provider(self) -> str:
 		return 'groq'
+
+	@property
+	def capabilities(self) -> ProviderCapabilities:
+		base = get_default_capabilities('groq')
+		if self.model in ToolCallingModels:
+			return base.model_copy(update={
+				'structured_output': StructuredOutputMethod.TOOL_CALLING,
+				'structured_output_fallback': StructuredOutputMethod.JSON_SCHEMA,
+			})
+		return base
 
 	@property
 	def name(self) -> str:

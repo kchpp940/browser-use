@@ -3,7 +3,6 @@ import gc
 import inspect
 import json
 import logging
-import os
 import re
 import tempfile
 import time
@@ -210,7 +209,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		max_clickable_elements_length: int = 40000,
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
-		trace_dir: str | Path | None = None,
 		**kwargs,
 	):
 		# Validate llm_screenshot_size
@@ -470,17 +468,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Verify we can connect to the model
 		self._verify_and_setup_llm()
 
-		# TODO: move this logic to the LLMs
-		# Handle users trying to use use_vision=True with DeepSeek models
-		if 'deepseek' in self.llm.model.lower():
-			self.logger.warning('⚠️ DeepSeek models do not support use_vision=True yet. Setting use_vision=False for now...')
-			self.settings.use_vision = False
+		capabilities = self.llm.capabilities
 
-		# Handle users trying to use use_vision=True with XAI models that don't support it
-		# grok-3 variants and grok-code don't support vision; grok-2 and grok-4 do
-		model_lower = self.llm.model.lower()
-		if 'grok-3' in model_lower or 'grok-code' in model_lower:
-			self.logger.warning('⚠️ This XAI model does not support use_vision=True yet. Setting use_vision=False for now...')
+		if self.settings.use_vision and not capabilities.supports_vision:
+			self.logger.warning(f'⚠️ {self.llm.model} does not support vision. Setting use_vision=False...')
 			self.settings.use_vision = False
 
 		logger.debug(
@@ -489,16 +480,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			f'{" +file_system" if self.file_system else ""}'
 		)
 
-		# Store llm_screenshot_size in browser_session so tools can access it
 		self.browser_session.llm_screenshot_size = llm_screenshot_size
 
-		# Check if LLM is ChatAnthropic instance
-		from browser_use.llm.anthropic.chat import ChatAnthropic
+		is_anthropic = capabilities.prompt_format == 'anthropic'
 
-		is_anthropic = isinstance(self.llm, ChatAnthropic)
-
-		# Check if model is a browser-use fine-tuned model (uses simplified prompts)
-		is_browser_use_model = 'browser-use/' in self.llm.model.lower()
+		is_browser_use_model = capabilities.prompt_format == 'browser_use'
 
 		# Initialize message manager with state
 		# Initial system prompt with all actions - will be updated during each step
@@ -606,24 +592,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Event-based pause control (kept out of AgentState for serialization)
 		self._external_pause_event = asyncio.Event()
 		self._external_pause_event.set()
-
-		# Trace export
-		self._trace_service: 'TraceService | None' = None
-		if trace_dir is None:
-			env_trace_dir = os.environ.get('BROWSER_USE_TRACE_DIR')
-			if env_trace_dir:
-				trace_dir = env_trace_dir
-		if trace_dir is not None:
-			from browser_use.agent.trace import TraceService
-
-			self._trace_service = TraceService(
-				trace_dir=trace_dir,
-				agent_id=self.id,
-				task=self.task,
-				model=self.llm.model if hasattr(self.llm, 'model') else 'unknown',
-				sensitive_data=self.sensitive_data,
-			)
-			self.logger.info(f'📋 Trace export enabled, writing to {Path(trace_dir).resolve()}')
 
 	def _enhance_task_with_schema(self, task: str, output_model_schema: type[AgentStructuredOutput] | None) -> str:
 		"""Enhance task description with output schema information if provided."""
@@ -1117,17 +1085,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Check for new downloads after getting browser state (catches PDF auto-downloads and previous step downloads)
 		await self._check_and_update_downloads(f'Step {self.state.n_steps}: after getting browser state')
 
-		# Trace: mark step start with initial page state and download baseline
-		if self._trace_service is not None:
-			downloaded_files = []
-			if self.has_downloads_path and self.browser_session:
-				downloaded_files = self.browser_session.downloaded_files
-			self._trace_service.step_start(
-				step_number=self.state.n_steps,
-				browser_state_summary=browser_state_summary,
-				downloaded_files=downloaded_files,
-			)
-
 		self._log_step_context(browser_state_summary)
 		await self._check_stop_or_pause()
 
@@ -1380,15 +1337,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""Finalize the step with history, logging, and events"""
 		step_end_time = time.time()
 		if not self.state.last_result:
-			if self._trace_service is not None and self._trace_service._pending is not None:
-				self._trace_service.step_end(
-					model_output=self.state.last_model_output,
-					action_results=None,
-					browser_state_summary=browser_state_summary,
-					screenshot_path=None,
-					downloaded_files=self.browser_session.downloaded_files if (self.has_downloads_path and self.browser_session) else [],
-					error='Step interrupted before producing results',
-				)
 			return
 
 		if browser_state_summary:
@@ -1445,27 +1393,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Increment step counter after step is fully completed
 		self.state.n_steps += 1
-
-		# Trace export
-		if self._trace_service is not None:
-			screenshot_path = None
-			if self.history.history:
-				screenshot_path = self.history.history[-1].state.screenshot_path
-			downloaded_files = []
-			if self.has_downloads_path and self.browser_session:
-				downloaded_files = self.browser_session.downloaded_files
-			step_error = None
-			if self.state.last_result:
-				errors = [r.error for r in self.state.last_result if r.error]
-				step_error = errors[0] if errors else None
-			self._trace_service.step_end(
-				model_output=self.state.last_model_output,
-				action_results=self.state.last_result,
-				browser_state_summary=browser_state_summary,
-				screenshot_path=screenshot_path,
-				downloaded_files=downloaded_files,
-				error=step_error,
-			)
 
 	def _update_plan_from_model_output(self, model_output: AgentOutput) -> None:
 		"""Update the plan state from model output fields (current_plan_item, plan_update)."""
@@ -2619,10 +2546,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					{'tag': 'status'},
 				)
 
-			# Subscribe trace service to browser event bus
-			if self._trace_service is not None and self.browser_session.event_bus:
-				self._trace_service.register_event_bus(self.browser_session.event_bus)
-
 			# Register skills as actions if SkillService is configured
 			await self._register_skills_as_actions()
 
@@ -2776,11 +2699,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Stop the event bus gracefully, waiting for all events to be processed
 			# Configurable via TIMEOUT_AgentEventBusStop env var (default: 3.0s)
 			await self.eventbus.stop(clear=True, timeout=_get_timeout('TIMEOUT_AgentEventBusStop', 3.0))
-
-			# Finalize trace export
-			if self._trace_service is not None:
-				trace_path = self._trace_service.finalize()
-				self.logger.info(f'📋 Trace saved to {trace_path}')
 
 			await self.close()
 

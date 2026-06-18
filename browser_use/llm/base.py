@@ -8,6 +8,7 @@ from typing import Any, Protocol, TypeVar, overload, runtime_checkable
 
 from pydantic import BaseModel
 
+from browser_use.llm.capabilities import ProviderCapabilities
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.views import ChatInvokeCompletion
 
@@ -25,6 +26,9 @@ class BaseChatModel(Protocol):
 
 	@property
 	def name(self) -> str: ...
+
+	@property
+	def capabilities(self) -> ProviderCapabilities: ...
 
 	@property
 	def model_name(self) -> str:
