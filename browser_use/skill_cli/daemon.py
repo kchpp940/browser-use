@@ -14,7 +14,7 @@ import logging
 import os
 import signal
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
 	from browser_use.skill_cli.sessions import SessionInfo
@@ -278,14 +278,8 @@ class Daemon:
 			if action == 'ping':
 				# Return live CDP URL (may differ from constructor arg for cloud sessions)
 				live_cdp_url = self.cdp_url
-				config_signature: dict[str, Any] = {}
-				if self._session and self._session.browser_session:
+				if self._session and self._session.browser_session.cdp_url:
 					live_cdp_url = self._session.browser_session.cdp_url
-					# Return full config signature for comprehensive mismatch detection
-					try:
-						config_signature = self._session.browser_session.browser_profile.get_config_signature()
-					except Exception:
-						pass
 				return {
 					'id': req_id,
 					'success': True,
@@ -296,7 +290,6 @@ class Daemon:
 						'profile': self.profile,
 						'cdp_url': live_cdp_url,
 						'use_cloud': self.use_cloud,
-						'config_signature': config_signature,
 					},
 				}
 

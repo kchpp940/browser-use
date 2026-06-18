@@ -156,7 +156,7 @@ load_dotenv()
 
 from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
-from browser_use.browser import BrowserSession
+from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
@@ -324,6 +324,8 @@ def update_config_with_click_args(config: dict[str, Any], ctx: click.Context) ->
 		config['browser']['profile_directory'] = ctx.params['profile_directory']
 	if ctx.params.get('cdp_url'):
 		config['browser']['cdp_url'] = ctx.params['cdp_url']
+	if ctx.params.get('trace_dir'):
+		config['trace_dir'] = ctx.params['trace_dir']
 
 	# Consolidated proxy dict
 	proxy: dict[str, str] = {}
@@ -1002,14 +1004,17 @@ class BrowserUseApp(App):
 		if self.agent is None:
 			if not self.llm:
 				raise RuntimeError('LLM not initialized')
-			self.agent = Agent(
-				task=task,
-				llm=self.llm,
-				controller=self.controller if self.controller else Controller(),
-				browser_session=self.browser_session,
-				source='cli',
+			agent_kwargs: dict[str, Any] = {
+				'task': task,
+				'llm': self.llm,
+				'controller': self.controller if self.controller else Controller(),
+				'browser_session': self.browser_session,
+				'source': 'cli',
 				**agent_settings.model_dump(),
-			)
+			}
+			if self.config.get('trace_dir'):
+				agent_kwargs['trace_dir'] = self.config['trace_dir']
+			self.agent = Agent(**agent_kwargs)
 			# Update our browser_session reference to point to the agent's
 			if hasattr(self.agent, 'browser_session'):
 				self.browser_session = self.agent.browser_session
@@ -1526,27 +1531,27 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 		# Get agent settings from config
 		agent_settings = AgentSettings.model_validate(config.get('agent', {}))
 
-		# Create browser session using the UNIFIED factory — same path as all entry points
+		# Create browser session with config parameters
 		browser_config = config.get('browser', {})
+		# Remove None values from browser_config
 		browser_config = {k: v for k, v in browser_config.items() if v is not None}
-		direct_kwargs = {'user_data_dir': str(USER_DATA_DIR)}
-		direct_kwargs.update(browser_config)
-		browser_session = BrowserSession.from_config_sources(
-			direct_kwargs=direct_kwargs,
-			cli_args=None,
-			load_from_env=True,
-			load_from_config_file=True,
+		# Create BrowserProfile with user_data_dir
+		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
+		browser_session = BrowserSession(
+			browser_profile=profile,
 		)
-		browser_session.log_effective_config()
 
 		# Create and run agent
-		agent = Agent(
-			task=prompt,
-			llm=llm,
-			browser_session=browser_session,
-			source='cli',
+		agent_kwargs: dict[str, Any] = {
+			'task': prompt,
+			'llm': llm,
+			'browser_session': browser_session,
+			'source': 'cli',
 			**agent_settings.model_dump(),
-		)
+		}
+		if config.get('trace_dir'):
+			agent_kwargs['trace_dir'] = config['trace_dir']
+		agent = Agent(**agent_kwargs)
 
 		await agent.run()
 
@@ -1646,17 +1651,14 @@ async def textual_interface(config: dict[str, Any]):
 		else:
 			logger.info('Browser mode: visible')
 
-		# Use UNIFIED BrowserSession factory — same path as all other entry points
+		# Create BrowserSession directly with config parameters
+		# Remove None values from browser_config
 		browser_config = {k: v for k, v in browser_config.items() if v is not None}
-		direct_kwargs = {'user_data_dir': str(USER_DATA_DIR)}
-		direct_kwargs.update(browser_config)
-		browser_session = BrowserSession.from_config_sources(
-			direct_kwargs=direct_kwargs,
-			cli_args=None,
-			load_from_env=True,
-			load_from_config_file=True,
+		# Create BrowserProfile with user_data_dir
+		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
+		browser_session = BrowserSession(
+			browser_profile=profile,
 		)
-		browser_session.log_effective_config()
 		logger.debug('BrowserSession initialized successfully')
 
 		# Set up FIFO logging pipes for streaming logs to UI
@@ -2018,6 +2020,7 @@ async def run_auth_command():
 @click.option('--proxy-password', type=str, help='Proxy auth password')
 @click.option('-p', '--prompt', type=str, help='Run a single task without the TUI (headless mode)')
 @click.option('--mcp', is_flag=True, help='Run as MCP server (exposes JSON RPC via stdin/stdout)')
+@click.option('--trace-dir', type=str, help='Directory to export structured trace files for step-by-step replay')
 @click.pass_context
 def main(ctx: click.Context, debug: bool = False, **kwargs):
 	"""Browser Use - AI Agent for Web Automation

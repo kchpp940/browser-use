@@ -62,6 +62,7 @@ from browser_use.agent.views import (
 	StepMetadata,
 )
 from browser_use.browser.events import _get_timeout
+from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
@@ -208,6 +209,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		max_clickable_elements_length: int = 40000,
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
+		trace_dir: str | Path | None = None,
 		**kwargs,
 	):
 		# Validate llm_screenshot_size
@@ -221,20 +223,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				raise ValueError('llm_screenshot_size dimensions must be at least 100 pixels')
 			self.logger.info(f'🖼️  LLM screenshot resizing enabled: {width}x{height}')
 		if llm is None:
-			# Build LLM from the UNIFIED EffectiveConfig — so provider + model + api_key
-			# are resolved exactly the same way as for BrowserSession and the cloud payload.
-			from browser_use.browser.views import EffectiveConfig
+			default_llm_name = CONFIG.DEFAULT_LLM
+			if default_llm_name:
+				from browser_use.llm.models import get_llm_by_name
 
-			effective = EffectiveConfig.from_config_sources(
-				direct_kwargs=None,
-				cli_args=None,
-				load_from_env=True,
-				load_from_config_file=True,
-			)
-			llm = effective.build_llm()
-			self.logger.info(
-				f'[Agent] Built LLM from unified EffectiveConfig: provider={effective.llm.provider}, model={effective.llm.model}'
-			)
+				llm = get_llm_by_name(default_llm_name)
+			else:
+				# No default LLM specified, use the original default
+				from browser_use import ChatBrowserUse
+
+				llm = ChatBrowserUse()
 
 		# set flashmode = True if llm is ChatBrowserUse
 		if llm.provider == 'browser-use':
@@ -282,47 +280,25 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.task_id: str = self.id
 		self.session_id: str = uuid7str()
 
+		base_profile = browser_profile or DEFAULT_BROWSER_PROFILE
+		if base_profile is DEFAULT_BROWSER_PROFILE:
+			base_profile = base_profile.model_copy()
+		if demo_mode is not None and base_profile.demo_mode != demo_mode:
+			base_profile = base_profile.model_copy(update={'demo_mode': demo_mode})
+		browser_profile = base_profile
+
 		# Handle browser vs browser_session parameter (browser takes precedence)
 		if browser and browser_session:
 			raise ValueError('Cannot specify both "browser" and "browser_session" parameters. Use "browser" for the cleaner API.')
 		browser_session = browser or browser_session
 
-		# Build profile updates from explicit parameters
-		profile_updates: dict[str, Any] = {}
-		if demo_mode is not None:
-			profile_updates['demo_mode'] = demo_mode
+		if browser_session is not None and demo_mode is not None and browser_session.browser_profile.demo_mode != demo_mode:
+			browser_session.browser_profile = browser_session.browser_profile.model_copy(update={'demo_mode': demo_mode})
 
-		if browser_session is not None:
-			# User provided an existing session — just apply demo_mode override if needed
-			if profile_updates and browser_session.browser_profile.demo_mode != demo_mode:
-				browser_session.browser_profile = browser_session.browser_profile.model_copy(update=profile_updates)
-			self.browser_session = browser_session
-		else:
-			# No existing session — use UNIFIED factory that merges all config sources
-			session_id = uuid7str()[:-4] + self.id[-4:]
-			if browser_profile is not None:
-				# User provided an explicit profile — use it as direct_kwargs with highest priority
-				explicit_kwargs = browser_profile.model_dump(exclude_unset=True)
-				explicit_kwargs.update(profile_updates)
-				self.browser_session = BrowserSession.from_config_sources(
-					direct_kwargs=explicit_kwargs,
-					cli_args=None,
-					load_from_env=True,
-					load_from_config_file=True,
-					session_id=session_id,
-				)
-			else:
-				# No explicit profile — let the unified factory handle everything
-				self.browser_session = BrowserSession.from_config_sources(
-					direct_kwargs=profile_updates or None,
-					cli_args=None,
-					load_from_env=True,
-					load_from_config_file=True,
-					session_id=session_id,
-				)
-
-		# Always log the effective config so logs match actual browser state
-		self.browser_session.log_effective_config()
+		self.browser_session = browser_session or BrowserSession(
+			browser_profile=browser_profile,
+			id=uuid7str()[:-4] + self.id[-4:],  # re-use the same 4-char suffix so they show up together in logs
+		)
 
 		self._demo_mode_enabled: bool = bool(self.browser_profile.demo_mode) if self.browser_session else False
 		if self._demo_mode_enabled and getattr(self.browser_profile, 'headless', False):
@@ -629,6 +605,20 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Event-based pause control (kept out of AgentState for serialization)
 		self._external_pause_event = asyncio.Event()
 		self._external_pause_event.set()
+
+		# Trace export
+		self._trace_service: 'TraceService | None' = None
+		if trace_dir is not None:
+			from browser_use.agent.trace import TraceService
+
+			self._trace_service = TraceService(
+				trace_dir=trace_dir,
+				agent_id=self.id,
+				task=self.task,
+				model=self.llm.model if hasattr(self.llm, 'model') else 'unknown',
+				sensitive_data=self.sensitive_data,
+			)
+			self.logger.info(f'📋 Trace export enabled, writing to {Path(trace_dir).resolve()}')
 
 	def _enhance_task_with_schema(self, task: str, output_model_schema: type[AgentStructuredOutput] | None) -> str:
 		"""Enhance task description with output schema information if provided."""
@@ -1430,6 +1420,30 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Increment step counter after step is fully completed
 		self.state.n_steps += 1
+
+		# Trace export
+		if self._trace_service is not None:
+			screenshot_path = None
+			if self.history.history:
+				screenshot_path = self.history.history[-1].state.screenshot_path
+			downloaded_files = []
+			if self.has_downloads_path and self.browser_session:
+				downloaded_files = self.browser_session.downloaded_files
+			step_error = None
+			if self.state.last_result:
+				errors = [r.error for r in self.state.last_result if r.error]
+				step_error = errors[0] if errors else None
+			self._trace_service.record_step(
+				step_number=self.state.n_steps - 1,
+				model_output=self.state.last_model_output,
+				action_results=self.state.last_result,
+				browser_state_summary=browser_state_summary,
+				screenshot_path=screenshot_path,
+				downloaded_files=downloaded_files,
+				step_start_time=self.step_start_time,
+				step_end_time=step_end_time,
+				error=step_error,
+			)
 
 	def _update_plan_from_model_output(self, model_output: AgentOutput) -> None:
 		"""Update the plan state from model output fields (current_plan_item, plan_update)."""
@@ -2583,6 +2597,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					{'tag': 'status'},
 				)
 
+			# Subscribe trace service to browser event bus
+			if self._trace_service is not None and self.browser_session.event_bus:
+				self._trace_service.register_event_bus(self.browser_session.event_bus)
+
 			# Register skills as actions if SkillService is configured
 			await self._register_skills_as_actions()
 
@@ -2736,6 +2754,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Stop the event bus gracefully, waiting for all events to be processed
 			# Configurable via TIMEOUT_AgentEventBusStop env var (default: 3.0s)
 			await self.eventbus.stop(clear=True, timeout=_get_timeout('TIMEOUT_AgentEventBusStop', 3.0))
+
+			# Finalize trace export
+			if self._trace_service is not None:
+				trace_path = self._trace_service.finalize()
+				self.logger.info(f'📋 Trace saved to {trace_path}')
 
 			await self.close()
 

@@ -19,7 +19,6 @@ import tempfile
 import time
 import zlib
 from pathlib import Path
-from typing import Any
 
 # =============================================================================
 # Early command interception (before heavy imports)
@@ -416,62 +415,6 @@ def _is_daemon_alive(session: str = 'default') -> bool:
 	return _probe_session(session).socket_reachable
 
 
-def _build_requested_config_signature(
-	headed: bool,
-	profile: str | None,
-	cdp_url: str | None,
-	use_cloud: bool,
-	cloud_profile_id: str | None,
-	cloud_proxy_country_code: str | None,
-	cloud_timeout: int | None,
-) -> dict[str, Any]:
-	"""Build the expected config signature for the requested daemon config.
-
-	Uses the same BrowserProfile.from_config_sources() path as the daemon
-	itself to ensure apples-to-apples comparison.
-	"""
-	from browser_use.browser.profile import BrowserProfile
-
-	cli_args: dict[str, Any] = {
-		'headed': headed,
-		'cdp_url': cdp_url,
-		'use_cloud': use_cloud,
-		'cloud_profile_id': cloud_profile_id,
-		'cloud_proxy_country_code': cloud_proxy_country_code,
-		'cloud_timeout': cloud_timeout,
-	}
-
-	# Note: We don't resolve Chrome profile here (requires Chrome installed),
-	# but daemon's signature will have it resolved. We only compare the fields
-	# that were explicitly requested AND exist in both signatures.
-	try:
-		profile_obj = BrowserProfile.from_config_sources(
-			direct_kwargs=None,
-			cli_args=cli_args,
-			load_from_env=True,
-			load_from_config_file=True,
-		)
-		return profile_obj.get_config_signature()
-	except Exception:
-		return {}
-
-
-def _configs_match(requested: dict[str, Any], running: dict[str, Any]) -> bool:
-	"""Compare two config signatures, ignoring fields that only exist in one.
-
-	This handles the case where daemon has resolved additional fields (like
-	Chrome executable path) that the caller couldn't pre-compute.
-	"""
-	if not requested:
-		return True  # Can't build requested signature — fall back to legacy check
-	if not running:
-		return False  # Daemon hasn't created session yet — can't compare
-	for key, req_val in requested.items():
-		if key in running and running[key] != req_val:
-			return False
-	return True
-
-
 def ensure_daemon(
 	headed: bool,
 	profile: str | None,
@@ -492,39 +435,18 @@ def ensure_daemon(
 		if not explicit_config:
 			return  # Reuse it
 
-		# User explicitly set config — build expected signature and compare
+		# User explicitly set --headed/--profile/--cdp-url — check config matches
 		try:
-			requested_sig = _build_requested_config_signature(
-				headed,
-				profile,
-				cdp_url,
-				use_cloud,
-				cloud_profile_id,
-				cloud_proxy_country_code,
-				cloud_timeout,
-			)
 			response = send_command('ping', {}, session=session)
 			if response.get('success'):
 				data = response.get('data', {})
-				running_sig = data.get('config_signature', {})
-
-				# Full signature comparison (preferred) OR legacy 4-field fallback
-				signatures_match = _configs_match(requested_sig, running_sig)
-				legacy_match = (
+				if (
 					data.get('headed') == headed
 					and data.get('profile') == profile
 					and data.get('cdp_url') == cdp_url
 					and data.get('use_cloud') == use_cloud
-				)
-
-				if running_sig:
-					# Daemon has session — use full signature comparison
-					if signatures_match:
-						return
-				else:
-					# Daemon alive but no session yet — use legacy check
-					if legacy_match:
-						return
+				):
+					return  # Already running with correct config
 
 				# Config mismatch — error, don't auto-restart (avoids orphan cascades)
 				print(
