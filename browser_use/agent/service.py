@@ -85,6 +85,10 @@ from browser_use.utils import (
 
 logger = logging.getLogger(__name__)
 
+# Sentinel value for "not explicitly set" by the user.
+# Used to distinguish between "user passed the default value" and "user didn't pass anything".
+_UNSET: Any = object()
+
 
 def log_response(response: AgentOutput, registry=None, logger=None) -> None:
 	"""Utility function to log the model's response."""
@@ -167,88 +171,154 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Agent settings
 		output_model_schema: type[AgentStructuredOutput] | None = None,
 		extraction_schema: dict | None = None,
-		use_vision: bool | Literal['auto'] = True,
+		use_vision: bool | Literal['auto'] = _UNSET,  # type: ignore[assignment]
 		save_conversation_path: str | Path | None = None,
-		save_conversation_path_encoding: str | None = 'utf-8',
-		max_failures: int = 5,
+		save_conversation_path_encoding: str | None = _UNSET,  # type: ignore[assignment]
+		max_failures: int = _UNSET,  # type: ignore[assignment]
 		override_system_message: str | None = None,
 		extend_system_message: str | None = None,
-		generate_gif: bool | str = False,
+		generate_gif: bool | str = _UNSET,  # type: ignore[assignment]
 		available_file_paths: list[str] | None = None,
 		include_attributes: list[str] | None = None,
-		max_actions_per_step: int = 5,
-		use_thinking: bool = True,
-		flash_mode: bool = False,
+		max_actions_per_step: int = _UNSET,  # type: ignore[assignment]
+		use_thinking: bool = _UNSET,  # type: ignore[assignment]
+		flash_mode: bool = _UNSET,  # type: ignore[assignment]
 		demo_mode: bool | None = None,
 		max_history_items: int | None = None,
 		page_extraction_llm: BaseChatModel | None = None,
 		fallback_llm: BaseChatModel | None = None,
-		use_judge: bool = True,
+		use_judge: bool = _UNSET,  # type: ignore[assignment]
 		ground_truth: str | None = None,
 		judge_llm: BaseChatModel | None = None,
 		injected_agent_state: AgentState | None = None,
 		source: str | None = None,
 		file_system_path: str | None = None,
 		task_id: str | None = None,
-		calculate_cost: bool = False,
+		calculate_cost: bool = _UNSET,  # type: ignore[assignment]
 		pricing_url: str | None = None,
 		display_files_in_done_text: bool = True,
-		include_tool_call_examples: bool = False,
-		vision_detail_level: Literal['auto', 'low', 'high'] = 'auto',
-		llm_timeout: int | None = None,
-		step_timeout: int = 180,
+		include_tool_call_examples: bool = _UNSET,  # type: ignore[assignment]
+		vision_detail_level: Literal['auto', 'low', 'high'] = _UNSET,  # type: ignore[assignment]
+		llm_timeout: int | None = _UNSET,  # type: ignore[assignment]
+		step_timeout: int = _UNSET,  # type: ignore[assignment]
 		directly_open_url: bool = True,
 		include_recent_events: bool = False,
 		sample_images: list[ContentPartTextParam | ContentPartImageParam] | None = None,
-		final_response_after_failure: bool = True,
-		enable_planning: bool = True,
-		planning_replan_on_stall: int = 3,
-		planning_exploration_limit: int = 5,
-		loop_detection_window: int = 20,
-		loop_detection_enabled: bool = True,
+		final_response_after_failure: bool = _UNSET,  # type: ignore[assignment]
+		enable_planning: bool = _UNSET,  # type: ignore[assignment]
+		planning_replan_on_stall: int = _UNSET,  # type: ignore[assignment]
+		planning_exploration_limit: int = _UNSET,  # type: ignore[assignment]
+		loop_detection_window: int = _UNSET,  # type: ignore[assignment]
+		loop_detection_enabled: bool = _UNSET,  # type: ignore[assignment]
 		llm_screenshot_size: tuple[int, int] | None = None,
-		message_compaction: MessageCompactionSettings | bool | None = True,
-		max_clickable_elements_length: int = 40000,
+		message_compaction: MessageCompactionSettings | bool | None = _UNSET,  # type: ignore[assignment]
+		max_clickable_elements_length: int = _UNSET,  # type: ignore[assignment]
 		_url_shortening_limit: int = 25,
 		enable_signal_handler: bool = True,
 		**kwargs,
 	):
-		# Load profile preset if specified
+		# ── Step 1: Build effective config from profile preset + environment ──
+		# Priority so far (lowest to highest): profile preset → env vars
 		self._profile_name = profile
-		self._resolved_profile = None
-		profile_agent_settings: dict[str, Any] = {}
-		if profile is not None:
+		self._effective_profile = None
+		effective = None
+
+		if profile is not None or os.environ.get('BROWSER_USE_PROFILE'):
+			from browser_use.profiles.manager import build_effective_config
+
+			effective = build_effective_config(
+				profile_name=profile,
+				source='api',
+			)
+			self._effective_profile = effective
+
 			from browser_use.profiles.manager import get_profile_manager
 
-			manager = get_profile_manager()
-			resolved_profile = manager.get_profile(profile)
-			self._resolved_profile = resolved_profile
-			profile_agent_settings = resolved_profile.agent
-			manager.log_profile_info(resolved_profile)
+			get_profile_manager().log_effective_profile_info(effective)
 
-			# Create LLM from profile if not provided
-			if llm is None and (resolved_profile.llm.provider or resolved_profile.llm.model):
-				llm = manager.create_llm(resolved_profile)
+		# ── Step 2: Resolve all agent parameters with proper precedence ──
+		# Priority (lowest to highest): code defaults → profile → env → explicit params
+		_default_settings = AgentSettings()
+		profile_agent = effective.agent if effective is not None else {}
 
-			# Apply profile settings to early-used parameters
-			# (only if they're still at code defaults - direct params take precedence)
-			_default_agent_settings = AgentSettings()
-			if 'flash_mode' in profile_agent_settings and flash_mode == _default_agent_settings.flash_mode:
-				flash_mode = profile_agent_settings['flash_mode']
-			if 'use_vision' in profile_agent_settings and use_vision == _default_agent_settings.use_vision:
-				use_vision = profile_agent_settings['use_vision']
-			if 'max_failures' in profile_agent_settings and max_failures == _default_agent_settings.max_failures:
-				max_failures = profile_agent_settings['max_failures']
-			if 'max_actions_per_step' in profile_agent_settings and max_actions_per_step == _default_agent_settings.max_actions_per_step:
-				max_actions_per_step = profile_agent_settings['max_actions_per_step']
-			if 'use_thinking' in profile_agent_settings and use_thinking == _default_agent_settings.use_thinking:
-				use_thinking = profile_agent_settings['use_thinking']
-			if 'llm_timeout' in profile_agent_settings and llm_timeout is None:
-				llm_timeout = profile_agent_settings['llm_timeout']
-			if 'step_timeout' in profile_agent_settings and step_timeout == _default_agent_settings.step_timeout:
-				step_timeout = profile_agent_settings['step_timeout']
-			if 'flash_mode' in profile_agent_settings and flash_mode:
-				enable_planning = False
+		# Collect all agent-related params and resolve their final values
+		# We build a dict that can be used both for early params and AgentSettings creation
+		agent_params: dict[str, Any] = {}
+
+		# Map of param_name -> (local_variable, code_default)
+		_param_map = {
+			'use_vision': (use_vision, _default_settings.use_vision),
+			'vision_detail_level': (vision_detail_level, _default_settings.vision_detail_level),
+			'save_conversation_path': (save_conversation_path, _default_settings.save_conversation_path),
+			'save_conversation_path_encoding': (
+				save_conversation_path_encoding,
+				_default_settings.save_conversation_path_encoding,
+			),
+			'max_failures': (max_failures, _default_settings.max_failures),
+			'override_system_message': (override_system_message, _default_settings.override_system_message),
+			'extend_system_message': (extend_system_message, _default_settings.extend_system_message),
+			'generate_gif': (generate_gif, _default_settings.generate_gif),
+			'include_attributes': (include_attributes, _default_settings.include_attributes),
+			'max_actions_per_step': (max_actions_per_step, _default_settings.max_actions_per_step),
+			'use_thinking': (use_thinking, _default_settings.use_thinking),
+			'flash_mode': (flash_mode, _default_settings.flash_mode),
+			'max_history_items': (max_history_items, _default_settings.max_history_items),
+			'page_extraction_llm': (page_extraction_llm, _default_settings.page_extraction_llm),
+			'calculate_cost': (calculate_cost, _default_settings.calculate_cost),
+			'include_tool_call_examples': (include_tool_call_examples, _default_settings.include_tool_call_examples),
+			'llm_timeout': (llm_timeout, _default_settings.llm_timeout),
+			'step_timeout': (step_timeout, _default_settings.step_timeout),
+			'final_response_after_failure': (
+				final_response_after_failure,
+				_default_settings.final_response_after_failure,
+			),
+			'use_judge': (use_judge, _default_settings.use_judge),
+			'ground_truth': (ground_truth, _default_settings.ground_truth),
+			'enable_planning': (enable_planning, _default_settings.enable_planning),
+			'planning_replan_on_stall': (planning_replan_on_stall, _default_settings.planning_replan_on_stall),
+			'planning_exploration_limit': (
+				planning_exploration_limit,
+				_default_settings.planning_exploration_limit,
+			),
+			'loop_detection_window': (loop_detection_window, _default_settings.loop_detection_window),
+			'loop_detection_enabled': (loop_detection_enabled, _default_settings.loop_detection_enabled),
+			'max_clickable_elements_length': (
+				max_clickable_elements_length,
+				_default_settings.max_clickable_elements_length,
+			),
+		}
+
+		for name, (sentinel_val, code_default) in _param_map.items():
+			if sentinel_val is not _UNSET:
+				# User explicitly passed a value
+				agent_params[name] = sentinel_val
+			elif name in profile_agent:
+				# Profile has a value
+				agent_params[name] = profile_agent[name]
+			else:
+				# Use code default
+				agent_params[name] = code_default
+
+		# Extract early-used parameters for convenience
+		use_vision = agent_params['use_vision']
+		max_failures = agent_params['max_failures']
+		max_actions_per_step = agent_params['max_actions_per_step']
+		use_thinking = agent_params['use_thinking']
+		flash_mode = agent_params['flash_mode']
+		vision_detail_level = agent_params['vision_detail_level']
+		llm_timeout = agent_params['llm_timeout']
+		step_timeout = agent_params['step_timeout']
+		enable_planning = agent_params['enable_planning']
+
+		# Create LLM from profile if not provided
+		if llm is None and effective is not None and effective.has_llm_config():
+			from browser_use.profiles.manager import get_profile_manager
+
+			llm = get_profile_manager().create_llm_from_effective(effective)
+
+		# Flash mode sets enable_planning=False
+		if flash_mode:
+			enable_planning = agent_params['enable_planning'] = False
 
 		# Validate llm_screenshot_size
 		if llm_screenshot_size is not None:
@@ -427,52 +497,39 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if isinstance(message_compaction, bool):
 			message_compaction = MessageCompactionSettings(enabled=message_compaction)
 
-		# Create base settings from direct parameters
-		direct_settings = AgentSettings(
-			use_vision=use_vision,
-			vision_detail_level=vision_detail_level,
-			save_conversation_path=save_conversation_path,
-			save_conversation_path_encoding=save_conversation_path_encoding,
-			max_failures=max_failures,
-			override_system_message=override_system_message,
-			extend_system_message=extend_system_message,
-			generate_gif=generate_gif,
-			include_attributes=include_attributes,
-			max_actions_per_step=max_actions_per_step,
-			use_thinking=use_thinking,
-			flash_mode=flash_mode,
-			max_history_items=max_history_items,
-			page_extraction_llm=page_extraction_llm,
-			calculate_cost=calculate_cost,
-			include_tool_call_examples=include_tool_call_examples,
-			llm_timeout=llm_timeout,
-			step_timeout=step_timeout,
-			final_response_after_failure=final_response_after_failure,
-			use_judge=use_judge,
-			ground_truth=ground_truth,
-			enable_planning=enable_planning,
-			planning_replan_on_stall=planning_replan_on_stall,
-			planning_exploration_limit=planning_exploration_limit,
-			loop_detection_window=loop_detection_window,
-			loop_detection_enabled=loop_detection_enabled,
-			message_compaction=message_compaction,
-			max_clickable_elements_length=max_clickable_elements_length,
+		# Create AgentSettings from resolved agent_params (already has proper precedence)
+		# agent_params contains the final value for every setting after applying
+		# code defaults → profile → env → explicit params
+		self.settings = AgentSettings(
+			use_vision=agent_params['use_vision'],
+			vision_detail_level=agent_params['vision_detail_level'],
+			save_conversation_path=agent_params['save_conversation_path'],
+			save_conversation_path_encoding=agent_params['save_conversation_path_encoding'],
+			max_failures=agent_params['max_failures'],
+			override_system_message=agent_params['override_system_message'],
+			extend_system_message=agent_params['extend_system_message'],
+			generate_gif=agent_params['generate_gif'],
+			include_attributes=agent_params['include_attributes'],
+			max_actions_per_step=agent_params['max_actions_per_step'],
+			use_thinking=agent_params['use_thinking'],
+			flash_mode=agent_params['flash_mode'],
+			max_history_items=agent_params['max_history_items'],
+			page_extraction_llm=agent_params['page_extraction_llm'],
+			calculate_cost=agent_params['calculate_cost'],
+			include_tool_call_examples=agent_params['include_tool_call_examples'],
+			llm_timeout=agent_params['llm_timeout'],
+			step_timeout=agent_params['step_timeout'],
+			final_response_after_failure=agent_params['final_response_after_failure'],
+			use_judge=agent_params['use_judge'],
+			ground_truth=agent_params['ground_truth'],
+			enable_planning=agent_params['enable_planning'],
+			planning_replan_on_stall=agent_params['planning_replan_on_stall'],
+			planning_exploration_limit=agent_params['planning_exploration_limit'],
+			loop_detection_window=agent_params['loop_detection_window'],
+			loop_detection_enabled=agent_params['loop_detection_enabled'],
+			message_compaction=message_compaction if message_compaction is not _UNSET else _default_settings.message_compaction,
+			max_clickable_elements_length=agent_params['max_clickable_elements_length'],
 		)
-
-		# Merge profile settings with priority: code defaults < profile < direct params
-		if profile_agent_settings:
-			default_settings = AgentSettings()
-			default_dict = default_settings.model_dump()
-			direct_dict = direct_settings.model_dump()
-			merged_dict = direct_dict.copy()
-
-			for key, profile_value in profile_agent_settings.items():
-				if key in direct_dict and direct_dict[key] == default_dict.get(key):
-					merged_dict[key] = profile_value
-
-			self.settings = AgentSettings(**merged_dict)
-		else:
-			self.settings = direct_settings
 
 		# Token cost service
 		self.token_cost_service = TokenCost(include_cost=calculate_cost, pricing_url=pricing_url)

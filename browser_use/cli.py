@@ -340,43 +340,75 @@ def apply_profile_to_config(config: dict[str, Any], profile_name: str) -> dict[s
 	return config
 
 
-def update_config_with_click_args(config: dict[str, Any], ctx: click.Context) -> dict[str, Any]:
-	"""Update configuration with command-line arguments."""
-	# Ensure required sections exist
-	if 'model' not in config:
-		config['model'] = {}
-	if 'browser' not in config:
-		config['browser'] = {}
+def _get_cli_overrides(ctx: click.Context) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+	"""Extract browser, llm, and agent overrides from CLI arguments.
 
-	# Update configuration with command-line args if provided
+	Returns:
+	    Tuple of (browser_overrides, llm_overrides, agent_overrides)
+	"""
+	browser_overrides: dict[str, Any] = {}
+	llm_overrides: dict[str, Any] = {}
+	agent_overrides: dict[str, Any] = {}
+
+	# LLM overrides
 	if ctx.params.get('model'):
-		config['model']['name'] = ctx.params['model']
-	if ctx.params.get('headless') is not None:
-		config['browser']['headless'] = ctx.params['headless']
-	if ctx.params.get('window_width'):
-		config['browser']['window_width'] = ctx.params['window_width']
-	if ctx.params.get('window_height'):
-		config['browser']['window_height'] = ctx.params['window_height']
-	if ctx.params.get('user_data_dir'):
-		config['browser']['user_data_dir'] = ctx.params['user_data_dir']
-	if ctx.params.get('profile_directory'):
-		config['browser']['profile_directory'] = ctx.params['profile_directory']
-	if ctx.params.get('cdp_url'):
-		config['browser']['cdp_url'] = ctx.params['cdp_url']
+		llm_overrides['model'] = ctx.params['model']
 
-	# Consolidated proxy dict
+	# Browser overrides
+	if ctx.params.get('headless') is not None:
+		browser_overrides['headless'] = ctx.params['headless']
+	if ctx.params.get('window_width') or ctx.params.get('window_height'):
+		window_size = {}
+		if ctx.params.get('window_width'):
+			window_size['width'] = ctx.params['window_width']
+		if ctx.params.get('window_height'):
+			window_size['height'] = ctx.params['window_height']
+		browser_overrides['window_size'] = window_size
+	if ctx.params.get('user_data_dir'):
+		browser_overrides['user_data_dir'] = ctx.params['user_data_dir']
+	if ctx.params.get('profile_directory'):
+		browser_overrides['profile_directory'] = ctx.params['profile_directory']
+	if ctx.params.get('cdp_url'):
+		browser_overrides['cdp_url'] = ctx.params['cdp_url']
+
+	# Proxy overrides
 	proxy: dict[str, str] = {}
 	if ctx.params.get('proxy_url'):
 		proxy['server'] = ctx.params['proxy_url']
 	if ctx.params.get('no_proxy'):
-		# Store as comma-separated list string to match Chrome flag
 		proxy['bypass'] = ','.join([p.strip() for p in ctx.params['no_proxy'].split(',') if p.strip()])
 	if ctx.params.get('proxy_username'):
 		proxy['username'] = ctx.params['proxy_username']
 	if ctx.params.get('proxy_password'):
 		proxy['password'] = ctx.params['proxy_password']
 	if proxy:
-		config['browser']['proxy'] = proxy
+		browser_overrides['proxy'] = proxy
+
+	return browser_overrides, llm_overrides, agent_overrides
+
+
+def update_config_with_click_args(config: dict[str, Any], ctx: click.Context) -> dict[str, Any]:
+	"""Update configuration with command-line arguments.
+
+	Deprecated: Use _get_cli_overrides + build_effective_config instead.
+	Kept for backwards compatibility with the TUI config dict.
+	"""
+	# Ensure required sections exist
+	if 'model' not in config:
+		config['model'] = {}
+	if 'browser' not in config:
+		config['browser'] = {}
+
+	browser_overrides, llm_overrides, _ = _get_cli_overrides(ctx)
+
+	# Apply LLM overrides
+	if 'model' in llm_overrides:
+		config['model']['name'] = llm_overrides['model']
+
+	# Apply browser overrides
+	for key, value in browser_overrides.items():
+		if value is not None:
+			config['browser'][key] = value
 
 	return config
 
@@ -1544,18 +1576,28 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 	error_msg = None
 
 	try:
-		# Load config
-		config = load_user_config()
+		from browser_use.profiles.manager import build_effective_config, get_profile_manager
 
-		# Apply profile if specified
-		if ctx.params.get('profile'):
-			config = apply_profile_to_config(config, ctx.params['profile'])
+		# Build effective config from profile + CLI overrides
+		browser_overrides, llm_overrides, agent_overrides = _get_cli_overrides(ctx)
 
-		# Apply CLI arguments (override profile settings)
-		config = update_config_with_click_args(config, ctx)
+		# Ensure user_data_dir is set for CLI
+		if 'user_data_dir' not in browser_overrides:
+			browser_overrides['user_data_dir'] = str(USER_DATA_DIR)
 
-		# Get LLM
-		llm = get_llm(config)
+		effective = build_effective_config(
+			profile_name=ctx.params.get('profile'),
+			browser_overrides=browser_overrides,
+			llm_overrides=llm_overrides,
+			agent_overrides=agent_overrides,
+			source='cli',
+		)
+
+		# Log effective profile info
+		get_profile_manager().log_effective_profile_info(effective)
+
+		# Create LLM from effective config
+		llm = get_profile_manager().create_llm_from_effective(effective)
 
 		# Capture telemetry for CLI start in oneshot mode
 		telemetry.capture(
@@ -1568,26 +1610,20 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 			)
 		)
 
-		# Get agent settings from config
-		agent_settings = AgentSettings.model_validate(config.get('agent', {}))
-
-		# Create browser session with config parameters
-		browser_config = config.get('browser', {})
-		# Remove None values from browser_config
-		browser_config = {k: v for k, v in browser_config.items() if v is not None}
-		# Create BrowserProfile with user_data_dir
-		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
+		# Create browser session from effective config
+		browser_profile = get_profile_manager().create_browser_profile_from_effective(effective)
 		browser_session = BrowserSession(
-			browser_profile=profile,
+			browser_profile=browser_profile,
 		)
 
-		# Create and run agent
+		# Create and run agent with agent settings from effective config
 		agent = Agent(
 			task=prompt,
 			llm=llm,
 			browser_session=browser_session,
 			source='cli',
-			**agent_settings.model_dump(),
+			profile=ctx.params.get('profile'),
+			**effective.agent,
 		)
 
 		await agent.run()
@@ -1674,27 +1710,33 @@ async def textual_interface(config: dict[str, Any]):
 
 	logger.debug('Setting up Browser, Controller, and LLM...')
 
-	# Step 1: Initialize BrowserSession with config
+	# Step 1: Initialize BrowserSession with effective config
 	logger.debug('Initializing BrowserSession...')
 	try:
-		# Get browser config from the config dict
-		browser_config = config.get('browser', {})
+		from browser_use.profiles.manager import get_profile_manager
+
+		manager = get_profile_manager()
+
+		# Use effective config if available, otherwise fall back to config dict
+		effective = config.get('effective_config')
+		if effective is not None:
+			browser_profile = manager.create_browser_profile_from_effective(effective)
+		else:
+			# Fallback to old method
+			browser_config = config.get('browser', {})
+			browser_config = {k: v for k, v in browser_config.items() if v is not None}
+			browser_profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
 
 		logger.info('Browser type: chromium')  # BrowserSession only supports chromium
-		if browser_config.get('executable_path'):
-			logger.info(f'Browser binary: {browser_config["executable_path"]}')
-		if browser_config.get('headless'):
+		if browser_profile.executable_path:
+			logger.info(f'Browser binary: {browser_profile.executable_path}')
+		if browser_profile.headless:
 			logger.info('Browser mode: headless')
 		else:
 			logger.info('Browser mode: visible')
 
-		# Create BrowserSession directly with config parameters
-		# Remove None values from browser_config
-		browser_config = {k: v for k, v in browser_config.items() if v is not None}
-		# Create BrowserProfile with user_data_dir
-		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
 		browser_session = BrowserSession(
-			browser_profile=profile,
+			browser_profile=browser_profile,
 		)
 		logger.debug('BrowserSession initialized successfully')
 
@@ -1721,12 +1763,22 @@ async def textual_interface(config: dict[str, Any]):
 		logger.error(f'Error initializing Controller: {str(e)}', exc_info=True)
 		raise RuntimeError(f'Failed to initialize Controller: {str(e)}')
 
-	# Step 4: Get LLM
+	# Step 4: Get LLM from effective config
 	logger.debug('Getting LLM...')
 	try:
-		# Ensure setup_logging is not called when importing modules
-		os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
-		llm = get_llm(config)
+		from browser_use.profiles.manager import get_profile_manager
+
+		manager = get_profile_manager()
+
+		# Use effective config if available, otherwise fall back to old method
+		effective = config.get('effective_config')
+		if effective is not None:
+			llm = manager.create_llm_from_effective(effective)
+		else:
+			# Fallback to old method
+			os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
+			llm = get_llm(config)
+
 		# Log LLM details
 		model_name = getattr(llm, 'model_name', None) or getattr(llm, 'model', 'Unknown model')
 		provider = llm.__class__.__name__
@@ -2145,26 +2197,50 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 		print(f'Error loading configuration: {str(e)}')
 		sys.exit(1)
 
-	# Apply profile if specified
-	if kwargs.get('profile'):
-		logger.debug(f'Applying profile: {kwargs["profile"]}')
-		try:
-			config = apply_profile_to_config(config, kwargs['profile'])
-			logger.debug('Profile applied successfully')
-		except Exception as e:
-			logger.error(f'Error applying profile: {str(e)}', exc_info=True)
-			print(f'Error applying profile: {str(e)}')
-			sys.exit(1)
+	# Build effective config from profile + CLI overrides
+	from browser_use.profiles.manager import build_effective_config, get_profile_manager
 
-	# Update config with command-line arguments
-	logger.debug('Updating configuration with command line arguments...')
-	try:
-		config = update_config_with_click_args(config, ctx)
-		logger.debug('Configuration updated')
-	except Exception as e:
-		logger.error(f'Error updating config with command line args: {str(e)}', exc_info=True)
-		print(f'Error updating configuration: {str(e)}')
-		sys.exit(1)
+	browser_overrides, llm_overrides, agent_overrides = _get_cli_overrides(ctx)
+
+	# Ensure user_data_dir is set for CLI
+	if 'user_data_dir' not in browser_overrides:
+		browser_overrides['user_data_dir'] = str(USER_DATA_DIR)
+
+	effective = build_effective_config(
+		profile_name=kwargs.get('profile'),
+		browser_overrides=browser_overrides,
+		llm_overrides=llm_overrides,
+		agent_overrides=agent_overrides,
+		source='cli',
+	)
+
+	# Log effective profile info
+	get_profile_manager().log_effective_profile_info(effective)
+
+	# Sync effective config back to config dict for UI display and backwards compatibility
+	if 'model' not in config:
+		config['model'] = {}
+	if 'browser' not in config:
+		config['browser'] = {}
+
+	# Sync LLM config
+	if effective.llm.model:
+		config['model']['name'] = effective.llm.model
+	if effective.llm.temperature is not None:
+		config['model']['temperature'] = effective.llm.temperature
+
+	# Sync browser config
+	for key, value in effective.browser.items():
+		if value is not None:
+			config['browser'][key] = value
+
+	# Sync agent config
+	if effective.agent:
+		config['agent'] = effective.agent
+
+	# Store profile name for reference
+	config['profile_name'] = effective.profile_name
+	config['effective_config'] = effective
 
 	# Save updated config
 	logger.debug('Saving user configuration...')

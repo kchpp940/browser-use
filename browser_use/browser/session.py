@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 import re
 import time
 from functools import cached_property
@@ -316,17 +317,24 @@ class BrowserSession(BaseModel):
 		max_iframes: int | None = None,
 		max_iframe_depth: int | None = None,
 	):
-		# Load profile preset if specified
-		profile_browser_dict: dict[str, Any] = {}
-		profile_logger = logging.getLogger('browser_use')
-		if profile is not None:
+		# ── Step 1: Build effective config from profile preset + environment ──
+		# Priority so far (lowest to highest): profile preset → env vars
+		effective = None
+		if profile is not None or os.environ.get('BROWSER_USE_PROFILE'):
+			from browser_use.profiles.manager import build_effective_config
+
+			effective = build_effective_config(
+				profile_name=profile,
+				source='api',
+			)
+			# Log the profile info (will add more about overrides later if needed)
 			from browser_use.profiles.manager import get_profile_manager
 
-			manager = get_profile_manager()
-			resolved_profile = manager.get_profile(profile)
-			profile_browser_dict = resolved_profile.browser
-			manager.log_profile_info(resolved_profile)
+			get_profile_manager().log_effective_profile_info(effective)
 
+		profile_browser_dict: dict[str, Any] = effective.browser if effective is not None else {}
+
+		# ── Step 2: Collect direct kwargs (explicit API parameters) ──
 		# Following the same pattern as AgentSettings in service.py
 		# Only pass non-None values to avoid validation errors
 		# Also filter _UNSET sentinel values (used for proxy params)
@@ -338,8 +346,8 @@ class BrowserSession(BaseModel):
 				'self',
 				'browser_profile',
 				'profile',
+				'effective',
 				'profile_browser_dict',
-				'profile_logger',
 				'id',
 				'cloud_profile_id',
 				'cloud_proxy_country_code',
@@ -395,8 +403,12 @@ class BrowserSession(BaseModel):
 		if not cdp_url and not use_cloud:
 			profile_kwargs['is_local'] = True
 
-		# Create browser profile from profile preset, browser_profile param, and direct parameters
-		# Priority (lowest to highest): profile preset → browser_profile param → direct kwargs
+		# ── Step 3: Merge all layers ──
+		# Priority (lowest to highest):
+		#   1. Profile preset (from profiles.json)
+		#   2. Environment variables
+		#   3. browser_profile param
+		#   4. Direct kwargs
 		merged_kwargs = profile_browser_dict.copy()
 
 		if browser_profile is not None:

@@ -63,7 +63,7 @@ if TYPE_CHECKING:
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
 	from browser_use.llm.vercel.chat import ChatVercel
-	from browser_use.profiles import ProfileManager, ResolvedProfile, load_profile, list_profiles
+	from browser_use.profiles import EffectiveProfileConfig, ProfileManager, ResolvedProfile, build_effective_config, list_profiles, load_profile
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
 
@@ -103,8 +103,10 @@ _LAZY_IMPORTS = {
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
 	# Profile presets
 	'ProfileManager': ('browser_use.profiles.manager', 'ProfileManager'),
+	'EffectiveProfileConfig': ('browser_use.profiles.models', 'EffectiveProfileConfig'),
 	'ResolvedProfile': ('browser_use.profiles.models', 'ResolvedProfile'),
 	'load_profile': ('browser_use.profiles.manager', 'load_profile'),
+	'build_effective_config': ('browser_use.profiles.manager', 'build_effective_config'),
 	'list_profiles': ('browser_use.profiles.manager', 'list_profiles'),
 	'resolve_profile': ('browser_use.profiles.manager', 'resolve_profile'),
 }
@@ -163,8 +165,10 @@ __all__ = [
 	'sandbox',
 	# Profile presets
 	'ProfileManager',
+	'EffectiveProfileConfig',
 	'ResolvedProfile',
 	'load_profile',
+	'build_effective_config',
 	'list_profiles',
 	'resolve_profile',
 ]

@@ -791,3 +791,42 @@ def resolve_profile(name: str, profiles_file: Path | str | None = None) -> Resol
 	"""
 	manager = get_profile_manager(profiles_file=profiles_file)
 	return manager.resolve_profile(name)
+
+
+def build_effective_config(
+	profile_name: str | None = None,
+	*,
+	browser_overrides: dict[str, Any] | None = None,
+	llm_overrides: dict[str, Any] | None = None,
+	agent_overrides: dict[str, Any] | None = None,
+	source: str = 'api',
+	profiles_file: Path | str | None = None,
+) -> EffectiveProfileConfig:
+	"""Build the final effective profile configuration.
+
+	Applies overrides in order of priority (lowest to highest):
+	1. Profile preset (from profiles.json)
+	2. Environment variables
+	3. Explicit CLI/API parameters
+
+	This is the main entry point for all entry points to get unified config.
+
+	Args:
+	    profile_name: Name of the profile to load, or None for default.
+	    browser_overrides: Browser settings from explicit parameters.
+	    llm_overrides: LLM settings from explicit parameters.
+	    agent_overrides: Agent settings from explicit parameters.
+	    source: Source identifier for the config (e.g., "api", "cli", "sandbox", "skill_cli").
+	    profiles_file: Optional path to profiles file.
+
+	Returns:
+	    EffectiveProfileConfig with all overrides applied.
+	"""
+	manager = get_profile_manager(profiles_file=profiles_file)
+	return manager.build_effective_config(
+		profile_name=profile_name,
+		browser_overrides=browser_overrides,
+		llm_overrides=llm_overrides,
+		agent_overrides=agent_overrides,
+		source=source,
+	)
