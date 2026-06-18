@@ -332,14 +332,28 @@ class ChatOCIRaw(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T],
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
+	) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the OCI GenAI model with the given messages using raw API.
@@ -363,41 +377,30 @@ class ChatOCIRaw(BaseChatModel):
 					usage=usage,
 				)
 			else:
-				# Structured output — use capabilities-driven strategy chain
-				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-				last_error: Exception | None = None
+				# Structured output — resolve strategy
+				if structured_output_method is None:
+					strategy_chain = self.capabilities.get_structured_output_strategy_chain()
+					strategy = strategy_chain[0]
+				else:
+					strategy = structured_output_method
 
-				for strategy in strategy_chain:
-					try:
-						if strategy == StructuredOutputMethod.PROMPT_TEXT:
-							modified_messages = [m.model_copy(deep=True) for m in messages]
-							if modified_messages and isinstance(modified_messages[-1].content, str):
-								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+				if strategy == StructuredOutputMethod.PROMPT_TEXT:
+					modified_messages = [m.model_copy(deep=True) for m in messages]
+					if modified_messages and isinstance(modified_messages[-1].content, str):
+						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
 
-							response = await self._make_request(modified_messages)
-							response_text = self._extract_content(response)
-							parsed = parse_structured_output_from_text(response_text, output_format)
-							if parsed is not None:
-								usage = self._extract_usage(response)
-								return ChatInvokeCompletion(
-									completion=parsed,
-									usage=usage,
-								)
-							raise ValueError(f'Failed to parse JSON from text: {response_text[:200]}')
-
-						elif strategy in (StructuredOutputMethod.JSON_SCHEMA, StructuredOutputMethod.TOOL_CALLING):
-							continue
-
-					except Exception as e:
-						last_error = e
-						continue
-
-				if last_error is not None:
-					raise ModelProviderError(
-						message=f'All structured output strategies failed. Last error: {last_error}',
-						model=self.name,
-					) from last_error
-				raise ModelProviderError('No valid structured output strategy for OCI Raw', model=self.name)
+					response = await self._make_request(modified_messages)
+					response_text = self._extract_content(response)
+					parsed = parse_structured_output_from_text(response_text, output_format)
+					if parsed is not None:
+						usage = self._extract_usage(response)
+						return ChatInvokeCompletion(
+							completion=parsed,
+							usage=usage,
+						)
+					raise ValueError(f'Failed to parse JSON from text: {response_text[:200]}')
+				else:
+					raise ValueError(f'Unsupported structured output strategy: {strategy}')
 
 		except ModelRateLimitError:
 			# Re-raise rate limit errors as-is

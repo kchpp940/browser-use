@@ -80,6 +80,7 @@ class ChatDeepSeek(BaseChatModel):
 		output_format: None = None,
 		tools: list[dict[str, Any]] | None = None,
 		stop: list[str] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
@@ -90,6 +91,7 @@ class ChatDeepSeek(BaseChatModel):
 		output_format: type[T],
 		tools: list[dict[str, Any]] | None = None,
 		stop: list[str] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T]: ...
 
@@ -99,6 +101,7 @@ class ChatDeepSeek(BaseChatModel):
 		output_format: type[T] | None = None,
 		tools: list[dict[str, Any]] | None = None,
 		stop: list[str] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
@@ -180,97 +183,89 @@ class ChatDeepSeek(BaseChatModel):
 			except Exception as e:
 				raise ModelProviderError(str(e), model=self.name) from e
 
-		# ③ Structured output with output_format — use capabilities-driven strategy chain
+		# ③ Structured output with output_format
 		if output_format is None:
 			raise ModelProviderError('No valid ainvoke execution path: output_format is None and no tools provided', model=self.name)
 		_output_format: type[T] = output_format
-		strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-		last_error: Exception | None = None
 
-		for strategy in strategy_chain:
-			try:
-				if strategy == StructuredOutputMethod.TOOL_CALLING:
-					tool_name = _output_format.__name__
-					schema = SchemaOptimizer.create_optimized_json_schema(_output_format)
-					schema.pop('title', None)
-					call_tools = [
-						{
-							'type': 'function',
-							'function': {
-								'name': tool_name,
-								'description': f'Return a JSON object of type {tool_name}',
-								'parameters': schema,
-							},
-						}
-					]
-					tool_choice = {'type': 'function', 'function': {'name': tool_name}}
-					resp = await client.chat.completions.create(  # type: ignore
-						model=self.model,
-						messages=ds_messages,  # type: ignore
-						tools=call_tools,  # type: ignore
-						tool_choice=tool_choice,  # type: ignore
-						**common,
-					)
-					msg = resp.choices[0].message
-					if not msg.tool_calls:
-						raise ValueError('Expected tool_calls in response but got none')
-					raw_args = msg.tool_calls[0].function.arguments
-					if isinstance(raw_args, str):
-						parsed = json.loads(raw_args)
-					else:
-						parsed = raw_args
-					return ChatInvokeCompletion(
-						completion=_output_format.model_validate(parsed),
-						usage=None,
-					)
+		if structured_output_method is None:
+			strategy = self.capabilities.get_structured_output_strategy_chain()[0]
+		else:
+			strategy = structured_output_method
 
-				elif strategy == StructuredOutputMethod.JSON_SCHEMA:
-					resp = await client.chat.completions.create(  # type: ignore
-						model=self.model,
-						messages=ds_messages,  # type: ignore
-						response_format={'type': 'json_object'},
-						**common,
-					)
-					content = resp.choices[0].message.content
-					if not content:
-						raise ModelProviderError('Empty JSON content in DeepSeek response', model=self.name)
-					parsed = parse_structured_output_from_text(content, _output_format)
-					if parsed is not None:
-						return ChatInvokeCompletion(
-							completion=parsed,
-							usage=None,
-						)
-					raise ValueError(f'Failed to parse JSON schema response: {content[:200]}')
+		if strategy == StructuredOutputMethod.TOOL_CALLING:
+			tool_name = _output_format.__name__
+			schema = SchemaOptimizer.create_optimized_json_schema(_output_format)
+			schema.pop('title', None)
+			call_tools = [
+				{
+					'type': 'function',
+					'function': {
+						'name': tool_name,
+						'description': f'Return a JSON object of type {tool_name}',
+						'parameters': schema,
+					},
+				}
+			]
+			tool_choice = {'type': 'function', 'function': {'name': tool_name}}
+			resp = await client.chat.completions.create(  # type: ignore
+				model=self.model,
+				messages=ds_messages,  # type: ignore
+				tools=call_tools,  # type: ignore
+				tool_choice=tool_choice,  # type: ignore
+				**common,
+			)
+			msg = resp.choices[0].message
+			if not msg.tool_calls:
+				raise ValueError('Expected tool_calls in response but got none')
+			raw_args = msg.tool_calls[0].function.arguments
+			if isinstance(raw_args, str):
+				parsed = json.loads(raw_args)
+			else:
+				parsed = raw_args
+			return ChatInvokeCompletion(
+				completion=_output_format.model_validate(parsed),
+				usage=None,
+			)
 
-				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-					modified_messages = [m.model_copy(deep=True) for m in messages]
-					if modified_messages and isinstance(modified_messages[-1].content, str):
-						modified_messages[-1].content += build_prompt_text_schema_instruction(_output_format)
-					fallback_ds_messages = DeepSeekMessageSerializer.serialize_messages(modified_messages)
-					resp = await client.chat.completions.create(  # type: ignore
-						model=self.model,
-						messages=fallback_ds_messages,  # type: ignore
-						**common,
-					)
-					content = resp.choices[0].message.content
-					if not content:
-						raise ValueError('Empty response in prompt text fallback')
-					parsed = parse_structured_output_from_text(content, _output_format)
-					if parsed is not None:
-						return ChatInvokeCompletion(
-							completion=parsed,
-							usage=None,
-						)
-					raise ValueError(f'Failed to parse prompt text fallback: {content[:200]}')
+		elif strategy == StructuredOutputMethod.JSON_SCHEMA:
+			resp = await client.chat.completions.create(  # type: ignore
+				model=self.model,
+				messages=ds_messages,  # type: ignore
+				response_format={'type': 'json_object'},
+				**common,
+			)
+			content = resp.choices[0].message.content
+			if not content:
+				raise ModelProviderError('Empty JSON content in DeepSeek response', model=self.name)
+			parsed = parse_structured_output_from_text(content, _output_format)
+			if parsed is not None:
+				return ChatInvokeCompletion(
+					completion=parsed,
+					usage=None,
+				)
+			raise ValueError(f'Failed to parse JSON schema response: {content[:200]}')
 
-			except Exception as e:
-				last_error = e
-				logger.debug(f'DeepSeek structured output strategy {strategy} failed: {e}')
-				continue
+		elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+			modified_messages = [m.model_copy(deep=True) for m in messages]
+			if modified_messages and isinstance(modified_messages[-1].content, str):
+				modified_messages[-1].content += build_prompt_text_schema_instruction(_output_format)
+			fallback_ds_messages = DeepSeekMessageSerializer.serialize_messages(modified_messages)
+			resp = await client.chat.completions.create(  # type: ignore
+				model=self.model,
+				messages=fallback_ds_messages,  # type: ignore
+				**common,
+			)
+			content = resp.choices[0].message.content
+			if not content:
+				raise ValueError('Empty response in prompt text fallback')
+			parsed = parse_structured_output_from_text(content, _output_format)
+			if parsed is not None:
+				return ChatInvokeCompletion(
+					completion=parsed,
+					usage=None,
+				)
+			raise ValueError(f'Failed to parse prompt text fallback: {content[:200]}')
 
-		if last_error is not None:
-			raise ModelProviderError(
-				message=f'All structured output strategies failed. Last error: {last_error}',
-				model=self.name,
-			) from last_error
-		raise ModelProviderError('No valid ainvoke execution path for DeepSeek LLM', model=self.name)
+		else:
+			raise ValueError(f'Unsupported structured output strategy: {strategy}')

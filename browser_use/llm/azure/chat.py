@@ -178,7 +178,11 @@ class ChatAzureOpenAI(ChatOpenAILike):
 		return model_params
 
 	async def _ainvoke_responses_api(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the model using the Responses API.
@@ -203,88 +207,79 @@ class ChatAzureOpenAI(ChatOpenAILike):
 				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
 				if self.dont_force_structured_output:
 					strategy_chain = [s for s in strategy_chain if s != StructuredOutputMethod.JSON_SCHEMA]
-				last_error: Exception | None = None
 
-				for strategy in strategy_chain:
-					try:
-						if strategy == StructuredOutputMethod.JSON_SCHEMA:
-							json_schema = SchemaOptimizer.create_optimized_json_schema(
-								output_format,
-								remove_min_items=self.remove_min_items_from_schema,
-								remove_defaults=self.remove_defaults_from_schema,
-							)
-							input_messages = [m.copy() for m in base_input_messages]
-							model_params = self._build_responses_base_params(input_messages)
-							model_params['text'] = {
-								'format': {
-									'type': 'json_schema',
-									'name': output_format.__name__,
-									'strict': True,
-									'schema': json_schema,
-								}
-							}
-							if self.add_schema_to_system_prompt and input_messages and input_messages[0].get('role') == 'system':
-								schema_text = f'\n<json_schema>\n{json_schema}\n</json_schema>'
-								content = input_messages[0].get('content', '')
-								if isinstance(content, str):
-									input_messages[0]['content'] = content + schema_text
-								elif isinstance(content, list):
-									input_messages[0]['content'] = list(content) + [{'type': 'input_text', 'text': schema_text}]
-								model_params['input'] = input_messages
+				if structured_output_method is None:
+					strategy = strategy_chain[0]
+				else:
+					strategy = structured_output_method
 
-							response = await self.get_client().responses.create(**model_params)
-							if not response.output_text:
-								raise ValueError('Empty output_text for JSON_SCHEMA strategy')
-							usage = self._get_usage_from_responses(response)
-							parsed = output_format.model_validate_json(response.output_text)
-							return ChatInvokeCompletion(
-								completion=parsed,
-								usage=usage,
-								stop_reason=response.status if response.status else None,
-							)
+				if strategy == StructuredOutputMethod.JSON_SCHEMA:
+					json_schema = SchemaOptimizer.create_optimized_json_schema(
+						output_format,
+						remove_min_items=self.remove_min_items_from_schema,
+						remove_defaults=self.remove_defaults_from_schema,
+					)
+					input_messages = [m.copy() for m in base_input_messages]
+					model_params = self._build_responses_base_params(input_messages)
+					model_params['text'] = {
+						'format': {
+							'type': 'json_schema',
+							'name': output_format.__name__,
+							'strict': True,
+							'schema': json_schema,
+						}
+					}
+					if self.add_schema_to_system_prompt and input_messages and input_messages[0].get('role') == 'system':
+						schema_text = f'\n<json_schema>\n{json_schema}\n</json_schema>'
+						content = input_messages[0].get('content', '')
+						if isinstance(content, str):
+							input_messages[0]['content'] = content + schema_text
+						elif isinstance(content, list):
+							input_messages[0]['content'] = list(content) + [{'type': 'input_text', 'text': schema_text}]
+						model_params['input'] = input_messages
 
-						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-							modified_messages = [m.model_copy(deep=True) for m in messages]
-							instruction_added = False
-							if modified_messages and isinstance(modified_messages[-1].content, str):
-								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-								instruction_added = True
-							elif modified_messages and isinstance(modified_messages[-1].content, list):
-								modified_messages[-1].content.append(
-									ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
-								)
-								instruction_added = True
-							if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
-								modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
+					response = await self.get_client().responses.create(**model_params)
+					if not response.output_text:
+						raise ValueError('Empty output_text for JSON_SCHEMA strategy')
+					usage = self._get_usage_from_responses(response)
+					parsed = output_format.model_validate_json(response.output_text)
+					return ChatInvokeCompletion(
+						completion=parsed,
+						usage=usage,
+						stop_reason=response.status if response.status else None,
+					)
 
-							fallback_input_messages = ResponsesAPIMessageSerializer.serialize_messages(modified_messages)
-							model_params = self._build_responses_base_params(fallback_input_messages)
-							response = await self.get_client().responses.create(**model_params)
-							if not response.output_text:
-								raise ValueError('Empty output_text for PROMPT_TEXT strategy')
-							usage = self._get_usage_from_responses(response)
-							parsed = parse_structured_output_from_text(response.output_text, output_format)
-							if parsed is not None:
-								return ChatInvokeCompletion(
-									completion=parsed,
-									usage=usage,
-									stop_reason=response.status if response.status else None,
-								)
-							raise ValueError('Failed to parse structured output from prompt text response')
+				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+					modified_messages = [m.model_copy(deep=True) for m in messages]
+					instruction_added = False
+					if modified_messages and isinstance(modified_messages[-1].content, str):
+						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+						instruction_added = True
+					elif modified_messages and isinstance(modified_messages[-1].content, list):
+						modified_messages[-1].content.append(
+							ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
+						)
+						instruction_added = True
+					if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
+						modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
 
-					except Exception as e:
-						last_error = e
-						continue
+					fallback_input_messages = ResponsesAPIMessageSerializer.serialize_messages(modified_messages)
+					model_params = self._build_responses_base_params(fallback_input_messages)
+					response = await self.get_client().responses.create(**model_params)
+					if not response.output_text:
+						raise ValueError('Empty output_text for PROMPT_TEXT strategy')
+					usage = self._get_usage_from_responses(response)
+					parsed = parse_structured_output_from_text(response.output_text, output_format)
+					if parsed is not None:
+						return ChatInvokeCompletion(
+							completion=parsed,
+							usage=usage,
+							stop_reason=response.status if response.status else None,
+						)
+					raise ValueError('Failed to parse structured output from prompt text response')
 
-				if last_error is not None:
-					raise ModelProviderError(
-						message=f'All structured output strategies failed. Last error: {last_error}',
-						model=self.name,
-					) from last_error
-				raise ModelProviderError(
-					message='No valid structured output strategy available for Azure Responses API',
-					model=self.name,
-				)
+				else:
+					raise ValueError(f'Unsupported structured_output_method: {strategy}')
 
 		except RateLimitError as e:
 			raise ModelRateLimitError(message=e.message, model=self.name) from e
@@ -300,14 +295,28 @@ class ChatAzureOpenAI(ChatOpenAILike):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T],
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
+	) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the model with the given messages.
@@ -318,12 +327,17 @@ class ChatAzureOpenAI(ChatOpenAILike):
 		Args:
 			messages: List of chat messages
 			output_format: Optional Pydantic model class for structured output
+			structured_output_method: Specific structured output strategy to use.
+				If None, uses the provider's primary strategy from capabilities.
 
 		Returns:
 			Either a string response or an instance of output_format
 		"""
 		if self._should_use_responses_api():
-			return await self._ainvoke_responses_api(messages, output_format, **kwargs)
+			return await self._ainvoke_responses_api(
+				messages, output_format, structured_output_method=structured_output_method, **kwargs
+			)
 		else:
-			# Use the parent class implementation (Chat Completions API)
-			return await super().ainvoke(messages, output_format, **kwargs)
+			return await super().ainvoke(
+				messages, output_format, structured_output_method=structured_output_method, **kwargs
+			)

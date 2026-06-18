@@ -123,6 +123,7 @@ class ChatLiteLLM(BaseChatModel):
 		self,
 		messages: list[BaseMessage],
 		output_format: None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
@@ -131,6 +132,7 @@ class ChatLiteLLM(BaseChatModel):
 		self,
 		messages: list[BaseMessage],
 		output_format: type[T],
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T]: ...
 
@@ -156,6 +158,7 @@ class ChatLiteLLM(BaseChatModel):
 		self,
 		messages: list[BaseMessage],
 		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		from litellm import acompletion  # type: ignore[reportMissingImports]
@@ -194,131 +197,117 @@ class ChatLiteLLM(BaseChatModel):
 
 			else:
 				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-				last_error: Exception | None = None
+				strategy = structured_output_method if structured_output_method is not None else strategy_chain[0]
 
-				for strategy in strategy_chain:
-					try:
-						if strategy == StructuredOutputMethod.JSON_SCHEMA:
-							schema = SchemaOptimizer.create_optimized_json_schema(output_format)
-							params = self._build_base_params(base_litellm_messages)
-							params['response_format'] = {
-								'type': 'json_schema',
-								'json_schema': {
-									'name': output_format.__name__,
-									'strict': True,
-									'schema': schema,
-								},
-							}
-							raw_response = await acompletion(**params)
-							assert isinstance(raw_response, ModelResponse)
-							choice = raw_response.choices[0] if raw_response.choices else None
-							if choice is None or not (choice.message.content or ''):
-								raise ValueError('Empty response for JSON_SCHEMA strategy')
-							content = choice.message.content or ''
-							usage = self._parse_usage(raw_response)
-							stop_reason = choice.finish_reason
-							thinking: str | None = None
-							reasoning = getattr(choice.message, 'reasoning_content', None)
-							if reasoning:
-								thinking = str(reasoning)
-							parsed = output_format.model_validate_json(content)
-							return ChatInvokeCompletion(
-								completion=parsed,
-								thinking=thinking,
-								usage=usage,
-								stop_reason=stop_reason,
-							)
+				if strategy == StructuredOutputMethod.JSON_SCHEMA:
+					schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+					params = self._build_base_params(base_litellm_messages)
+					params['response_format'] = {
+						'type': 'json_schema',
+						'json_schema': {
+							'name': output_format.__name__,
+							'strict': True,
+							'schema': schema,
+						},
+					}
+					raw_response = await acompletion(**params)
+					assert isinstance(raw_response, ModelResponse)
+					choice = raw_response.choices[0] if raw_response.choices else None
+					if choice is None or not (choice.message.content or ''):
+						raise ValueError('Empty response for JSON_SCHEMA strategy')
+					content = choice.message.content or ''
+					usage = self._parse_usage(raw_response)
+					stop_reason = choice.finish_reason
+					thinking: str | None = None
+					reasoning = getattr(choice.message, 'reasoning_content', None)
+					if reasoning:
+						thinking = str(reasoning)
+					parsed = output_format.model_validate_json(content)
+					return ChatInvokeCompletion(
+						completion=parsed,
+						thinking=thinking,
+						usage=usage,
+						stop_reason=stop_reason,
+					)
 
-						elif strategy == StructuredOutputMethod.TOOL_CALLING:
-							schema = SchemaOptimizer.create_optimized_json_schema(output_format)
-							tool_spec = {
-								'type': 'function',
-								'function': {
-									'name': output_format.__name__,
-									'description': f'Extract information in the format of {output_format.__name__}',
-									'strict': True,
-									'parameters': schema,
-								},
-							}
-							params = self._build_base_params(base_litellm_messages)
-							params['tools'] = [tool_spec]
-							params['tool_choice'] = {'type': 'function', 'function': {'name': output_format.__name__}}
-							raw_response = await acompletion(**params)
-							assert isinstance(raw_response, ModelResponse)
-							choice = raw_response.choices[0] if raw_response.choices else None
-							if choice is None:
-								raise ValueError('Empty response for TOOL_CALLING strategy')
-							msg = choice.message
-							usage = self._parse_usage(raw_response)
-							stop_reason = choice.finish_reason
-							thinking: str | None = None
-							reasoning = getattr(msg, 'reasoning_content', None)
-							if reasoning:
-								thinking = str(reasoning)
-							tool_calls = getattr(msg, 'tool_calls', None)
-							if tool_calls and len(tool_calls) > 0:
-								args_str = getattr(tool_calls[0].function, 'arguments', '')
-								parsed = output_format.model_validate_json(args_str)
-								return ChatInvokeCompletion(
-									completion=parsed,
-									thinking=thinking,
-									usage=usage,
-									stop_reason=stop_reason,
-								)
-							raise ValueError('No tool calls found in response')
+				elif strategy == StructuredOutputMethod.TOOL_CALLING:
+					schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+					tool_spec = {
+						'type': 'function',
+						'function': {
+							'name': output_format.__name__,
+							'description': f'Extract information in the format of {output_format.__name__}',
+							'strict': True,
+							'parameters': schema,
+						},
+					}
+					params = self._build_base_params(base_litellm_messages)
+					params['tools'] = [tool_spec]
+					params['tool_choice'] = {'type': 'function', 'function': {'name': output_format.__name__}}
+					raw_response = await acompletion(**params)
+					assert isinstance(raw_response, ModelResponse)
+					choice = raw_response.choices[0] if raw_response.choices else None
+					if choice is None:
+						raise ValueError('Empty response for TOOL_CALLING strategy')
+					msg = choice.message
+					usage = self._parse_usage(raw_response)
+					stop_reason = choice.finish_reason
+					thinking: str | None = None
+					reasoning = getattr(msg, 'reasoning_content', None)
+					if reasoning:
+						thinking = str(reasoning)
+					tool_calls = getattr(msg, 'tool_calls', None)
+					if tool_calls and len(tool_calls) > 0:
+						args_str = getattr(tool_calls[0].function, 'arguments', '')
+						parsed = output_format.model_validate_json(args_str)
+						return ChatInvokeCompletion(
+							completion=parsed,
+							thinking=thinking,
+							usage=usage,
+							stop_reason=stop_reason,
+						)
+					raise ValueError('No tool calls found in response')
 
-						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-							modified_messages = [m.model_copy(deep=True) for m in messages]
-							instruction_added = False
-							if modified_messages and isinstance(modified_messages[-1].content, str):
-								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-								instruction_added = True
-							elif modified_messages and isinstance(modified_messages[-1].content, list):
-								modified_messages[-1].content.append(
-									ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
-								)
-								instruction_added = True
-							if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
-								modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
+				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+					modified_messages = [m.model_copy(deep=True) for m in messages]
+					instruction_added = False
+					if modified_messages and isinstance(modified_messages[-1].content, str):
+						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+						instruction_added = True
+					elif modified_messages and isinstance(modified_messages[-1].content, list):
+						modified_messages[-1].content.append(
+							ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
+						)
+						instruction_added = True
+					if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
+						modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
 
-							fallback_litellm_messages = LiteLLMMessageSerializer.serialize(modified_messages)
-							params = self._build_base_params(fallback_litellm_messages)
-							raw_response = await acompletion(**params)
-							assert isinstance(raw_response, ModelResponse)
-							choice = raw_response.choices[0] if raw_response.choices else None
-							if choice is None or not (choice.message.content or ''):
-								raise ValueError('Empty response for PROMPT_TEXT strategy')
-							content = choice.message.content or ''
-							usage = self._parse_usage(raw_response)
-							stop_reason = choice.finish_reason
-							thinking: str | None = None
-							reasoning = getattr(choice.message, 'reasoning_content', None)
-							if reasoning:
-								thinking = str(reasoning)
-							parsed = parse_structured_output_from_text(content, output_format)
-							if parsed is not None:
-								return ChatInvokeCompletion(
-									completion=parsed,
-									thinking=thinking,
-									usage=usage,
-									stop_reason=stop_reason,
-								)
-							raise ValueError('Failed to parse structured output from prompt text response')
+					fallback_litellm_messages = LiteLLMMessageSerializer.serialize(modified_messages)
+					params = self._build_base_params(fallback_litellm_messages)
+					raw_response = await acompletion(**params)
+					assert isinstance(raw_response, ModelResponse)
+					choice = raw_response.choices[0] if raw_response.choices else None
+					if choice is None or not (choice.message.content or ''):
+						raise ValueError('Empty response for PROMPT_TEXT strategy')
+					content = choice.message.content or ''
+					usage = self._parse_usage(raw_response)
+					stop_reason = choice.finish_reason
+					thinking: str | None = None
+					reasoning = getattr(choice.message, 'reasoning_content', None)
+					if reasoning:
+						thinking = str(reasoning)
+					parsed = parse_structured_output_from_text(content, output_format)
+					if parsed is not None:
+						return ChatInvokeCompletion(
+							completion=parsed,
+							thinking=thinking,
+							usage=usage,
+							stop_reason=stop_reason,
+						)
+					raise ValueError('Failed to parse structured output from prompt text response')
 
-					except Exception as e:
-						last_error = e
-						logger.debug(f'LiteLLM structured output strategy {strategy} failed: {e}')
-						continue
-
-				if last_error is not None:
-					raise ModelProviderError(
-						message=f'All structured output strategies failed. Last error: {last_error}',
-						model=self.name,
-					) from last_error
-				raise ModelProviderError(
-					message='No valid structured output strategy available for LiteLLM',
-					model=self.name,
-				)
+				else:
+					raise ValueError(f'Unsupported structured_output_method: {strategy}')
 
 		except RateLimitError as e:
 			raise ModelRateLimitError(message=str(e), model=self.name) from e

@@ -285,14 +285,28 @@ class ChatAnthropic(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T],
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
+	) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		anthropic_messages, system_prompt = AnthropicMessageSerializer.serialize_messages(messages)
 
@@ -326,153 +340,136 @@ class ChatAnthropic(BaseChatModel):
 				)
 
 			else:
-				# Use capabilities-driven strategy chain for structured output
-				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-				last_error: Exception | None = None
+				if structured_output_method is None:
+					strategy = self.capabilities.get_structured_output_strategy_chain()[0]
+				else:
+					strategy = structured_output_method
 
-				for strategy in strategy_chain:
-					try:
-						if strategy == StructuredOutputMethod.TOOL_CALLING:
-							tool_name = output_format.__name__
-							schema = SchemaOptimizer.create_optimized_json_schema(output_format)
-							if 'title' in schema:
-								del schema['title']
+				if strategy == StructuredOutputMethod.TOOL_CALLING:
+					tool_name = output_format.__name__
+					schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+					if 'title' in schema:
+						del schema['title']
 
-							tool = ToolParam(
-								name=tool_name,
-								description=f'Extract information in the format of {tool_name}',
-								input_schema=schema,
-								cache_control=CacheControlEphemeralParam(type='ephemeral'),
-							)
+					tool = ToolParam(
+						name=tool_name,
+						description=f'Extract information in the format of {tool_name}',
+						input_schema=schema,
+						cache_control=CacheControlEphemeralParam(type='ephemeral'),
+					)
 
-							if self._requires_auto_tool_choice():
-								tool_choice = {'type': 'auto'}
-							else:
-								tool_choice = ToolChoiceToolParam(type='tool', name=tool_name)
+					if self._requires_auto_tool_choice():
+						tool_choice = {'type': 'auto'}
+					else:
+						tool_choice = ToolChoiceToolParam(type='tool', name=tool_name)
 
-							response = await self._create_message(
-								model=self.model,
-								messages=anthropic_messages,
-								tools=[tool],
-								system=system_prompt or omit,
-								tool_choice=tool_choice,
-								**self._get_client_params_for_invoke(),
-							)
+					response = await self._create_message(
+						model=self.model,
+						messages=anthropic_messages,
+						tools=[tool],
+						system=system_prompt or omit,
+						tool_choice=tool_choice,
+						**self._get_client_params_for_invoke(),
+					)
 
-							if not isinstance(response, Message) and not self._is_message_like_response(response):
-								raise ModelProviderError(
-									message=f'Unexpected response type from Anthropic API: {type(response).__name__}. Response: {str(response)[:200]}',
-									status_code=502,
-									model=self.name,
-								)
+					if not isinstance(response, Message) and not self._is_message_like_response(response):
+						raise ModelProviderError(
+							message=f'Unexpected response type from Anthropic API: {type(response).__name__}. Response: {str(response)[:200]}',
+							status_code=502,
+							model=self.name,
+						)
 
-							usage = self._get_usage(response)
+					usage = self._get_usage(response)
 
-							for content_block in response.content:
-								if hasattr(content_block, 'type') and content_block.type == 'tool_use':
-									try:
-										return ChatInvokeCompletion(
-											completion=output_format.model_validate(content_block.input),
-											usage=usage,
-											stop_reason=response.stop_reason,
-											stop_details=self._get_stop_details(response),
-										)
-									except Exception as e:
-										_input = content_block.input
-										if isinstance(_input, str):
-											_input = json.loads(_input)
-										elif isinstance(_input, dict):
-											for key, value in _input.items():
-												if isinstance(value, str) and value.startswith(('[', '{')):
-													try:
-														_input[key] = json.loads(value)
-													except json.JSONDecodeError:
-														cleaned = (
-															value.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
-														)
-														try:
-															_input[key] = json.loads(cleaned)
-														except json.JSONDecodeError:
-															pass
-										else:
-											raise
-										return ChatInvokeCompletion(
-											completion=output_format.model_validate(_input),
-											usage=usage,
-											stop_reason=response.stop_reason,
-											stop_details=self._get_stop_details(response),
-										)
-
-							if self._requires_auto_tool_choice():
-								response_text, thinking, redacted_thinking = self._extract_content_blocks(response)
-								parsed = parse_structured_output_from_text(response_text, output_format)
-								if parsed is not None:
-									return ChatInvokeCompletion(
-										completion=parsed,
-										thinking=thinking,
-										redacted_thinking=redacted_thinking,
-										usage=usage,
-										stop_reason=response.stop_reason,
-										stop_details=self._get_stop_details(response),
-									)
-
-							raise ValueError('Expected tool use in response but none found')
-
-						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-							modified_messages = [m.model_copy(deep=True) for m in messages]
-							if modified_messages and isinstance(modified_messages[-1].content, str):
-								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-
-							fallback_anthropic_messages, fallback_system = AnthropicMessageSerializer.serialize_messages(
-								modified_messages
-							)
-
-							response = await self._create_message(
-								model=self.model,
-								messages=fallback_anthropic_messages,
-								system=fallback_system or omit,
-								**self._get_client_params_for_invoke(),
-							)
-
-							if not isinstance(response, Message) and not self._is_message_like_response(response):
-								raise ModelProviderError(
-									message=f'Unexpected response type from Anthropic API: {type(response).__name__}. Response: {str(response)[:200]}',
-									status_code=502,
-									model=self.name,
-								)
-
-							usage = self._get_usage(response)
-							response_text, thinking, redacted_thinking = self._extract_content_blocks(response)
-							parsed = parse_structured_output_from_text(response_text, output_format)
-							if parsed is not None:
+					for content_block in response.content:
+						if hasattr(content_block, 'type') and content_block.type == 'tool_use':
+							try:
 								return ChatInvokeCompletion(
-									completion=parsed,
-									thinking=thinking,
-									redacted_thinking=redacted_thinking,
+									completion=output_format.model_validate(content_block.input),
 									usage=usage,
 									stop_reason=response.stop_reason,
 									stop_details=self._get_stop_details(response),
 								)
-							raise ValueError('Failed to parse structured output from prompt text response')
+							except Exception as e:
+								_input = content_block.input
+								if isinstance(_input, str):
+									_input = json.loads(_input)
+								elif isinstance(_input, dict):
+									for key, value in _input.items():
+										if isinstance(value, str) and value.startswith(('[', '{')):
+											try:
+												_input[key] = json.loads(value)
+											except json.JSONDecodeError:
+												cleaned = (
+													value.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')
+												)
+												try:
+													_input[key] = json.loads(cleaned)
+												except json.JSONDecodeError:
+													pass
+								else:
+									raise
+								return ChatInvokeCompletion(
+									completion=output_format.model_validate(_input),
+									usage=usage,
+									stop_reason=response.stop_reason,
+									stop_details=self._get_stop_details(response),
+								)
 
-						elif strategy == StructuredOutputMethod.JSON_SCHEMA:
-							# Anthropic does not support native JSON schema response format
-							continue
+					if self._requires_auto_tool_choice():
+						response_text, thinking, redacted_thinking = self._extract_content_blocks(response)
+						parsed = parse_structured_output_from_text(response_text, output_format)
+						if parsed is not None:
+							return ChatInvokeCompletion(
+								completion=parsed,
+								thinking=thinking,
+								redacted_thinking=redacted_thinking,
+								usage=usage,
+								stop_reason=response.stop_reason,
+								stop_details=self._get_stop_details(response),
+							)
 
-					except Exception as e:
-						last_error = e
-						logger.debug(f'Anthropic structured output strategy {strategy} failed: {e}')
-						continue
+					raise ValueError('Expected tool use in response but none found')
 
-				if last_error is not None:
-					raise ModelProviderError(
-						message=f'All structured output strategies failed. Last error: {last_error}',
-						model=self.name,
-					) from last_error
-				raise ModelProviderError(
-					message='No valid structured output strategy available for Anthropic',
-					model=self.name,
-				)
+				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+					modified_messages = [m.model_copy(deep=True) for m in messages]
+					if modified_messages and isinstance(modified_messages[-1].content, str):
+						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+
+					fallback_anthropic_messages, fallback_system = AnthropicMessageSerializer.serialize_messages(
+						modified_messages
+					)
+
+					response = await self._create_message(
+						model=self.model,
+						messages=fallback_anthropic_messages,
+						system=fallback_system or omit,
+						**self._get_client_params_for_invoke(),
+					)
+
+					if not isinstance(response, Message) and not self._is_message_like_response(response):
+						raise ModelProviderError(
+							message=f'Unexpected response type from Anthropic API: {type(response).__name__}. Response: {str(response)[:200]}',
+							status_code=502,
+							model=self.name,
+						)
+
+					usage = self._get_usage(response)
+					response_text, thinking, redacted_thinking = self._extract_content_blocks(response)
+					parsed = parse_structured_output_from_text(response_text, output_format)
+					if parsed is not None:
+						return ChatInvokeCompletion(
+							completion=parsed,
+							thinking=thinking,
+							redacted_thinking=redacted_thinking,
+							usage=usage,
+							stop_reason=response.stop_reason,
+							stop_details=self._get_stop_details(response),
+						)
+					raise ValueError('Failed to parse structured output from prompt text response')
+
+				else:
+					raise ValueError(f'Unsupported structured_output_method: {strategy}')
 
 		except APIConnectionError as e:
 			raise ModelProviderError(message=e.message, model=self.name) from e

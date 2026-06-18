@@ -502,11 +502,11 @@ class ChatVercel(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+		self, messages: list[BaseMessage], output_format: None = None, structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any) -> ChatInvokeCompletion[T]: ...
 
 	def _build_model_params(self) -> dict[str, Any]:
 		model_params: dict[str, Any] = {}
@@ -543,7 +543,7 @@ class ChatVercel(BaseChatModel):
 		return model_params
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self, messages: list[BaseMessage], output_format: type[T] | None = None, structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the model with the given messages through Vercel AI Gateway.
@@ -551,6 +551,7 @@ class ChatVercel(BaseChatModel):
 		Args:
 		    messages: List of chat messages
 		    output_format: Optional Pydantic model class for structured output
+		    structured_output_method: Optional structured output method to use
 
 		Returns:
 		    Either a string response or an instance of output_format
@@ -575,99 +576,85 @@ class ChatVercel(BaseChatModel):
 
 			else:
 				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-				last_error: Exception | None = None
+				strategy = structured_output_method if structured_output_method is not None else strategy_chain[0]
 
-				for strategy in strategy_chain:
-					try:
-						if strategy == StructuredOutputMethod.JSON_SCHEMA:
-							schema = SchemaOptimizer.create_optimized_json_schema(output_format)
-							response_format_schema: JSONSchema = {
-								'name': 'agent_output',
-								'strict': True,
-								'schema': schema,
-							}
+				if strategy == StructuredOutputMethod.JSON_SCHEMA:
+					schema = SchemaOptimizer.create_optimized_json_schema(output_format)
+					response_format_schema: JSONSchema = {
+						'name': 'agent_output',
+						'strict': True,
+						'schema': schema,
+					}
 
-							response = await self.get_client().chat.completions.create(
-								model=self.model,
-								messages=vercel_messages,
-								response_format=ResponseFormatJSONSchema(
-									json_schema=response_format_schema,
-									type='json_schema',
-								),
-								**model_params,
-							)
+					response = await self.get_client().chat.completions.create(
+						model=self.model,
+						messages=vercel_messages,
+						response_format=ResponseFormatJSONSchema(
+							json_schema=response_format_schema,
+							type='json_schema',
+						),
+						**model_params,
+					)
 
-							content = response.choices[0].message.content if response.choices else None
-							if not content:
-								raise ValueError('Empty content in JSON schema response')
+					content = response.choices[0].message.content if response.choices else None
+					if not content:
+						raise ValueError('Empty content in JSON schema response')
 
-							usage = self._get_usage(response)
-							parsed = output_format.model_validate_json(content)
-							return ChatInvokeCompletion(
-								completion=parsed,
-								usage=usage,
-								stop_reason=response.choices[0].finish_reason if response.choices else None,
-							)
+					usage = self._get_usage(response)
+					parsed = output_format.model_validate_json(content)
+					return ChatInvokeCompletion(
+						completion=parsed,
+						usage=usage,
+						stop_reason=response.choices[0].finish_reason if response.choices else None,
+					)
 
-						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-							modified_messages = [m.model_copy(deep=True) for m in messages]
-							instruction_added = False
-							schema_instruction = build_prompt_text_schema_instruction(output_format)
+				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+					modified_messages = [m.model_copy(deep=True) for m in messages]
+					instruction_added = False
+					schema_instruction = build_prompt_text_schema_instruction(output_format)
 
-							if modified_messages and modified_messages[0].role == 'system':
-								if isinstance(modified_messages[0].content, str):
-									modified_messages[0].content += schema_instruction
-									instruction_added = True
-								elif isinstance(modified_messages[0].content, list):
-									modified_messages[0].content.append(ContentPartTextParam(text=schema_instruction))
-									instruction_added = True
-							elif modified_messages and modified_messages[-1].role == 'user':
-								if isinstance(modified_messages[-1].content, str):
-									modified_messages[-1].content += schema_instruction
-									instruction_added = True
-								elif isinstance(modified_messages[-1].content, list):
-									modified_messages[-1].content.append(ContentPartTextParam(text=schema_instruction))
-									instruction_added = True
+					if modified_messages and modified_messages[0].role == 'system':
+						if isinstance(modified_messages[0].content, str):
+							modified_messages[0].content += schema_instruction
+							instruction_added = True
+						elif isinstance(modified_messages[0].content, list):
+							modified_messages[0].content.append(ContentPartTextParam(text=schema_instruction))
+							instruction_added = True
+					elif modified_messages and modified_messages[-1].role == 'user':
+						if isinstance(modified_messages[-1].content, str):
+							modified_messages[-1].content += schema_instruction
+							instruction_added = True
+						elif isinstance(modified_messages[-1].content, list):
+							modified_messages[-1].content.append(ContentPartTextParam(text=schema_instruction))
+							instruction_added = True
 
-							if not instruction_added:
-								modified_messages.insert(0, SystemMessage(content=schema_instruction))
+					if not instruction_added:
+						modified_messages.insert(0, SystemMessage(content=schema_instruction))
 
-							modified_vercel_messages = VercelMessageSerializer.serialize_messages(modified_messages)
+					modified_vercel_messages = VercelMessageSerializer.serialize_messages(modified_messages)
 
-							response = await self.get_client().chat.completions.create(
-								model=self.model,
-								messages=modified_vercel_messages,
-								**model_params,
-							)
+					response = await self.get_client().chat.completions.create(
+						model=self.model,
+						messages=modified_vercel_messages,
+						**model_params,
+					)
 
-							content = response.choices[0].message.content if response.choices else None
-							if not content:
-								raise ValueError('Empty content in prompt text response')
+					content = response.choices[0].message.content if response.choices else None
+					if not content:
+						raise ValueError('Empty content in prompt text response')
 
-							usage = self._get_usage(response)
-							parsed = parse_structured_output_from_text(content, output_format)
-							if parsed is not None:
-								return ChatInvokeCompletion(
-									completion=parsed,
-									usage=usage,
-									stop_reason=response.choices[0].finish_reason if response.choices else None,
-								)
-							raise ValueError('Failed to parse structured output from prompt text response')
+					usage = self._get_usage(response)
+					parsed = parse_structured_output_from_text(content, output_format)
+					if parsed is not None:
+						return ChatInvokeCompletion(
+							completion=parsed,
+							usage=usage,
+							stop_reason=response.choices[0].finish_reason if response.choices else None,
+						)
+					raise ValueError('Failed to parse structured output from prompt text response')
 
-					except Exception as e:
-						last_error = e
-						logger.debug(f'Vercel structured output strategy {strategy} failed: {e}')
-						continue
-
-				if last_error is not None:
-					raise ModelProviderError(
-						message=f'All structured output strategies failed. Last error: {last_error}',
-						model=self.name,
-					) from last_error
-				raise ModelProviderError(
-					message='No valid structured output strategy available for Vercel',
-					model=self.name,
-				)
+				else:
+					raise ValueError(f'Unsupported structured output strategy: {strategy}')
 
 		except RateLimitError as e:
 			raise ModelRateLimitError(message=e.message, model=self.name) from e

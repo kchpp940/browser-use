@@ -213,7 +213,11 @@ class ChatOpenAI(BaseChatModel):
 		return choice
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the model with the given messages.
@@ -221,6 +225,8 @@ class ChatOpenAI(BaseChatModel):
 		Args:
 			messages: List of chat messages
 			output_format: Optional Pydantic model class for structured output
+			structured_output_method: Specific structured output strategy to use.
+				If None, uses the provider's primary strategy from capabilities.
 
 		Returns:
 			Either a string response or an instance of output_format
@@ -246,163 +252,150 @@ class ChatOpenAI(BaseChatModel):
 				)
 
 			else:
-				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-				if self.dont_force_structured_output and StructuredOutputMethod.JSON_SCHEMA in strategy_chain:
-					strategy_chain = [s for s in strategy_chain if s != StructuredOutputMethod.JSON_SCHEMA] or [
-						StructuredOutputMethod.PROMPT_TEXT
+				# Resolve which strategy to execute
+				if structured_output_method is None:
+					strategy_chain = self.capabilities.get_structured_output_strategy_chain()
+					if self.dont_force_structured_output:
+						strategy_chain = [s for s in strategy_chain if s != StructuredOutputMethod.JSON_SCHEMA] or [
+							StructuredOutputMethod.PROMPT_TEXT
+						]
+					strategy = strategy_chain[0]
+				else:
+					strategy = structured_output_method
+
+				if strategy == StructuredOutputMethod.JSON_SCHEMA:
+					response_format: JSONSchema = {
+						'name': output_format.__name__,
+						'strict': True,
+						'schema': SchemaOptimizer.create_optimized_json_schema(
+							output_format,
+							remove_min_items=self.remove_min_items_from_schema,
+							remove_defaults=self.remove_defaults_from_schema,
+						),
+					}
+
+					if self.add_schema_to_system_prompt and openai_messages and openai_messages[0]['role'] == 'system':
+						schema_text = f'\n<json_schema>\n{response_format}\n</json_schema>'
+						if isinstance(openai_messages[0]['content'], str):
+							openai_messages[0]['content'] += schema_text
+						elif isinstance(openai_messages[0]['content'], Iterable):
+							openai_messages[0]['content'] = list(openai_messages[0]['content']) + [
+								ChatCompletionContentPartTextParam(text=schema_text, type='text')
+							]
+
+					response = await self.get_client().chat.completions.create(
+						model=self.model,
+						messages=openai_messages,
+						response_format=ResponseFormatJSONSchema(json_schema=response_format, type='json_schema'),
+						**model_params,
+					)
+
+					choice = self._validate_response_choices(response)
+					if choice.message.content is None:
+						raise ValueError('Empty content in structured JSON schema response')
+
+					usage = self._get_usage(response)
+					parsed = output_format.model_validate_json(choice.message.content)
+					return ChatInvokeCompletion(
+						completion=parsed,
+						usage=usage,
+						stop_reason=choice.finish_reason,
+					)
+
+				elif strategy == StructuredOutputMethod.TOOL_CALLING:
+					tool_name = output_format.__name__
+					schema = SchemaOptimizer.create_optimized_json_schema(
+						output_format,
+						remove_min_items=self.remove_min_items_from_schema,
+						remove_defaults=self.remove_defaults_from_schema,
+					)
+					tools: list[ChatCompletionToolParam] = [
+						{
+							'type': 'function',
+							'function': {
+								'name': tool_name,
+								'description': f'Extract structured output as {tool_name}',
+								'parameters': schema,
+							},
+						}
 					]
-				if self.add_schema_to_system_prompt and StructuredOutputMethod.JSON_SCHEMA in strategy_chain:
-					pass
+					tool_choice: ChatCompletionToolChoiceOptionParam = {
+						'type': 'function',
+						'function': {'name': tool_name},
+					}
 
-				last_error: Exception | None = None
+					response = await self.get_client().chat.completions.create(
+						model=self.model,
+						messages=openai_messages,
+						tools=tools,
+						tool_choice=tool_choice,
+						**model_params,
+					)
 
-				for strategy in strategy_chain:
-					try:
-						if strategy == StructuredOutputMethod.JSON_SCHEMA:
-							response_format: JSONSchema = {
-								'name': 'agent_output',
-								'strict': True,
-								'schema': SchemaOptimizer.create_optimized_json_schema(
-									output_format,
-									remove_min_items=self.remove_min_items_from_schema,
-									remove_defaults=self.remove_defaults_from_schema,
-								),
-							}
+					choice = self._validate_response_choices(response)
+					usage = self._get_usage(response)
 
-							if self.add_schema_to_system_prompt and openai_messages and openai_messages[0]['role'] == 'system':
-								schema_text = f'\n<json_schema>\n{response_format}\n</json_schema>'
-								if isinstance(openai_messages[0]['content'], str):
-									openai_messages[0]['content'] += schema_text
-								elif isinstance(openai_messages[0]['content'], Iterable):
-									openai_messages[0]['content'] = list(openai_messages[0]['content']) + [
-										ChatCompletionContentPartTextParam(text=schema_text, type='text')
-									]
+					if choice.message.tool_calls:
+						for tc in choice.message.tool_calls:
+							try:
+								parsed = output_format.model_validate_json(tc.function.arguments)
+								return ChatInvokeCompletion(
+									completion=parsed,
+									usage=usage,
+									stop_reason=choice.finish_reason,
+								)
+							except Exception:
+								continue
 
-							response = await self.get_client().chat.completions.create(
-								model=self.model,
-								messages=openai_messages,
-								response_format=ResponseFormatJSONSchema(json_schema=response_format, type='json_schema'),
-								**model_params,
-							)
-
-							choice = self._validate_response_choices(response)
-							if choice.message.content is None:
-								raise ValueError('Empty content in structured JSON schema response')
-
-							usage = self._get_usage(response)
-							parsed = output_format.model_validate_json(choice.message.content)
+					if choice.message.content:
+						parsed = parse_structured_output_from_text(choice.message.content, output_format)
+						if parsed is not None:
 							return ChatInvokeCompletion(
 								completion=parsed,
 								usage=usage,
 								stop_reason=choice.finish_reason,
 							)
 
-						elif strategy == StructuredOutputMethod.TOOL_CALLING:
-							tool_name = output_format.__name__
-							schema = SchemaOptimizer.create_optimized_json_schema(
-								output_format,
-								remove_min_items=self.remove_min_items_from_schema,
-								remove_defaults=self.remove_defaults_from_schema,
-							)
-							tools: list[ChatCompletionToolParam] = [
-								{
-									'type': 'function',
-									'function': {
-										'name': tool_name,
-										'description': f'Extract structured output as {tool_name}',
-										'parameters': schema,
-									},
-								}
-							]
-							tool_choice: ChatCompletionToolChoiceOptionParam = {
-								'type': 'function',
-								'function': {'name': tool_name},
-							}
+					raise ValueError('No tool call or parseable content in TOOL_CALLING response')
 
-							response = await self.get_client().chat.completions.create(
-								model=self.model,
-								messages=openai_messages,
-								tools=tools,
-								tool_choice=tool_choice,
-								**model_params,
-							)
+				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+					modified_messages = [m.model_copy(deep=True) for m in messages]
+					instruction_added = False
+					if modified_messages and isinstance(modified_messages[0].content, str):
+						modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
+						instruction_added = True
+					elif modified_messages and isinstance(modified_messages[0].content, list):
+						modified_messages[0].content.append(
+							MsgContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
+						)
+						instruction_added = True
+					if not instruction_added and modified_messages and isinstance(modified_messages[-1].content, str):
+						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+						instruction_added = True
 
-							choice = self._validate_response_choices(response)
-							usage = self._get_usage(response)
+					modified_openai_messages = OpenAIMessageSerializer.serialize_messages(modified_messages)
 
-							if choice.message.tool_calls:
-								for tc in choice.message.tool_calls:
-									try:
-										parsed = output_format.model_validate_json(tc.function.arguments)
-										return ChatInvokeCompletion(
-											completion=parsed,
-											usage=usage,
-											stop_reason=choice.finish_reason,
-										)
-									except Exception:
-										continue
+					response = await self.get_client().chat.completions.create(
+						model=self.model,
+						messages=modified_openai_messages,
+						**model_params,
+					)
 
-							if choice.message.content:
-								parsed = parse_structured_output_from_text(choice.message.content, output_format)
-								if parsed is not None:
-									return ChatInvokeCompletion(
-										completion=parsed,
-										usage=usage,
-										stop_reason=choice.finish_reason,
-									)
+					choice = self._validate_response_choices(response)
+					usage = self._get_usage(response)
+					content = choice.message.content or ''
 
-							raise ValueError('No tool call or parseable content in TOOL_CALLING response')
+					parsed = parse_structured_output_from_text(content, output_format)
+					if parsed is not None:
+						return ChatInvokeCompletion(
+							completion=parsed,
+							usage=usage,
+							stop_reason=choice.finish_reason,
+						)
+					raise ValueError('Failed to parse structured output from prompt text response')
 
-						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-							modified_messages = [m.model_copy(deep=True) for m in messages]
-							instruction_added = False
-							if modified_messages and isinstance(modified_messages[0].content, str):
-								modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
-								instruction_added = True
-							elif modified_messages and isinstance(modified_messages[0].content, list):
-								modified_messages[0].content.append(
-									MsgContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
-								)
-								instruction_added = True
-							if not instruction_added and modified_messages and isinstance(modified_messages[-1].content, str):
-								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-								instruction_added = True
-
-							modified_openai_messages = OpenAIMessageSerializer.serialize_messages(modified_messages)
-
-							response = await self.get_client().chat.completions.create(
-								model=self.model,
-								messages=modified_openai_messages,
-								**model_params,
-							)
-
-							choice = self._validate_response_choices(response)
-							usage = self._get_usage(response)
-							content = choice.message.content or ''
-
-							parsed = parse_structured_output_from_text(content, output_format)
-							if parsed is not None:
-								return ChatInvokeCompletion(
-									completion=parsed,
-									usage=usage,
-									stop_reason=choice.finish_reason,
-								)
-							raise ValueError('Failed to parse structured output from prompt text response')
-
-					except Exception as e:
-						last_error = e
-						logger.debug(f'OpenAI structured output strategy {strategy} failed: {e}')
-						continue
-
-				if last_error is not None:
-					raise ModelProviderError(
-						message=f'All structured output strategies failed. Last error: {last_error}',
-						model=self.name,
-					) from last_error
-				raise ModelProviderError(
-					message='No valid structured output strategy available for OpenAI',
-					model=self.name,
-				)
+				else:
+					raise ValueError(f'Unsupported structured_output_method: {strategy}')
 
 		except ModelProviderError:
 			raise

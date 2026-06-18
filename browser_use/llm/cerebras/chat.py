@@ -88,6 +88,7 @@ class ChatCerebras(BaseChatModel):
 		self,
 		messages: list[BaseMessage],
 		output_format: None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
@@ -96,6 +97,7 @@ class ChatCerebras(BaseChatModel):
 		self,
 		messages: list[BaseMessage],
 		output_format: type[T],
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T]: ...
 
@@ -103,6 +105,7 @@ class ChatCerebras(BaseChatModel):
 		self,
 		messages: list[BaseMessage],
 		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
@@ -145,42 +148,40 @@ class ChatCerebras(BaseChatModel):
 
 		# ② Structured output — use capabilities-driven strategy chain
 		strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-		last_error: Exception | None = None
+		strategy = structured_output_method if structured_output_method is not None else strategy_chain[0]
 
-		for strategy in strategy_chain:
-			try:
-				if strategy == StructuredOutputMethod.PROMPT_TEXT:
-					modified_messages = [m.model_copy(deep=True) for m in messages]
-					if modified_messages and isinstance(modified_messages[-1].content, str):
-						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-					fallback_cerebras_messages = CerebrasMessageSerializer.serialize_messages(modified_messages)
-					resp = await client.chat.completions.create(  # type: ignore
-						model=self.model,
-						messages=fallback_cerebras_messages,  # type: ignore
-						**common,
+		try:
+			if strategy == StructuredOutputMethod.PROMPT_TEXT:
+				modified_messages = [m.model_copy(deep=True) for m in messages]
+				if modified_messages and isinstance(modified_messages[-1].content, str):
+					modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+				fallback_cerebras_messages = CerebrasMessageSerializer.serialize_messages(modified_messages)
+				resp = await client.chat.completions.create(  # type: ignore
+					model=self.model,
+					messages=fallback_cerebras_messages,  # type: ignore
+					**common,
+				)
+				content = resp.choices[0].message.content
+				if not content:
+					raise ModelProviderError('Empty JSON content in Cerebras response', model=self.name)
+				usage = self._get_usage(resp)
+				parsed = parse_structured_output_from_text(content, output_format)
+				if parsed is not None:
+					return ChatInvokeCompletion(
+						completion=parsed,
+						usage=usage,
 					)
-					content = resp.choices[0].message.content
-					if not content:
-						raise ModelProviderError('Empty JSON content in Cerebras response', model=self.name)
-					usage = self._get_usage(resp)
-					parsed = parse_structured_output_from_text(content, output_format)
-					if parsed is not None:
-						return ChatInvokeCompletion(
-							completion=parsed,
-							usage=usage,
-						)
-					raise ValueError(f'Failed to parse JSON from text: {content[:200]}')
+				raise ValueError(f'Failed to parse JSON from text: {content[:200]}')
 
-				elif strategy in (StructuredOutputMethod.JSON_SCHEMA, StructuredOutputMethod.TOOL_CALLING):
-					continue
+			elif strategy in (StructuredOutputMethod.JSON_SCHEMA, StructuredOutputMethod.TOOL_CALLING):
+				raise ValueError(f'Strategy {strategy} is not supported by Cerebras provider')
 
-			except Exception as e:
-				last_error = e
-				continue
+			else:
+				raise ValueError(f'Unsupported structured output strategy: {strategy}')
 
-		if last_error is not None:
-			raise ModelProviderError(
-				message=f'All structured output strategies failed. Last error: {last_error}',
-				model=self.name,
-			) from last_error
-		raise ModelProviderError('No valid ainvoke execution path for Cerebras LLM', model=self.name)
+		except RateLimitError as e:
+			raise ModelRateLimitError(str(e), model=self.name) from e
+		except (APIError, APIConnectionError, APITimeoutError, APIStatusError) as e:
+			raise ModelProviderError(str(e), model=self.name) from e
+		except Exception as e:
+			raise ModelProviderError(str(e), model=self.name) from e

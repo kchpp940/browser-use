@@ -120,14 +120,28 @@ class ChatGroq(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T],
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
+	) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		groq_messages = GroqMessageSerializer.serialize_messages(messages)
 
@@ -135,7 +149,9 @@ class ChatGroq(BaseChatModel):
 			if output_format is None:
 				return await self._invoke_regular_completion(groq_messages)
 			else:
-				return await self._invoke_structured_output(groq_messages, output_format, messages)
+				return await self._invoke_structured_output(
+					groq_messages, output_format, messages, structured_output_method
+				)
 
 		except RateLimitError as e:
 			raise ModelRateLimitError(message=e.response.text, status_code=e.response.status_code, model=self.name) from e
@@ -184,73 +200,69 @@ class ChatGroq(BaseChatModel):
 		)
 
 	async def _invoke_structured_output(
-		self, groq_messages, output_format: type[T], original_messages: list[BaseMessage]
+		self,
+		groq_messages,
+		output_format: type[T],
+		original_messages: list[BaseMessage],
+		structured_output_method: StructuredOutputMethod | None = None,
 	) -> ChatInvokeCompletion[T]:
 		"""Handle structured output using capabilities-driven strategy chain."""
 		schema = SchemaOptimizer.create_optimized_json_schema(output_format)
-		strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-		last_error: Exception | None = None
 
-		for strategy in strategy_chain:
-			try:
-				if strategy == StructuredOutputMethod.TOOL_CALLING:
-					response = await self._invoke_with_tool_calling(groq_messages, output_format, schema)
-					if not response.choices[0].message.content:
-						raise ValueError('No content in tool calling response')
-					parsed_response = output_format.model_validate_json(response.choices[0].message.content)
-					usage = self._get_usage(response)
-					return ChatInvokeCompletion(
-						completion=parsed_response,
-						usage=usage,
-					)
+		if structured_output_method is None:
+			strategy = self.capabilities.get_structured_output_strategy_chain()[0]
+		else:
+			strategy = structured_output_method
 
-				elif strategy == StructuredOutputMethod.JSON_SCHEMA:
-					response = await self._invoke_with_json_schema(groq_messages, output_format, schema)
-					if not response.choices[0].message.content:
-						raise ValueError('No content in JSON schema response')
-					parsed_response = output_format.model_validate_json(response.choices[0].message.content)
-					usage = self._get_usage(response)
-					return ChatInvokeCompletion(
-						completion=parsed_response,
-						usage=usage,
-					)
+		if strategy == StructuredOutputMethod.TOOL_CALLING:
+			response = await self._invoke_with_tool_calling(groq_messages, output_format, schema)
+			if not response.choices[0].message.content:
+				raise ValueError('No content in tool calling response')
+			parsed_response = output_format.model_validate_json(response.choices[0].message.content)
+			usage = self._get_usage(response)
+			return ChatInvokeCompletion(
+				completion=parsed_response,
+				usage=usage,
+			)
 
-				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-					modified_messages = [m.model_copy(deep=True) for m in original_messages]
-					if modified_messages and isinstance(modified_messages[-1].content, str):
-						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-					fallback_groq_messages = GroqMessageSerializer.serialize_messages(modified_messages)
-					response = await self.get_client().chat.completions.create(
-						model=self.model,
-						messages=fallback_groq_messages,
-						temperature=self.temperature,
-						top_p=self.top_p,
-						seed=self.seed,
-						service_tier=self.service_tier,
-					)
-					content = response.choices[0].message.content
-					if not content:
-						raise ValueError('No content in prompt text fallback')
-					parsed = parse_structured_output_from_text(content, output_format)
-					if parsed is not None:
-						usage = self._get_usage(response)
-						return ChatInvokeCompletion(
-							completion=parsed,
-							usage=usage,
-						)
-					raise ValueError(f'Failed to parse prompt text fallback: {content[:200]}')
+		elif strategy == StructuredOutputMethod.JSON_SCHEMA:
+			response = await self._invoke_with_json_schema(groq_messages, output_format, schema)
+			if not response.choices[0].message.content:
+				raise ValueError('No content in JSON schema response')
+			parsed_response = output_format.model_validate_json(response.choices[0].message.content)
+			usage = self._get_usage(response)
+			return ChatInvokeCompletion(
+				completion=parsed_response,
+				usage=usage,
+			)
 
-			except Exception as e:
-				last_error = e
-				logger.debug(f'Groq structured output strategy {strategy} failed: {e}')
-				continue
+		elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+			modified_messages = [m.model_copy(deep=True) for m in original_messages]
+			if modified_messages and isinstance(modified_messages[-1].content, str):
+				modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+			fallback_groq_messages = GroqMessageSerializer.serialize_messages(modified_messages)
+			response = await self.get_client().chat.completions.create(
+				model=self.model,
+				messages=fallback_groq_messages,
+				temperature=self.temperature,
+				top_p=self.top_p,
+				seed=self.seed,
+				service_tier=self.service_tier,
+			)
+			content = response.choices[0].message.content
+			if not content:
+				raise ValueError('No content in prompt text fallback')
+			parsed = parse_structured_output_from_text(content, output_format)
+			if parsed is not None:
+				usage = self._get_usage(response)
+				return ChatInvokeCompletion(
+					completion=parsed,
+					usage=usage,
+				)
+			raise ValueError(f'Failed to parse prompt text fallback: {content[:200]}')
 
-		if last_error is not None:
-			raise ModelProviderError(
-				message=f'All structured output strategies failed. Last error: {last_error}',
-				model=self.name,
-			) from last_error
-		raise ModelProviderError('No valid structured output strategy for Groq', model=self.name)
+		else:
+			raise ValueError(f'Unsupported structured output strategy: {strategy}')
 
 	async def _invoke_with_tool_calling(self, groq_messages, output_format: type[T], schema) -> ChatCompletion:
 		"""Handle structured output using tool calling."""

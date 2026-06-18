@@ -171,11 +171,21 @@ class ChatMistral(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T],
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
+	) -> ChatInvokeCompletion[T]: ...
 
 	def _build_payload(self, messages: list[BaseMessage]) -> dict[str, Any]:
 		payload: dict[str, Any] = {
@@ -195,7 +205,11 @@ class ChatMistral(BaseChatModel):
 		return payload
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		try:
 			if output_format is None:
@@ -210,71 +224,57 @@ class ChatMistral(BaseChatModel):
 
 			else:
 				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-				last_error: Exception | None = None
+				strategy = structured_output_method if structured_output_method is not None else strategy_chain[0]
 
-				for strategy in strategy_chain:
-					try:
-						if strategy == StructuredOutputMethod.JSON_SCHEMA:
-							payload = self._build_payload(messages)
-							payload['response_format'] = {
-								'type': 'json_schema',
-								'json_schema': {
-									'name': 'agent_output',
-									'strict': True,
-									'schema': MistralSchemaOptimizer.create_mistral_compatible_schema(output_format),
-								},
-							}
+				if strategy == StructuredOutputMethod.JSON_SCHEMA:
+					payload = self._build_payload(messages)
+					payload['response_format'] = {
+						'type': 'json_schema',
+						'json_schema': {
+							'name': 'agent_output',
+							'strict': True,
+							'schema': MistralSchemaOptimizer.create_mistral_compatible_schema(output_format),
+						},
+					}
 
-							data = await self._post(payload)
-							choices = data.get('choices', [])
-							if not choices:
-								raise ModelProviderError('Mistral returned no choices', model=self.name)
-							content_text = self._extract_content_text(choices[0])
-							usage = self._build_usage(data.get('usage'))
-							parsed = output_format.model_validate_json(content_text)
-							return ChatInvokeCompletion(completion=parsed, usage=usage)
+					data = await self._post(payload)
+					choices = data.get('choices', [])
+					if not choices:
+						raise ModelProviderError('Mistral returned no choices', model=self.name)
+					content_text = self._extract_content_text(choices[0])
+					usage = self._build_usage(data.get('usage'))
+					parsed = output_format.model_validate_json(content_text)
+					return ChatInvokeCompletion(completion=parsed, usage=usage)
 
-						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-							modified_messages = [m.model_copy(deep=True) for m in messages]
-							instruction_added = False
-							if modified_messages and isinstance(modified_messages[0].content, str):
-								modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
-								instruction_added = True
-							elif modified_messages and isinstance(modified_messages[0].content, list):
-								modified_messages[0].content.append(
-									ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
-								)
-								instruction_added = True
-							if not instruction_added and modified_messages and isinstance(modified_messages[-1].content, str):
-								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-								instruction_added = True
+				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+					modified_messages = [m.model_copy(deep=True) for m in messages]
+					instruction_added = False
+					if modified_messages and isinstance(modified_messages[0].content, str):
+						modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
+						instruction_added = True
+					elif modified_messages and isinstance(modified_messages[0].content, list):
+						modified_messages[0].content.append(
+							ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
+						)
+						instruction_added = True
+					if not instruction_added and modified_messages and isinstance(modified_messages[-1].content, str):
+						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+						instruction_added = True
 
-							payload = self._build_payload(modified_messages)
-							data = await self._post(payload)
-							choices = data.get('choices', [])
-							if not choices:
-								raise ModelProviderError('Mistral returned no choices', model=self.name)
-							content_text = self._extract_content_text(choices[0])
-							usage = self._build_usage(data.get('usage'))
-							parsed = parse_structured_output_from_text(content_text, output_format)
-							if parsed is not None:
-								return ChatInvokeCompletion(completion=parsed, usage=usage)
-							raise ValueError('Failed to parse structured output from prompt text response')
+					payload = self._build_payload(modified_messages)
+					data = await self._post(payload)
+					choices = data.get('choices', [])
+					if not choices:
+						raise ModelProviderError('Mistral returned no choices', model=self.name)
+					content_text = self._extract_content_text(choices[0])
+					usage = self._build_usage(data.get('usage'))
+					parsed = parse_structured_output_from_text(content_text, output_format)
+					if parsed is not None:
+						return ChatInvokeCompletion(completion=parsed, usage=usage)
+					raise ValueError('Failed to parse structured output from prompt text response')
 
-					except Exception as e:
-						last_error = e
-						logger.debug(f'Mistral structured output strategy {strategy} failed: {e}')
-						continue
-
-				if last_error is not None:
-					raise ModelProviderError(
-						message=f'All structured output strategies failed. Last error: {last_error}',
-						model=self.name,
-					) from last_error
-				raise ModelProviderError(
-					message='No valid structured output strategy available for Mistral',
-					model=self.name,
-				)
+				else:
+					raise ValueError(f'Unsupported structured output strategy: {strategy}')
 
 		except ModelRateLimitError:
 			raise

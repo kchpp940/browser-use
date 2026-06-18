@@ -15,7 +15,7 @@ import httpx
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
-from browser_use.llm.capabilities import ProviderCapabilities, get_default_capabilities
+from browser_use.llm.capabilities import ProviderCapabilities, StructuredOutputMethod, get_default_capabilities
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.views import ChatInvokeCompletion
@@ -116,12 +116,22 @@ class ChatBrowserUse(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, request_type: str = 'browser_agent', **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: None = None,
+		request_type: str = 'browser_agent',
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T], request_type: str = 'browser_agent', **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T],
+		request_type: str = 'browser_agent',
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T]: ...
 
 	@observe(name='chat_browser_use_ainvoke')
@@ -130,6 +140,7 @@ class ChatBrowserUse(BaseChatModel):
 		messages: list[BaseMessage],
 		output_format: type[T] | None = None,
 		request_type: str = 'browser_agent',
+		structured_output_method: StructuredOutputMethod | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
@@ -139,6 +150,7 @@ class ChatBrowserUse(BaseChatModel):
 			messages: List of messages to send
 			output_format: Expected output format (Pydantic model)
 			request_type: Type of request - 'browser_agent' or 'judge'
+			structured_output_method: Strategy hint (ignored — cloud API selects optimal strategy server-side)
 			**kwargs: Additional arguments, including:
 				- session_id: Session ID for sticky routing (same session → same container)
 

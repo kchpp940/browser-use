@@ -72,14 +72,28 @@ class ChatOllama(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T],
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
+	) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self,
+		messages: list[BaseMessage],
+		output_format: type[T] | None = None,
+		structured_output_method: StructuredOutputMethod | None = None,
+		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		try:
 			if output_format is None:
@@ -93,63 +107,49 @@ class ChatOllama(BaseChatModel):
 
 			else:
 				strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-				last_error: Exception | None = None
+				strategy = structured_output_method if structured_output_method is not None else strategy_chain[0]
 
-				for strategy in strategy_chain:
-					try:
-						if strategy == StructuredOutputMethod.JSON_SCHEMA:
-							schema = output_format.model_json_schema()
-							ollama_messages = OllamaMessageSerializer.serialize_messages(messages)
-							response = await self.get_client().chat(
-								model=self.model,
-								messages=ollama_messages,
-								format=schema,
-								options=self.ollama_options,
-							)
-							completion_text = response.message.content or ''
-							parsed = output_format.model_validate_json(completion_text)
-							return ChatInvokeCompletion(completion=parsed, usage=None)
+				if strategy == StructuredOutputMethod.JSON_SCHEMA:
+					schema = output_format.model_json_schema()
+					ollama_messages = OllamaMessageSerializer.serialize_messages(messages)
+					response = await self.get_client().chat(
+						model=self.model,
+						messages=ollama_messages,
+						format=schema,
+						options=self.ollama_options,
+					)
+					completion_text = response.message.content or ''
+					parsed = output_format.model_validate_json(completion_text)
+					return ChatInvokeCompletion(completion=parsed, usage=None)
 
-						elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-							modified_messages = [m.model_copy(deep=True) for m in messages]
-							instruction_added = False
-							if modified_messages and isinstance(modified_messages[-1].content, str):
-								modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
-								instruction_added = True
-							elif modified_messages and isinstance(modified_messages[-1].content, list):
-								modified_messages[-1].content.append(
-									ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
-								)
-								instruction_added = True
-							if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
-								modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
+				elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+					modified_messages = [m.model_copy(deep=True) for m in messages]
+					instruction_added = False
+					if modified_messages and isinstance(modified_messages[-1].content, str):
+						modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+						instruction_added = True
+					elif modified_messages and isinstance(modified_messages[-1].content, list):
+						modified_messages[-1].content.append(
+							ContentPartTextParam(text=build_prompt_text_schema_instruction(output_format))
+						)
+						instruction_added = True
+					if not instruction_added and modified_messages and isinstance(modified_messages[0].content, str):
+						modified_messages[0].content += build_prompt_text_schema_instruction(output_format)
 
-							ollama_messages = OllamaMessageSerializer.serialize_messages(modified_messages)
-							response = await self.get_client().chat(
-								model=self.model,
-								messages=ollama_messages,
-								options=self.ollama_options,
-							)
-							completion_text = response.message.content or ''
-							parsed = parse_structured_output_from_text(completion_text, output_format)
-							if parsed is not None:
-								return ChatInvokeCompletion(completion=parsed, usage=None)
-							raise ValueError('Failed to parse structured output from prompt text response')
+					ollama_messages = OllamaMessageSerializer.serialize_messages(modified_messages)
+					response = await self.get_client().chat(
+						model=self.model,
+						messages=ollama_messages,
+						options=self.ollama_options,
+					)
+					completion_text = response.message.content or ''
+					parsed = parse_structured_output_from_text(completion_text, output_format)
+					if parsed is not None:
+						return ChatInvokeCompletion(completion=parsed, usage=None)
+					raise ValueError('Failed to parse structured output from prompt text response')
 
-					except Exception as e:
-						last_error = e
-						logger.debug(f'Ollama structured output strategy {strategy} failed: {e}')
-						continue
-
-				if last_error is not None:
-					raise ModelProviderError(
-						message=f'All structured output strategies failed. Last error: {last_error}',
-						model=self.name,
-					) from last_error
-				raise ModelProviderError(
-					message='No valid structured output strategy available for Ollama',
-					model=self.name,
-				)
+				else:
+					raise ValueError(f'Unsupported structured output strategy: {strategy}')
 
 		except ModelProviderError:
 			raise

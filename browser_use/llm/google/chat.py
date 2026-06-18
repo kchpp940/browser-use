@@ -238,14 +238,14 @@ class ChatGoogle(BaseChatModel):
 
 	@overload
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: None = None, **kwargs: Any
+		self, messages: list[BaseMessage], output_format: None = None, structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[str]: ...
 
 	@overload
-	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], **kwargs: Any) -> ChatInvokeCompletion[T]: ...
+	async def ainvoke(self, messages: list[BaseMessage], output_format: type[T], structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any) -> ChatInvokeCompletion[T]: ...
 
 	async def ainvoke(
-		self, messages: list[BaseMessage], output_format: type[T] | None = None, **kwargs: Any
+		self, messages: list[BaseMessage], output_format: type[T] | None = None, structured_output_method: StructuredOutputMethod | None = None, **kwargs: Any
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
 		"""
 		Invoke the model with the given messages.
@@ -372,114 +372,97 @@ class ChatGoogle(BaseChatModel):
 					)
 
 				else:
-					# Handle structured output using capabilities-driven strategy chain
-					strategy_chain = self.capabilities.get_structured_output_strategy_chain()
-					last_error: Exception | None = None
+					if structured_output_method is None:
+						strategy = self.capabilities.get_structured_output_strategy_chain()[0]
+					else:
+						strategy = structured_output_method
 
-					for strategy in strategy_chain:
-						try:
-							if strategy == StructuredOutputMethod.JSON_SCHEMA:
-								# Use native JSON mode
-								self.logger.debug(f'🔧 Requesting structured output via JSON_SCHEMA for {output_format.__name__}')
-								json_config = config.copy()
-								json_config['response_mime_type'] = 'application/json'
-								optimized_schema = SchemaOptimizer.create_gemini_optimized_schema(output_format)
-								gemini_schema = self._fix_gemini_schema(optimized_schema)
-								json_config['response_schema'] = gemini_schema
+					if strategy == StructuredOutputMethod.JSON_SCHEMA:
+						# Use native JSON mode
+						self.logger.debug(f'🔧 Requesting structured output via JSON_SCHEMA for {output_format.__name__}')
+						json_config = config.copy()
+						json_config['response_mime_type'] = 'application/json'
+						optimized_schema = SchemaOptimizer.create_gemini_optimized_schema(output_format)
+						gemini_schema = self._fix_gemini_schema(optimized_schema)
+						json_config['response_schema'] = gemini_schema
 
-								response = await self.get_client().aio.models.generate_content(
-									model=self.model,
-									contents=contents,
-									config=json_config,
-								)
+						response = await self.get_client().aio.models.generate_content(
+							model=self.model,
+							contents=contents,
+							config=json_config,
+						)
 
-								elapsed = time.time() - start_time
-								self.logger.debug(f'✅ Got structured response in {elapsed:.2f}s')
+						elapsed = time.time() - start_time
+						self.logger.debug(f'✅ Got structured response in {elapsed:.2f}s')
 
-								usage = self._get_usage(response)
+						usage = self._get_usage(response)
 
-								if response.parsed is None:
-									self.logger.debug('📝 Parsing JSON from text response')
-									if response.text:
-										parsed = parse_structured_output_from_text(response.text, output_format)
-										if parsed is not None:
-											return ChatInvokeCompletion(
-												completion=parsed,
-												usage=usage,
-												stop_reason=self._get_stop_reason(response),
-											)
-										raise ValueError(f'Failed to parse JSON from response text: {response.text[:200]}')
-									else:
-										raise ValueError('No response text received')
-
-								if isinstance(response.parsed, output_format):
+						if response.parsed is None:
+							self.logger.debug('📝 Parsing JSON from text response')
+							if response.text:
+								parsed = parse_structured_output_from_text(response.text, output_format)
+								if parsed is not None:
 									return ChatInvokeCompletion(
-										completion=response.parsed,
+										completion=parsed,
 										usage=usage,
 										stop_reason=self._get_stop_reason(response),
 									)
-								else:
-									return ChatInvokeCompletion(
-										completion=output_format.model_validate(response.parsed),
-										usage=usage,
-										stop_reason=self._get_stop_reason(response),
-									)
+								raise ValueError(f'Failed to parse JSON from response text: {response.text[:200]}')
+							else:
+								raise ValueError('No response text received')
 
-							elif strategy == StructuredOutputMethod.PROMPT_TEXT:
-								# Fallback: Request JSON in the prompt
-								self.logger.debug(f'🔄 Using fallback PROMPT_TEXT mode for {output_format.__name__}')
-								modified_messages = [m.model_copy(deep=True) for m in messages]
-								if modified_messages and isinstance(modified_messages[-1].content, str):
-									modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+						if isinstance(response.parsed, output_format):
+							return ChatInvokeCompletion(
+								completion=response.parsed,
+								usage=usage,
+								stop_reason=self._get_stop_reason(response),
+							)
+						else:
+							return ChatInvokeCompletion(
+								completion=output_format.model_validate(response.parsed),
+								usage=usage,
+								stop_reason=self._get_stop_reason(response),
+							)
 
-								fallback_contents, fallback_system = GoogleMessageSerializer.serialize_messages(
-									modified_messages, include_system_in_user=self.include_system_in_user
+					elif strategy == StructuredOutputMethod.PROMPT_TEXT:
+						# Fallback: Request JSON in the prompt
+						self.logger.debug(f'🔄 Using fallback PROMPT_TEXT mode for {output_format.__name__}')
+						modified_messages = [m.model_copy(deep=True) for m in messages]
+						if modified_messages and isinstance(modified_messages[-1].content, str):
+							modified_messages[-1].content += build_prompt_text_schema_instruction(output_format)
+
+						fallback_contents, fallback_system = GoogleMessageSerializer.serialize_messages(
+							modified_messages, include_system_in_user=self.include_system_in_user
+						)
+						fallback_config = config.copy()
+						if fallback_system:
+							fallback_config['system_instruction'] = fallback_system
+
+						response = await self.get_client().aio.models.generate_content(
+							model=self.model,
+							contents=fallback_contents,  # type: ignore
+							config=fallback_config,
+						)
+
+						elapsed = time.time() - start_time
+						self.logger.debug(f'✅ Got fallback response in {elapsed:.2f}s')
+
+						usage = self._get_usage(response)
+
+						if response.text:
+							parsed = parse_structured_output_from_text(response.text, output_format)
+							if parsed is not None:
+								return ChatInvokeCompletion(
+									completion=parsed,
+									usage=usage,
+									stop_reason=self._get_stop_reason(response),
 								)
-								fallback_config = config.copy()
-								if fallback_system:
-									fallback_config['system_instruction'] = fallback_system
+							raise ValueError(f'Failed to parse JSON from text response: {response.text[:200]}')
+						else:
+							raise ValueError('No response text in fallback mode')
 
-								response = await self.get_client().aio.models.generate_content(
-									model=self.model,
-									contents=fallback_contents,  # type: ignore
-									config=fallback_config,
-								)
-
-								elapsed = time.time() - start_time
-								self.logger.debug(f'✅ Got fallback response in {elapsed:.2f}s')
-
-								usage = self._get_usage(response)
-
-								if response.text:
-									parsed = parse_structured_output_from_text(response.text, output_format)
-									if parsed is not None:
-										return ChatInvokeCompletion(
-											completion=parsed,
-											usage=usage,
-											stop_reason=self._get_stop_reason(response),
-										)
-									raise ValueError(f'Failed to parse JSON from text response: {response.text[:200]}')
-								else:
-									raise ValueError('No response text in fallback mode')
-
-							elif strategy == StructuredOutputMethod.TOOL_CALLING:
-								# Google Gemini tool calling for structured output is not used here
-								continue
-
-						except Exception as e:
-							last_error = e
-							self.logger.debug(f'Google structured output strategy {strategy} failed: {e}')
-							continue
-
-					if last_error is not None:
-						raise ModelProviderError(
-							message=f'All structured output strategies failed. Last error: {last_error}',
-							model=self.name,
-						) from last_error
-					raise ModelProviderError(
-						message='No valid structured output strategy available for Google LLM',
-						model=self.name,
-					)
+					else:
+						raise ValueError(f'Unsupported structured_output_method: {strategy}')
 			except Exception as e:
 				elapsed = time.time() - start_time
 				self.logger.error(f'💥 API call failed after {elapsed:.2f}s: {type(e).__name__}: {e}')
