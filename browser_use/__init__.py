@@ -64,6 +64,16 @@ if TYPE_CHECKING:
 	from browser_use.llm.openai.chat import ChatOpenAI
 	from browser_use.llm.vercel.chat import ChatVercel
 	from browser_use.sandbox import sandbox
+	from browser_use.task_templates import (
+		OutputFileRule,
+		TaskTemplate,
+		TaskTemplateExecutionResult,
+		TaskTemplateStatus,
+		TemplateManager,
+		TemplateVariable,
+		TemplateVariableType,
+		run_template,
+	)
 	from browser_use.tools.service import Controller, Tools
 
 	# Lazy imports mapping - only import when actually accessed
@@ -100,6 +110,16 @@ _LAZY_IMPORTS = {
 	'models': ('browser_use.llm.models', None),
 	# Sandbox execution
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
+	# Task templates (lazy loaded to keep startup fast)
+	'task_templates': ('browser_use.task_templates', None),
+	'TaskTemplate': ('browser_use.task_templates', 'TaskTemplate'),
+	'TemplateVariable': ('browser_use.task_templates', 'TemplateVariable'),
+	'TemplateVariableType': ('browser_use.task_templates', 'TemplateVariableType'),
+	'OutputFileRule': ('browser_use.task_templates', 'OutputFileRule'),
+	'TaskTemplateExecutionResult': ('browser_use.task_templates', 'TaskTemplateExecutionResult'),
+	'TaskTemplateStatus': ('browser_use.task_templates', 'TaskTemplateStatus'),
+	'TemplateManager': ('browser_use.task_templates', 'TemplateManager'),
+	'run_template': ('browser_use.task_templates', 'run_template'),
 }
 
 
@@ -154,4 +174,14 @@ __all__ = [
 	'models',
 	# Sandbox execution
 	'sandbox',
+	# Task templates
+	'task_templates',
+	'TaskTemplate',
+	'TemplateVariable',
+	'TemplateVariableType',
+	'OutputFileRule',
+	'TaskTemplateExecutionResult',
+	'TaskTemplateStatus',
+	'TemplateManager',
+	'run_template',
 ]

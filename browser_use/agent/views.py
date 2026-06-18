@@ -24,7 +24,6 @@ from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES, DOMInteractedEleme
 # )
 # from browser_use.dom.views import SelectorMap
 from browser_use.filesystem.file_system import FileSystemState
-from browser_use.filesystem.workspace_manifest import FileSource
 from browser_use.llm.base import BaseChatModel
 from browser_use.tokens.views import UsageSummary
 from browser_use.tools.registry.views import ActionModel
@@ -55,17 +54,6 @@ class MessageCompactionSettings(BaseModel):
 		elif self.trigger_char_count is None:
 			self.trigger_char_count = 40000  # ~10k tokens
 		return self
-
-
-class WorkspaceManifestSettings(BaseModel):
-	"""Configuration for workspace manifest display in the agent prompt."""
-
-	enabled: bool = True
-	max_items: int = 20
-	include_sources: list[FileSource] | None = None
-	exclude_sources: list[FileSource] | None = None
-	show_full_paths: bool = False
-	show_in_prompt: bool = True  # Whether to show the summary in the agent prompt
 
 
 class AgentSettings(BaseModel):
@@ -102,9 +90,6 @@ class AgentSettings(BaseModel):
 	loop_detection_window: int = 20  # Rolling window size for action similarity tracking
 	loop_detection_enabled: bool = True  # Whether to enable loop detection nudges
 	max_clickable_elements_length: int = 40000  # Max characters for clickable elements in prompt
-
-	# Workspace manifest settings
-	workspace_manifest: WorkspaceManifestSettings = Field(default_factory=WorkspaceManifestSettings)
 
 
 class PageFingerprint(BaseModel):

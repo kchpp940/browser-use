@@ -12,8 +12,6 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from browser_use.filesystem.workspace_manifest import FileSource, PathType, WorkspaceManifest
-
 UNSUPPORTED_BINARY_EXTENSIONS = {
 	'png',
 	'jpg',
@@ -350,7 +348,6 @@ class FileSystemState(BaseModel):
 	files: dict[str, dict[str, Any]] = Field(default_factory=dict)  # full filename -> file data
 	base_dir: str
 	extracted_content_count: int = 0
-	manifest_state: dict[str, dict[str, Any]] | None = None
 
 
 class FileSystem:
@@ -386,25 +383,10 @@ class FileSystem:
 			self._create_default_files()
 
 		self.extracted_content_count = 0
-		self.manifest = WorkspaceManifest()
-		self._sync_manifest_from_files()
 
 	def get_allowed_extensions(self) -> list[str]:
 		"""Get allowed extensions"""
 		return list(self._file_types.keys())
-
-	def _sync_manifest_from_files(self) -> None:
-		for file_obj in self.files.values():
-			real_path = str(self.data_dir / file_obj.full_name)
-			self.manifest.register(
-				display_name=file_obj.full_name,
-				source=FileSource.VIRTUAL,
-				path_type=PathType.VIRTUAL_NAME,
-				real_path=real_path,
-				size_bytes=file_obj.get_size,
-				readable=True,
-				uploadable=True,
-			)
 
 	def _get_file_type_class(self, extension: str) -> type[BaseFile] | None:
 		"""Get the appropriate file class for an extension."""
@@ -720,7 +702,6 @@ class FileSystem:
 
 		try:
 			content = file_obj.read()
-			self.manifest.touch(resolved, 'read')
 			sanitize_note = f"Note: filename was auto-corrected from '{full_filename}' to '{resolved}'. " if was_sanitized else ''
 			result['message'] = f'{sanitize_note}Read from file {resolved}.\n<content>\n{content}\n</content>'
 			return result
@@ -762,16 +743,6 @@ class FileSystem:
 
 			# Use file-specific write method
 			await file_obj.write(content, self.data_dir)
-			self.manifest.register(
-				display_name=full_filename,
-				source=FileSource.VIRTUAL,
-				path_type=PathType.VIRTUAL_NAME,
-				real_path=str(self.data_dir / file_obj.full_name),
-				size_bytes=file_obj.get_size,
-				readable=True,
-				uploadable=True,
-				last_action='write',
-			)
 			sanitize_note = f" (auto-corrected from '{original_filename}')" if was_sanitized else ''
 			return f'Data written to file {full_filename} successfully.{sanitize_note}'
 		except FileSystemError as e:
@@ -795,16 +766,6 @@ class FileSystem:
 
 		try:
 			await file_obj.append(content, self.data_dir)
-			self.manifest.register(
-				display_name=full_filename,
-				source=FileSource.VIRTUAL,
-				path_type=PathType.VIRTUAL_NAME,
-				real_path=str(self.data_dir / file_obj.full_name),
-				size_bytes=file_obj.get_size,
-				readable=True,
-				uploadable=True,
-				last_action='append',
-			)
 			sanitize_note = f" (auto-corrected from '{original_filename}')" if was_sanitized else ''
 			return f'Data appended to file {full_filename} successfully.{sanitize_note}'
 		except FileSystemError as e:
@@ -833,16 +794,6 @@ class FileSystem:
 			content = file_obj.read()
 			content = content.replace(old_str, new_str)
 			await file_obj.write(content, self.data_dir)
-			self.manifest.register(
-				display_name=full_filename,
-				source=FileSource.VIRTUAL,
-				path_type=PathType.VIRTUAL_NAME,
-				real_path=str(self.data_dir / file_obj.full_name),
-				size_bytes=file_obj.get_size,
-				readable=True,
-				uploadable=True,
-				last_action='replace',
-			)
 			sanitize_note = f" (auto-corrected from '{original_filename}')" if was_sanitized else ''
 			return f'Successfully replaced all occurrences of "{old_str}" with "{new_str}" in file {full_filename}{sanitize_note}'
 		except FileSystemError as e:
@@ -858,16 +809,6 @@ class FileSystem:
 		await file_obj.write(content, self.data_dir)
 		self.files[extracted_filename] = file_obj
 		self.extracted_content_count += 1
-		self.manifest.register(
-			display_name=extracted_filename,
-			source=FileSource.EXTRACTED,
-			path_type=PathType.VIRTUAL_NAME,
-			real_path=str(self.data_dir / file_obj.full_name),
-			size_bytes=file_obj.get_size,
-			readable=True,
-			uploadable=True,
-			last_action='extract',
-		)
 		return extracted_filename
 
 	def describe(self) -> str:
@@ -954,12 +895,8 @@ class FileSystem:
 		for full_filename, file_obj in self.files.items():
 			files_data[full_filename] = {'type': file_obj.__class__.__name__, 'data': file_obj.model_dump()}
 
-		manifest_state = self.manifest.get_state()
 		return FileSystemState(
-			files=files_data,
-			base_dir=str(self.base_dir),
-			extracted_content_count=self.extracted_content_count,
-			manifest_state=manifest_state.entries if manifest_state.entries else None,
+			files=files_data, base_dir=str(self.base_dir), extracted_content_count=self.extracted_content_count
 		)
 
 	def nuke(self) -> None:
@@ -1000,12 +937,5 @@ class FileSystem:
 			# Add to files dict and sync to disk
 			fs.files[full_filename] = file_obj
 			file_obj.sync_to_disk_sync(fs.data_dir)
-
-		if state.manifest_state:
-			from browser_use.filesystem.workspace_manifest import WorkspaceManifestState
-
-			fs.manifest = WorkspaceManifest.from_state(WorkspaceManifestState(entries=state.manifest_state))
-		else:
-			fs._sync_manifest_from_files()
 
 		return fs

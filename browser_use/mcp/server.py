@@ -444,6 +444,63 @@ class BrowserUseServer:
 					description='Close all active browser sessions and clean up resources',
 					inputSchema={'type': 'object', 'properties': {}},
 				),
+				# Task template tools
+				types.Tool(
+					name='template_list',
+					description='List all saved task templates (reusable automation blueprints). Returns template names, descriptions, variables, and tags.',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'tags': {
+								'type': 'array',
+								'items': {'type': 'string'},
+								'description': 'Optional list of tags to filter templates (match any tag).',
+							},
+						},
+					},
+				),
+				types.Tool(
+					name='template_show',
+					description='Show the full definition of a saved task template, including its prompt template, variables, browser settings, LLM provider, allowed tools, and output file rules.',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'name': {
+								'type': 'string',
+								'description': 'Name of the template to inspect.',
+							},
+						},
+						'required': ['name'],
+					},
+				),
+				types.Tool(
+					name='template_run',
+					description='Execute a saved task template. Templates are pre-defined automation blueprints with variables you can customize. Returns a structured result with status, extracted content, output files, URLs visited, and failure reason if any.',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'name': {
+								'type': 'string',
+								'description': 'Name of the saved template to run.',
+							},
+							'variables': {
+								'type': 'object',
+								'description': (
+									'Dictionary of variable name -> value to pass to the template. '
+									'Check template_show to see which variables are available/required. '
+									'Example: {"query": "python jobs", "output_file": "./results.csv"}'
+								),
+								'default': {},
+							},
+							'max_steps': {
+								'type': 'integer',
+								'description': 'Override the template\'s default maximum agent steps.',
+								'minimum': 1,
+							},
+						},
+						'required': ['name'],
+					},
+				),
 			]
 
 		@self.server.list_resources()
@@ -507,6 +564,19 @@ class BrowserUseServer:
 
 		elif tool_name == 'browser_close_all':
 			return await self._close_all_sessions()
+
+		# Task template tools
+		elif tool_name.startswith('template_'):
+			if tool_name == 'template_list':
+				return await self._template_list(arguments.get('tags'))
+			elif tool_name == 'template_show':
+				return await self._template_show(arguments['name'])
+			elif tool_name == 'template_run':
+				return await self._template_run(
+					name=arguments['name'],
+					variables=arguments.get('variables', {}),
+					max_steps=arguments.get('max_steps'),
+				)
 
 		# Direct browser control tools (require active session)
 		elif tool_name.startswith('browser_'):
@@ -1194,6 +1264,104 @@ class BrowserUseServer:
 			result += f'. Errors: {"; ".join(errors)}'
 
 		return result
+
+	async def _template_list(self, tags: list[str] | None = None) -> str:
+		"""List saved task templates with optional tag filtering."""
+		from browser_use.task_templates.service import get_template_manager
+
+		mgr = get_template_manager()
+		templates = mgr.list_templates()
+
+		if tags:
+			tag_set = {t.lower() for t in tags}
+			templates = [
+				t for t in templates
+				if tag_set & {tg.lower() for tg in t.tags}
+			]
+
+		entries = []
+		for t in templates:
+			variables_info = []
+			for name, var in t.variables.items():
+				variables_info.append({
+					'name': name,
+					'type': var.type.value,
+					'required': var.required,
+					'description': var.description,
+					'has_default': var.default is not None,
+				})
+			entries.append({
+				'name': t.name,
+				'version': t.version,
+				'description': t.description,
+				'tags': t.tags,
+				'variables': variables_info,
+				'max_steps': t.max_steps,
+				'has_llm_config': t.llm is not None,
+				'has_browser_profile': t.browser_profile is not None,
+				'output_file_rules': len(t.output_files),
+				'allowed_tools': t.default_tools,
+				'excluded_tools': t.exclude_tools,
+			})
+		return json.dumps({'templates': entries, 'count': len(entries)}, indent=2)
+
+	async def _template_show(self, name: str) -> str:
+		"""Show full definition of a saved task template."""
+		from browser_use.task_templates.service import get_template_manager
+
+		mgr = get_template_manager()
+		try:
+			tpl = mgr.load(name)
+		except FileNotFoundError:
+			return json.dumps({'error': f'Template {name!r} not found', 'found': False}, indent=2)
+		except ValueError as e:
+			return json.dumps({'error': f'Failed to load template: {e}', 'found': False}, indent=2)
+
+		data = tpl.model_dump(mode='json')
+		return json.dumps({'found': True, 'template': data}, indent=2)
+
+	async def _template_run(
+		self,
+		name: str,
+		variables: dict[str, Any] | None = None,
+		max_steps: int | None = None,
+	) -> str:
+		"""Execute a saved task template and return structured result."""
+		from browser_use.task_templates.service import get_template_manager
+		from browser_use.task_templates.views import TaskTemplateStatus
+
+		mgr = get_template_manager()
+		try:
+			result = await mgr.run(
+				name,
+				variables=variables or {},
+				max_steps=max_steps,
+			)
+		except FileNotFoundError:
+			return json.dumps({
+				'status': 'failed',
+				'success': False,
+				'error': f'Template {name!r} not found',
+				'template_name': name,
+			}, indent=2)
+
+		# Build a machine-readable payload
+		payload = {
+			'template_name': result.template_name,
+			'status': result.status.value,
+			'success': result.success,
+			'num_steps': result.num_steps,
+			'duration_seconds': round(result.duration_seconds, 3),
+			'variables_used': result.variables_used,
+			'extracted_content': result.extracted_content,
+			'structured_output': result.structured_output,
+			'output_files': result.output_files,
+			'missing_output_files': result.missing_output_files,
+			'urls_visited': result.urls_visited,
+			'error': result.error,
+			'error_type': result.error_type,
+		}
+		return json.dumps(payload, indent=2, ensure_ascii=False)
 
 	async def _cleanup_expired_sessions(self) -> None:
 		"""Background task to clean up expired sessions."""

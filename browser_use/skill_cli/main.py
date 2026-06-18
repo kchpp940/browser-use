@@ -619,6 +619,15 @@ def build_parser() -> argparse.ArgumentParser:
   browser-use cloud v2 --help                   # Show API endpoints""")
 
 	epilog_parts.append("""
+Task Templates:
+  browser-use template list                     # List saved task templates
+  browser-use template show <name>              # Show template definition
+  browser-use template run <name>               # Run a saved template
+  browser-use template run <name> --var k=v     # Run with variable overrides
+  browser-use template create <file.json>       # Create template from JSON file
+  browser-use template edit <name>              # Open template in $EDITOR
+  browser-use template delete <name>            # Delete a template
+
 Setup:
   browser-use open https://example.com          # Navigate to URL
   browser-use install                           # Install Chromium browser
@@ -695,6 +704,57 @@ Setup:
 	config_sub.add_parser('list', help='List all config values')
 	p = config_sub.add_parser('unset', help='Remove a config value')
 	p.add_argument('key', help='Config key')
+
+	# -------------------------------------------------------------------------
+	# Task Template Commands
+	# -------------------------------------------------------------------------
+
+	template_p = subparsers.add_parser('template', help='Manage reusable task templates')
+	template_sub = template_p.add_subparsers(dest='template_command', help='Template subcommand')
+
+	# template list
+	template_list_p = template_sub.add_parser('list', help='List saved task templates')
+	template_list_p.add_argument('--tags', nargs='*', help='Filter by tags (match any)')
+	template_list_p.add_argument('--verbose', '-v', action='store_true', help='Show more details per template')
+
+	# template show
+	template_show_p = template_sub.add_parser('show', help='Show a template definition')
+	template_show_p.add_argument('name', help='Template name')
+	template_show_p.add_argument('--raw', action='store_true', help='Output raw JSON instead of pretty-printed')
+
+	# template run
+	template_run_p = template_sub.add_parser('run', help='Run a saved task template')
+	template_run_p.add_argument('name', help='Template name')
+	template_run_p.add_argument(
+		'--var',
+		'-V',
+		action='append',
+		dest='vars',
+		help='Set a variable: --var key=value (repeatable). JSON-compatible strings are parsed.',
+	)
+	template_run_p.add_argument('--vars-json', help='Set all variables from a JSON object string or file path')
+	template_run_p.add_argument('--max-steps', type=int, default=None, help='Override template max_steps')
+	template_run_p.add_argument('--output-json', action='store_true', help='Output structured result as JSON')
+	template_run_p.add_argument('--quiet', '-q', action='store_true', help='Suppress progress output')
+
+	# template create
+	template_create_p = template_sub.add_parser('create', help='Create a new template from a JSON file')
+	template_create_p.add_argument('file', help='Path to JSON template definition')
+	template_create_p.add_argument('--force', '-f', action='store_true', help='Overwrite existing template with same name')
+
+	# template edit
+	template_edit_p = template_sub.add_parser('edit', help='Edit a saved template in $EDITOR')
+	template_edit_p.add_argument('name', help='Template name')
+
+	# template delete
+	template_delete_p = template_sub.add_parser('delete', help='Delete a saved template')
+	template_delete_p.add_argument('name', help='Template name')
+	template_delete_p.add_argument('--yes', '-y', action='store_true', help='Skip confirmation prompt')
+
+	# template init (scaffold)
+	template_init_p = template_sub.add_parser('init', help='Create a sample template JSON file to get started')
+	template_init_p.add_argument('--output', '-o', default=None, help='Output file path (default: ./sample-template.json)')
+	template_init_p.add_argument('--force', '-f', action='store_true', help='Overwrite existing file')
 
 	# -------------------------------------------------------------------------
 	# Browser Control Commands
@@ -1334,6 +1394,12 @@ def main() -> int:
 			print(f'  Docs: {CLI_DOCS_URL}')
 
 		return 0
+
+	# Handle template command - manages reusable task templates
+	if args.command == 'template':
+		from browser_use.skill_cli.commands.template import handle_template_command
+
+		return handle_template_command(args)
 
 	# Handle tunnel command - runs independently of browser session
 	if args.command == 'tunnel':
