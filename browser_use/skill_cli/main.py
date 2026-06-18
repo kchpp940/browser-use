@@ -417,7 +417,7 @@ def _is_daemon_alive(session: str = 'default') -> bool:
 
 def ensure_daemon(
 	headed: bool,
-	profile: str | None,
+	profile_directory: str | None,
 	cdp_url: str | None = None,
 	*,
 	session: str = 'default',
@@ -426,7 +426,7 @@ def ensure_daemon(
 	cloud_profile_id: str | None = None,
 	cloud_proxy_country_code: str | None = None,
 	cloud_timeout: int | None = None,
-	preset: str | None = None,
+	profile: str | None = None,
 ) -> None:
 	"""Start daemon if not running. Uses state file for phase-aware decisions."""
 	probe = _probe_session(session)
@@ -436,17 +436,17 @@ def ensure_daemon(
 		if not explicit_config:
 			return  # Reuse it
 
-		# User explicitly set --headed/--profile/--cdp-url/--preset — check config matches
+		# User explicitly set --headed/--profile-directory/--cdp-url/--profile — check config matches
 		try:
 			response = send_command('ping', {}, session=session)
 			if response.get('success'):
 				data = response.get('data', {})
 				if (
 					data.get('headed') == headed
-					and data.get('profile') == profile
+					and data.get('profile_directory') == profile_directory
 					and data.get('cdp_url') == cdp_url
 					and data.get('use_cloud') == use_cloud
-					and data.get('preset') == preset
+					and data.get('profile') == profile
 				):
 					return  # Already running with correct config
 
@@ -508,8 +508,8 @@ def ensure_daemon(
 	]
 	if headed:
 		cmd.append('--headed')
-	if profile:
-		cmd.extend(['--profile', profile])
+	if profile_directory:
+		cmd.extend(['--profile-directory', profile_directory])
 	if cdp_url:
 		cmd.extend(['--cdp-url', cdp_url])
 	if use_cloud:
@@ -520,8 +520,8 @@ def ensure_daemon(
 		cmd.extend(['--cloud-proxy-country', cloud_proxy_country_code])
 	if cloud_timeout is not None:
 		cmd.extend(['--cloud-timeout', str(cloud_timeout)])
-	if preset is not None:
-		cmd.extend(['--preset', preset])
+	if profile is not None:
+		cmd.extend(['--profile', profile])
 
 	# Set up environment
 	env = os.environ.copy()
@@ -638,14 +638,14 @@ Setup:
 	# Global flags
 	parser.add_argument('--headed', action='store_true', help='Show browser window')
 	parser.add_argument(
-		'--profile',
+		'--profile-directory',
 		nargs='?',
 		const='Default',
 		default=None,
-		help='Use real Chrome with profile (bare --profile uses "Default")',
+		help='Use real Chrome with profile directory (bare --profile-directory uses "Default")',
 	)
 	parser.add_argument(
-		'--preset',
+		'--profile',
 		default=None,
 		help='Profile preset to load (from profiles.json)',
 	)
@@ -974,7 +974,7 @@ def _handle_cloud_connect(cloud_args: list[str], args: argparse.Namespace, sessi
 		cloud_profile_id=cloud_profile_id,
 		cloud_proxy_country_code=_get_cloud_connect_proxy(),
 		cloud_timeout=_get_cloud_connect_timeout(),
-		preset=args.preset,
+		profile=args.profile,
 	)
 
 	# Send connect command to force immediate session creation
@@ -1436,7 +1436,7 @@ def main() -> int:
 			print(f'Error: {e}', file=sys.stderr)
 			return 1
 
-		ensure_daemon(args.headed, None, cdp_url=cdp_url, session=session, explicit_config=True, preset=args.preset)
+		ensure_daemon(args.headed, None, cdp_url=cdp_url, session=session, explicit_config=True, profile=args.profile)
 		response = send_command('connect', {}, session=session)
 
 		if args.json:
@@ -1453,16 +1453,16 @@ def main() -> int:
 		return 0
 
 	# Mutual exclusivity
-	if args.cdp_url and args.profile:
-		print('Error: --cdp-url and --profile are mutually exclusive', file=sys.stderr)
+	if args.cdp_url and args.profile_directory:
+		print('Error: --cdp-url and --profile-directory are mutually exclusive', file=sys.stderr)
 		return 1
 
 	# One-time legacy migration
 	_migrate_legacy_files()
 
 	# Ensure daemon is running
-	explicit_config = any(flag in sys.argv for flag in ('--headed', '--profile', '--cdp-url', '--preset'))
-	ensure_daemon(args.headed, args.profile, args.cdp_url, session=session, explicit_config=explicit_config, preset=args.preset)
+	explicit_config = any(flag in sys.argv for flag in ('--headed', '--profile-directory', '--profile', '--cdp-url'))
+	ensure_daemon(args.headed, args.profile_directory, args.cdp_url, session=session, explicit_config=explicit_config, profile=args.profile)
 
 	# Build params from args
 	params = {}

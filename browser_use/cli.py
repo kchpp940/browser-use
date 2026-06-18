@@ -2346,11 +2346,12 @@ def profiles_list():
 @profiles.command('show')
 @click.argument('name', required=False)
 @click.option('--json', 'as_json', is_flag=True, help='Output as JSON')
-def profiles_show(name: str | None = None, as_json: bool = False):
+@click.option('--effective', 'show_effective', is_flag=True, help='Show effective config (with env overrides applied)')
+def profiles_show(name: str | None = None, as_json: bool = False, show_effective: bool = False):
 	"""Show details of a profile preset"""
 	import json
 
-	from browser_use.profiles.manager import get_profile_manager
+	from browser_use.profiles.manager import build_effective_config, get_profile_manager
 
 	manager = get_profile_manager()
 
@@ -2366,6 +2367,50 @@ def profiles_show(name: str | None = None, as_json: bool = False):
 	except ValueError as e:
 		click.echo(f'Error: {e}', err=True)
 		sys.exit(1)
+
+	if show_effective:
+		effective = build_effective_config(profile_name=name, source='cli')
+		if as_json:
+			output = {
+				'profile_name': effective.profile_name,
+				'source': effective.source,
+				'signature': effective.signature(),
+				'browser': effective.browser,
+				'llm': effective.llm.model_dump(exclude_none=True),
+				'agent': effective.agent,
+			}
+			click.echo(json.dumps(output, indent=2, default=str))
+			return
+
+		click.echo(f'Effective config for profile: {effective.profile_name or "(none)"}')
+		click.echo(f'Source: {effective.source}')
+		click.echo(f'Signature: {effective.signature()}')
+		click.echo()
+
+		click.echo('Browser settings:')
+		if effective.browser:
+			for key, value in sorted(effective.browser.items()):
+				click.echo(f'  {key}: {value}')
+		else:
+			click.echo('  (none)')
+		click.echo()
+
+		click.echo('LLM settings:')
+		llm_dict = effective.llm.model_dump(exclude_none=True)
+		if llm_dict:
+			for key, value in sorted(llm_dict.items()):
+				click.echo(f'  {key}: {value}')
+		else:
+			click.echo('  (none)')
+		click.echo()
+
+		click.echo('Agent settings:')
+		if effective.agent:
+			for key, value in sorted(effective.agent.items()):
+				click.echo(f'  {key}: {value}')
+		else:
+			click.echo('  (none)')
+		return
 
 	if as_json:
 		output = {

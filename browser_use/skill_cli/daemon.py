@@ -34,27 +34,27 @@ class Daemon:
 	def __init__(
 		self,
 		headed: bool,
-		profile: str | None,
+		profile_directory: str | None,
 		cdp_url: str | None = None,
 		use_cloud: bool = False,
 		cloud_profile_id: str | None = None,
 		cloud_proxy_country_code: str | None = None,
 		cloud_timeout: int | None = None,
 		session: str = 'default',
-		preset: str | None = None,
+		profile: str | None = None,
 	) -> None:
 		from browser_use.skill_cli.utils import validate_session_name
 
 		validate_session_name(session)
 		self.session = session
 		self.headed = headed
-		self.profile = profile
+		self.profile_directory = profile_directory
 		self.cdp_url = cdp_url
 		self.use_cloud = use_cloud
 		self.cloud_profile_id = cloud_profile_id
 		self.cloud_proxy_country_code = cloud_proxy_country_code
 		self.cloud_timeout = cloud_timeout
-		self.preset = preset
+		self.profile = profile
 		self.running = True
 		self._server: asyncio.Server | None = None
 		self._shutdown_event = asyncio.Event()
@@ -80,10 +80,10 @@ class Daemon:
 			'updated_at': time.time(),
 			'config': {
 				'headed': self.headed,
-				'profile': self.profile,
+				'profile_directory': self.profile_directory,
 				'cdp_url': self.cdp_url,
 				'use_cloud': self.use_cloud,
-				'preset': self.preset,
+				'profile': self.profile,
 			},
 		}
 		state_path = get_home_dir() / f'{self.session}.state.json'
@@ -117,20 +117,20 @@ class Daemon:
 			from browser_use.skill_cli.sessions import SessionInfo, create_browser_session
 
 			logger.info(
-				f'Creating session (headed={self.headed}, profile={self.profile}, cdp_url={self.cdp_url}, use_cloud={self.use_cloud})'
+				f'Creating session (headed={self.headed}, profile_directory={self.profile_directory}, cdp_url={self.cdp_url}, use_cloud={self.use_cloud})'
 			)
 
 			self._write_state('starting')
 
 			bs = await create_browser_session(
 				self.headed,
-				self.profile,
+				self.profile_directory,
 				self.cdp_url,
 				use_cloud=self.use_cloud,
 				cloud_profile_id=self.cloud_profile_id,
 				cloud_proxy_country_code=self.cloud_proxy_country_code,
 				cloud_timeout=self.cloud_timeout,
-				preset=self.preset,
+				profile=self.profile,
 			)
 
 			try:
@@ -151,11 +151,12 @@ class Daemon:
 				self._session = SessionInfo(
 					name=self.session,
 					headed=self.headed,
-					profile=self.profile,
+					profile_directory=self.profile_directory,
 					cdp_url=self.cdp_url,
 					browser_session=bs,
 					actions=actions,
 					use_cloud=self.use_cloud,
+					profile=self.profile,
 				)
 				self._browser_watchdog_task = asyncio.create_task(self._watch_browser())
 
@@ -291,10 +292,10 @@ class Daemon:
 						'session': self.session,
 						'pid': os.getpid(),
 						'headed': self.headed,
-						'profile': self.profile,
+						'profile_directory': self.profile_directory,
 						'cdp_url': live_cdp_url,
 						'use_cloud': self.use_cloud,
-						'preset': self.preset,
+						'profile': self.profile,
 					},
 				}
 
@@ -520,30 +521,31 @@ def main() -> None:
 	parser = argparse.ArgumentParser(description='Browser-use daemon')
 	parser.add_argument('--session', default='default', help='Session name (default: "default")')
 	parser.add_argument('--headed', action='store_true', help='Show browser window')
-	parser.add_argument('--profile', help='Chrome profile (triggers real Chrome mode)')
+	parser.add_argument('--profile-directory', help='Chrome profile directory (triggers real Chrome mode)')
+	parser.add_argument('--profile', help='Profile preset to load (from profiles.json)')
 	parser.add_argument('--cdp-url', help='CDP URL to connect to')
 	parser.add_argument('--use-cloud', action='store_true', help='Use cloud browser')
 	parser.add_argument('--cloud-profile-id', help='Cloud browser profile ID')
 	parser.add_argument('--cloud-proxy-country', help='Cloud browser proxy country code')
 	parser.add_argument('--cloud-timeout', type=int, help='Cloud browser timeout in minutes')
-	parser.add_argument('--preset', help='Profile preset to load (from profiles.json)')
 	args = parser.parse_args()
 
 	logger.info(
-		f'Starting daemon: session={args.session}, headed={args.headed}, profile={args.profile}, '
-		f'cdp_url={args.cdp_url}, use_cloud={args.use_cloud}, preset={args.preset}'
+		f'Starting daemon: session={args.session}, headed={args.headed}, '
+		f'profile_directory={args.profile_directory}, cdp_url={args.cdp_url}, '
+		f'use_cloud={args.use_cloud}, profile={args.profile}'
 	)
 
 	daemon = Daemon(
 		headed=args.headed,
-		profile=args.profile,
+		profile_directory=args.profile_directory,
 		cdp_url=args.cdp_url,
 		use_cloud=args.use_cloud,
 		cloud_profile_id=args.cloud_profile_id,
 		cloud_proxy_country_code=args.cloud_proxy_country,
 		cloud_timeout=args.cloud_timeout,
 		session=args.session,
-		preset=args.preset,
+		profile=args.profile,
 	)
 
 	exit_code = 0
