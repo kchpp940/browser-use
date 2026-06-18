@@ -2,7 +2,6 @@
 
 import asyncio
 import logging
-import os
 import re
 import time
 from functools import cached_property
@@ -138,8 +137,6 @@ class BrowserSession(BaseModel):
 	def __init__(
 		self,
 		*,
-		# Profile preset
-		profile: str | None = None,
 		# Cloud browser params - use these for cloud mode
 		cloud_profile_id: UUID | str | None = None,
 		cloud_proxy_country_code: ProxyCountryCode | None = None,
@@ -176,8 +173,6 @@ class BrowserSession(BaseModel):
 	def __init__(
 		self,
 		*,
-		# Profile preset
-		profile: str | None = None,
 		# Core configuration for local
 		id: str | None = None,
 		cdp_url: str | None = None,
@@ -243,8 +238,6 @@ class BrowserSession(BaseModel):
 		cdp_url: str | None = None,
 		is_local: bool = False,
 		browser_profile: BrowserProfile | None = None,
-		# Profile preset
-		profile: str | None = None,
 		# Cloud browser params (don't mix with local browser params)
 		cloud_profile_id: UUID | str | None = None,
 		cloud_proxy_country_code: ProxyCountryCode | None = _UNSET,  # type: ignore[assignment]
@@ -317,24 +310,6 @@ class BrowserSession(BaseModel):
 		max_iframes: int | None = None,
 		max_iframe_depth: int | None = None,
 	):
-		# ── Step 1: Build effective config from profile preset + environment ──
-		# Priority so far (lowest to highest): profile preset → env vars
-		effective = None
-		if profile is not None or os.environ.get('BROWSER_USE_PROFILE'):
-			from browser_use.profiles.manager import build_effective_config
-
-			effective = build_effective_config(
-				profile_name=profile,
-				source='api',
-			)
-			# Log the profile info (will add more about overrides later if needed)
-			from browser_use.profiles.manager import get_profile_manager
-
-			get_profile_manager().log_effective_profile_info(effective)
-
-		profile_browser_dict: dict[str, Any] = effective.browser if effective is not None else {}
-
-		# ── Step 2: Collect direct kwargs (explicit API parameters) ──
 		# Following the same pattern as AgentSettings in service.py
 		# Only pass non-None values to avoid validation errors
 		# Also filter _UNSET sentinel values (used for proxy params)
@@ -345,9 +320,6 @@ class BrowserSession(BaseModel):
 			not in [
 				'self',
 				'browser_profile',
-				'profile',
-				'effective',
-				'profile_browser_dict',
 				'id',
 				'cloud_profile_id',
 				'cloud_proxy_country_code',
@@ -403,20 +375,13 @@ class BrowserSession(BaseModel):
 		if not cdp_url and not use_cloud:
 			profile_kwargs['is_local'] = True
 
-		# ── Step 3: Merge all layers ──
-		# Priority (lowest to highest):
-		#   1. Profile preset (from profiles.json)
-		#   2. Environment variables
-		#   3. browser_profile param
-		#   4. Direct kwargs
-		merged_kwargs = profile_browser_dict.copy()
-
+		# Create browser profile from direct parameters or use provided one
 		if browser_profile is not None:
-			merged_kwargs = {**merged_kwargs, **browser_profile.model_dump(exclude_unset=True)}
-
-		merged_kwargs = {**merged_kwargs, **profile_kwargs}
-
-		resolved_browser_profile = BrowserProfile(**merged_kwargs)
+			# Merge any direct kwargs into the provided browser_profile (direct kwargs take precedence)
+			merged_kwargs = {**browser_profile.model_dump(exclude_unset=True), **profile_kwargs}
+			resolved_browser_profile = BrowserProfile(**merged_kwargs)
+		else:
+			resolved_browser_profile = BrowserProfile(**profile_kwargs)
 
 		# Initialize the Pydantic model
 		super().__init__(

@@ -874,6 +874,10 @@ class Tools(Generic[Context]):
 							params = UploadFileAction(index=params.index, path=file_system_path)
 						else:
 							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
+							if file_system.manifest:
+								hint = file_system.manifest.suggest_for_upload(params.path)
+								if hint:
+									msg += f'\n{hint}'
 							logger.error(f'❌ {msg}')
 							return ActionResult(error=msg)
 					else:
@@ -882,6 +886,10 @@ class Tools(Generic[Context]):
 							pass
 						else:
 							msg = f'File path {params.path} is not available. To fix: The user must add this file path to the available_file_paths parameter when creating the Agent. Example: Agent(task="...", llm=llm, browser=browser, available_file_paths=["{params.path}"])'
+							if file_system and file_system.manifest:
+								hint = file_system.manifest.suggest_for_upload(params.path)
+								if hint:
+									msg += f'\n{hint}'
 							raise BrowserError(message=msg, long_term_memory=msg)
 
 			# For local browsers, ensure the file exists and has content
@@ -1610,6 +1618,12 @@ You will be given a query and the markdown of a webpage that has been filtered t
 			msg = f'Saved page as PDF: {file_name} ({file_size:,} bytes)'
 			logger.info(f'📄 {msg}. Full path: {file_path}')
 
+			file_system.manifest.register_pdf_save(
+				display_name=file_name,
+				real_path=str(file_path),
+				size_bytes=file_size,
+			)
+
 			return ActionResult(
 				extracted_content=msg,
 				long_term_memory=f'{msg}. Full path: {file_path}',
@@ -1743,6 +1757,11 @@ You will be given a query and the markdown of a webpage that has been filtered t
 
 			result = structured_result['message']
 			images = structured_result.get('images')
+
+			if 'not found' in result.lower() and file_system.manifest:
+				hint = file_system.manifest.suggest_for_read(file_name)
+				if hint:
+					result += f'\n{hint}'
 
 			MAX_MEMORY_SIZE = 1000
 			# For images, create a shorter memory message

@@ -301,114 +301,43 @@ def save_user_config(config: dict[str, Any]) -> None:
 			json.dump(history, f, indent=2, ensure_ascii=False)
 
 
-def apply_profile_to_config(config: dict[str, Any], profile_name: str) -> dict[str, Any]:
-	"""Apply profile preset settings to configuration dictionary.
-
-	Profile settings override existing config values, except for command_history.
-	CLI arguments will be applied on top of profile settings.
-	"""
-	from browser_use.profiles.manager import get_profile_manager
-
-	manager = get_profile_manager()
-	resolved_profile = manager.get_profile(profile_name)
-	manager.log_profile_info(resolved_profile)
-
-	# Apply LLM settings
-	if resolved_profile.llm.provider or resolved_profile.llm.model:
-		if 'model' not in config:
-			config['model'] = {}
-		if resolved_profile.llm.model:
-			config['model']['name'] = resolved_profile.llm.model
-		if resolved_profile.llm.temperature is not None:
-			config['model']['temperature'] = resolved_profile.llm.temperature
-
-	# Apply browser settings
-	if resolved_profile.browser:
-		if 'browser' not in config:
-			config['browser'] = {}
-		for key, value in resolved_profile.browser.items():
-			if value is not None:
-				config['browser'][key] = value
-
-	# Apply agent settings
-	if resolved_profile.agent:
-		config['agent'] = resolved_profile.agent
-
-	# Store profile name in config for reference
-	config['profile_name'] = profile_name
-
-	return config
-
-
-def _get_cli_overrides(ctx: click.Context) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-	"""Extract browser, llm, and agent overrides from CLI arguments.
-
-	Returns:
-	    Tuple of (browser_overrides, llm_overrides, agent_overrides)
-	"""
-	browser_overrides: dict[str, Any] = {}
-	llm_overrides: dict[str, Any] = {}
-	agent_overrides: dict[str, Any] = {}
-
-	# LLM overrides
-	if ctx.params.get('model'):
-		llm_overrides['model'] = ctx.params['model']
-
-	# Browser overrides
-	if ctx.params.get('headless') is not None:
-		browser_overrides['headless'] = ctx.params['headless']
-	if ctx.params.get('window_width') or ctx.params.get('window_height'):
-		window_size = {}
-		if ctx.params.get('window_width'):
-			window_size['width'] = ctx.params['window_width']
-		if ctx.params.get('window_height'):
-			window_size['height'] = ctx.params['window_height']
-		browser_overrides['window_size'] = window_size
-	if ctx.params.get('user_data_dir'):
-		browser_overrides['user_data_dir'] = ctx.params['user_data_dir']
-	if ctx.params.get('profile_directory'):
-		browser_overrides['profile_directory'] = ctx.params['profile_directory']
-	if ctx.params.get('cdp_url'):
-		browser_overrides['cdp_url'] = ctx.params['cdp_url']
-
-	# Proxy overrides
-	proxy: dict[str, str] = {}
-	if ctx.params.get('proxy_url'):
-		proxy['server'] = ctx.params['proxy_url']
-	if ctx.params.get('no_proxy'):
-		proxy['bypass'] = ','.join([p.strip() for p in ctx.params['no_proxy'].split(',') if p.strip()])
-	if ctx.params.get('proxy_username'):
-		proxy['username'] = ctx.params['proxy_username']
-	if ctx.params.get('proxy_password'):
-		proxy['password'] = ctx.params['proxy_password']
-	if proxy:
-		browser_overrides['proxy'] = proxy
-
-	return browser_overrides, llm_overrides, agent_overrides
-
-
 def update_config_with_click_args(config: dict[str, Any], ctx: click.Context) -> dict[str, Any]:
-	"""Update configuration with command-line arguments.
-
-	Deprecated: Use _get_cli_overrides + build_effective_config instead.
-	Kept for backwards compatibility with the TUI config dict.
-	"""
+	"""Update configuration with command-line arguments."""
 	# Ensure required sections exist
 	if 'model' not in config:
 		config['model'] = {}
 	if 'browser' not in config:
 		config['browser'] = {}
 
-	browser_overrides, llm_overrides, _ = _get_cli_overrides(ctx)
+	# Update configuration with command-line args if provided
+	if ctx.params.get('model'):
+		config['model']['name'] = ctx.params['model']
+	if ctx.params.get('headless') is not None:
+		config['browser']['headless'] = ctx.params['headless']
+	if ctx.params.get('window_width'):
+		config['browser']['window_width'] = ctx.params['window_width']
+	if ctx.params.get('window_height'):
+		config['browser']['window_height'] = ctx.params['window_height']
+	if ctx.params.get('user_data_dir'):
+		config['browser']['user_data_dir'] = ctx.params['user_data_dir']
+	if ctx.params.get('profile_directory'):
+		config['browser']['profile_directory'] = ctx.params['profile_directory']
+	if ctx.params.get('cdp_url'):
+		config['browser']['cdp_url'] = ctx.params['cdp_url']
 
-	# Apply LLM overrides
-	if 'model' in llm_overrides:
-		config['model']['name'] = llm_overrides['model']
-
-	# Apply browser overrides
-	for key, value in browser_overrides.items():
-		if value is not None:
-			config['browser'][key] = value
+	# Consolidated proxy dict
+	proxy: dict[str, str] = {}
+	if ctx.params.get('proxy_url'):
+		proxy['server'] = ctx.params['proxy_url']
+	if ctx.params.get('no_proxy'):
+		# Store as comma-separated list string to match Chrome flag
+		proxy['bypass'] = ','.join([p.strip() for p in ctx.params['no_proxy'].split(',') if p.strip()])
+	if ctx.params.get('proxy_username'):
+		proxy['username'] = ctx.params['proxy_username']
+	if ctx.params.get('proxy_password'):
+		proxy['password'] = ctx.params['proxy_password']
+	if proxy:
+		config['browser']['proxy'] = proxy
 
 	return config
 
@@ -1576,28 +1505,12 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 	error_msg = None
 
 	try:
-		from browser_use.profiles.manager import build_effective_config, get_profile_manager
+		# Load config
+		config = load_user_config()
+		config = update_config_with_click_args(config, ctx)
 
-		# Build effective config from profile + CLI overrides
-		browser_overrides, llm_overrides, agent_overrides = _get_cli_overrides(ctx)
-
-		# Ensure user_data_dir is set for CLI
-		if 'user_data_dir' not in browser_overrides:
-			browser_overrides['user_data_dir'] = str(USER_DATA_DIR)
-
-		effective = build_effective_config(
-			profile_name=ctx.params.get('profile'),
-			browser_overrides=browser_overrides,
-			llm_overrides=llm_overrides,
-			agent_overrides=agent_overrides,
-			source='cli',
-		)
-
-		# Log effective profile info
-		get_profile_manager().log_effective_profile_info(effective)
-
-		# Create LLM from effective config
-		llm = get_profile_manager().create_llm_from_effective(effective)
+		# Get LLM
+		llm = get_llm(config)
 
 		# Capture telemetry for CLI start in oneshot mode
 		telemetry.capture(
@@ -1610,20 +1523,26 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 			)
 		)
 
-		# Create browser session from effective config
-		browser_profile = get_profile_manager().create_browser_profile_from_effective(effective)
+		# Get agent settings from config
+		agent_settings = AgentSettings.model_validate(config.get('agent', {}))
+
+		# Create browser session with config parameters
+		browser_config = config.get('browser', {})
+		# Remove None values from browser_config
+		browser_config = {k: v for k, v in browser_config.items() if v is not None}
+		# Create BrowserProfile with user_data_dir
+		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
 		browser_session = BrowserSession(
-			browser_profile=browser_profile,
+			browser_profile=profile,
 		)
 
-		# Create and run agent with agent settings from effective config
+		# Create and run agent
 		agent = Agent(
 			task=prompt,
 			llm=llm,
 			browser_session=browser_session,
 			source='cli',
-			profile=ctx.params.get('profile'),
-			**effective.agent,
+			**agent_settings.model_dump(),
 		)
 
 		await agent.run()
@@ -1710,33 +1629,27 @@ async def textual_interface(config: dict[str, Any]):
 
 	logger.debug('Setting up Browser, Controller, and LLM...')
 
-	# Step 1: Initialize BrowserSession with effective config
+	# Step 1: Initialize BrowserSession with config
 	logger.debug('Initializing BrowserSession...')
 	try:
-		from browser_use.profiles.manager import get_profile_manager
-
-		manager = get_profile_manager()
-
-		# Use effective config if available, otherwise fall back to config dict
-		effective = config.get('effective_config')
-		if effective is not None:
-			browser_profile = manager.create_browser_profile_from_effective(effective)
-		else:
-			# Fallback to old method
-			browser_config = config.get('browser', {})
-			browser_config = {k: v for k, v in browser_config.items() if v is not None}
-			browser_profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
+		# Get browser config from the config dict
+		browser_config = config.get('browser', {})
 
 		logger.info('Browser type: chromium')  # BrowserSession only supports chromium
-		if browser_profile.executable_path:
-			logger.info(f'Browser binary: {browser_profile.executable_path}')
-		if browser_profile.headless:
+		if browser_config.get('executable_path'):
+			logger.info(f'Browser binary: {browser_config["executable_path"]}')
+		if browser_config.get('headless'):
 			logger.info('Browser mode: headless')
 		else:
 			logger.info('Browser mode: visible')
 
+		# Create BrowserSession directly with config parameters
+		# Remove None values from browser_config
+		browser_config = {k: v for k, v in browser_config.items() if v is not None}
+		# Create BrowserProfile with user_data_dir
+		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
 		browser_session = BrowserSession(
-			browser_profile=browser_profile,
+			browser_profile=profile,
 		)
 		logger.debug('BrowserSession initialized successfully')
 
@@ -1763,22 +1676,12 @@ async def textual_interface(config: dict[str, Any]):
 		logger.error(f'Error initializing Controller: {str(e)}', exc_info=True)
 		raise RuntimeError(f'Failed to initialize Controller: {str(e)}')
 
-	# Step 4: Get LLM from effective config
+	# Step 4: Get LLM
 	logger.debug('Getting LLM...')
 	try:
-		from browser_use.profiles.manager import get_profile_manager
-
-		manager = get_profile_manager()
-
-		# Use effective config if available, otherwise fall back to old method
-		effective = config.get('effective_config')
-		if effective is not None:
-			llm = manager.create_llm_from_effective(effective)
-		else:
-			# Fallback to old method
-			os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
-			llm = get_llm(config)
-
+		# Ensure setup_logging is not called when importing modules
+		os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
+		llm = get_llm(config)
 		# Log LLM details
 		model_name = getattr(llm, 'model_name', None) or getattr(llm, 'model', 'Unknown model')
 		provider = llm.__class__.__name__
@@ -2109,7 +2012,6 @@ async def run_auth_command():
 @click.option('--proxy-password', type=str, help='Proxy auth password')
 @click.option('-p', '--prompt', type=str, help='Run a single task without the TUI (headless mode)')
 @click.option('--mcp', is_flag=True, help='Run as MCP server (exposes JSON RPC via stdin/stdout)')
-@click.option('--profile', type=str, help='Profile preset to use (from profiles.json)')
 @click.pass_context
 def main(ctx: click.Context, debug: bool = False, **kwargs):
 	"""Browser Use - AI Agent for Web Automation
@@ -2197,50 +2099,15 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 		print(f'Error loading configuration: {str(e)}')
 		sys.exit(1)
 
-	# Build effective config from profile + CLI overrides
-	from browser_use.profiles.manager import build_effective_config, get_profile_manager
-
-	browser_overrides, llm_overrides, agent_overrides = _get_cli_overrides(ctx)
-
-	# Ensure user_data_dir is set for CLI
-	if 'user_data_dir' not in browser_overrides:
-		browser_overrides['user_data_dir'] = str(USER_DATA_DIR)
-
-	effective = build_effective_config(
-		profile_name=kwargs.get('profile'),
-		browser_overrides=browser_overrides,
-		llm_overrides=llm_overrides,
-		agent_overrides=agent_overrides,
-		source='cli',
-	)
-
-	# Log effective profile info
-	get_profile_manager().log_effective_profile_info(effective)
-
-	# Sync effective config back to config dict for UI display and backwards compatibility
-	if 'model' not in config:
-		config['model'] = {}
-	if 'browser' not in config:
-		config['browser'] = {}
-
-	# Sync LLM config
-	if effective.llm.model:
-		config['model']['name'] = effective.llm.model
-	if effective.llm.temperature is not None:
-		config['model']['temperature'] = effective.llm.temperature
-
-	# Sync browser config
-	for key, value in effective.browser.items():
-		if value is not None:
-			config['browser'][key] = value
-
-	# Sync agent config
-	if effective.agent:
-		config['agent'] = effective.agent
-
-	# Store profile name for reference
-	config['profile_name'] = effective.profile_name
-	config['effective_config'] = effective
+	# Update config with command-line arguments
+	logger.debug('Updating configuration with command line arguments...')
+	try:
+		config = update_config_with_click_args(config, ctx)
+		logger.debug('Configuration updated')
+	except Exception as e:
+		logger.error(f'Error updating config with command line args: {str(e)}', exc_info=True)
+		print(f'Error updating configuration: {str(e)}')
+		sys.exit(1)
 
 	# Save updated config
 	logger.debug('Saving user configuration...')
@@ -2312,147 +2179,6 @@ def install():
 	else:
 		print('\n❌ Installation failed')
 		sys.exit(1)
-
-
-@main.group()
-def profiles():
-	"""Manage profile presets"""
-	pass
-
-
-@profiles.command('list')
-def profiles_list():
-	"""List all available profile presets"""
-	from browser_use.profiles.manager import get_profile_manager
-
-	manager = get_profile_manager()
-	profile_list = manager.list_profiles()
-	default_profile = manager.get_default_profile_name()
-
-	if not profile_list:
-		click.echo('No profiles found. Create a profiles.json file to define profiles.')
-		click.echo(f'Config file location: {manager.profiles_file}')
-		return
-
-	click.echo(f'Available profiles ({len(profile_list)}):')
-	for name in sorted(profile_list):
-		marker = ' (default)' if name == default_profile else ''
-		click.echo(f'  • {name}{marker}')
-
-	click.echo()
-	click.echo(f'Config file: {manager.profiles_file}')
-
-
-@profiles.command('show')
-@click.argument('name', required=False)
-@click.option('--json', 'as_json', is_flag=True, help='Output as JSON')
-@click.option('--effective', 'show_effective', is_flag=True, help='Show effective config (with env overrides applied)')
-def profiles_show(name: str | None = None, as_json: bool = False, show_effective: bool = False):
-	"""Show details of a profile preset"""
-	import json
-
-	from browser_use.profiles.manager import build_effective_config, get_profile_manager
-
-	manager = get_profile_manager()
-
-	if name is None:
-		name = manager.get_default_profile_name()
-		if name is None:
-			click.echo('Error: No profile specified and no default profile set.', err=True)
-			click.echo('Usage: browser-use profiles show <profile-name>', err=True)
-			sys.exit(1)
-
-	try:
-		resolved = manager.get_profile(name)
-	except ValueError as e:
-		click.echo(f'Error: {e}', err=True)
-		sys.exit(1)
-
-	if show_effective:
-		effective = build_effective_config(profile_name=name, source='cli')
-		if as_json:
-			output = {
-				'profile_name': effective.profile_name,
-				'source': effective.source,
-				'signature': effective.signature(),
-				'browser': effective.browser,
-				'llm': effective.llm.model_dump(exclude_none=True),
-				'agent': effective.agent,
-			}
-			click.echo(json.dumps(output, indent=2, default=str))
-			return
-
-		click.echo(f'Effective config for profile: {effective.profile_name or "(none)"}')
-		click.echo(f'Source: {effective.source}')
-		click.echo(f'Signature: {effective.signature()}')
-		click.echo()
-
-		click.echo('Browser settings:')
-		if effective.browser:
-			for key, value in sorted(effective.browser.items()):
-				click.echo(f'  {key}: {value}')
-		else:
-			click.echo('  (none)')
-		click.echo()
-
-		click.echo('LLM settings:')
-		llm_dict = effective.llm.model_dump(exclude_none=True)
-		if llm_dict:
-			for key, value in sorted(llm_dict.items()):
-				click.echo(f'  {key}: {value}')
-		else:
-			click.echo('  (none)')
-		click.echo()
-
-		click.echo('Agent settings:')
-		if effective.agent:
-			for key, value in sorted(effective.agent.items()):
-				click.echo(f'  {key}: {value}')
-		else:
-			click.echo('  (none)')
-		return
-
-	if as_json:
-		output = {
-			'name': resolved.name,
-			'description': resolved.description,
-			'browser': resolved.browser,
-			'llm': resolved.llm.model_dump(exclude_none=True),
-			'agent': resolved.agent,
-			'signature': resolved.signature(),
-		}
-		click.echo(json.dumps(output, indent=2, default=str))
-		return
-
-	click.echo(f'Profile: {resolved.name}')
-	if resolved.description:
-		click.echo(f'Description: {resolved.description}')
-	click.echo(f'Signature: {resolved.signature()}')
-	click.echo()
-
-	click.echo('Browser settings:')
-	if resolved.browser:
-		for key, value in sorted(resolved.browser.items()):
-			click.echo(f'  {key}: {value}')
-	else:
-		click.echo('  (none)')
-	click.echo()
-
-	click.echo('LLM settings:')
-	llm_dict = resolved.llm.model_dump(exclude_none=True)
-	if llm_dict:
-		for key, value in sorted(llm_dict.items()):
-			click.echo(f'  {key}: {value}')
-	else:
-		click.echo('  (none)')
-	click.echo()
-
-	click.echo('Agent settings:')
-	if resolved.agent:
-		for key, value in sorted(resolved.agent.items()):
-			click.echo(f'  {key}: {value}')
-	else:
-		click.echo('  (none)')
 
 
 # ============================================================================

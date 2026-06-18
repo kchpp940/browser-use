@@ -221,7 +221,6 @@ def sandbox(
 	log_level: str = 'INFO',
 	quiet: bool = False,
 	headers: dict[str, str] | None = None,
-	profile: str | None = None,
 	on_browser_created: Callable[[BrowserCreatedData], None]
 	| Callable[[BrowserCreatedData], Coroutine[Any, Any, None]]
 	| None = None,
@@ -246,7 +245,6 @@ def sandbox(
 	    log_level: Logging level (INFO, DEBUG, WARNING, ERROR)
 	    quiet: Suppress console output
 	    headers: Additional HTTP headers to send with the request
-	    profile: Profile preset to load (from profiles.json). Provides defaults for cloud settings.
 	    on_browser_created: Callback when browser is created
 	    on_instance_ready: Callback when instance is ready
 	    on_log: Callback for log events
@@ -267,11 +265,6 @@ def sandbox(
 	    # With cloud parameters:
 	    @sandbox(cloud_proxy_country_code='us', cloud_timeout=60)
 	    async def task_with_proxy(browser: Browser) -> str:
-	        ...
-
-	    # With profile preset:
-	    @sandbox(profile='cloud-us')
-	    async def task_with_profile(browser: Browser) -> str:
 	        ...
 	"""
 
@@ -295,40 +288,6 @@ def sandbox(
 			api_key = BROWSER_USE_API_KEY or os.getenv('BROWSER_USE_API_KEY')
 			if not api_key:
 				raise SandboxError('BROWSER_USE_API_KEY is required')
-
-			# 1b. Build effective config from profile + decorator overrides
-			effective_cloud_profile_id = cloud_profile_id
-			effective_cloud_proxy_country_code = cloud_proxy_country_code
-			effective_cloud_timeout = cloud_timeout
-
-			if profile is not None:
-				from browser_use.profiles.manager import build_effective_config, get_profile_manager
-
-				browser_overrides: dict[str, Any] = {}
-				if cloud_profile_id is not None:
-					browser_overrides['cloud_profile_id'] = cloud_profile_id
-				if cloud_proxy_country_code is not None:
-					browser_overrides['cloud_proxy_country_code'] = cloud_proxy_country_code
-				if cloud_timeout is not None:
-					browser_overrides['cloud_timeout'] = cloud_timeout
-
-				effective = build_effective_config(
-					profile_name=profile,
-					browser_overrides=browser_overrides if browser_overrides else None,
-					source='sandbox',
-				)
-
-				get_profile_manager().log_effective_profile_info(effective)
-
-				# Extract effective cloud settings (profile + decorator overrides merged)
-				if 'cloud_profile_id' in effective.browser and effective.browser['cloud_profile_id'] is not None:
-					effective_cloud_profile_id = effective.browser['cloud_profile_id']
-				if 'cloud_proxy_country_code' in effective.browser and effective.browser['cloud_proxy_country_code'] is not None:
-					effective_cloud_proxy_country_code = effective.browser['cloud_proxy_country_code']
-				if 'cloud_timeout' in effective.browser and effective.browser['cloud_timeout'] is not None:
-					effective_cloud_timeout = effective.browser['cloud_timeout']
-			else:
-				effective = None
 
 			# 2. Extract all parameters (explicit + closure)
 			all_params = _extract_all_params(func, args, kwargs)
@@ -397,23 +356,12 @@ async def run(browser):
 			payload['env'] = combined_env
 
 			# Add cloud parameters if provided
-			if effective_cloud_profile_id is not None:
-				payload['cloud_profile_id'] = effective_cloud_profile_id
-			if effective_cloud_proxy_country_code is not None:
-				payload['cloud_proxy_country_code'] = effective_cloud_proxy_country_code
-			if effective_cloud_timeout is not None:
-				payload['cloud_timeout'] = effective_cloud_timeout
-
-			# Add effective profile config for complete configuration passing
-			if effective is not None:
-				payload['profile_config'] = {
-					'profile_name': effective.profile_name,
-					'source': effective.source,
-					'signature': effective.signature(),
-					'browser': effective.browser,
-					'llm': effective.llm.model_dump(exclude_none=True),
-					'agent': effective.agent,
-				}
+			if cloud_profile_id is not None:
+				payload['cloud_profile_id'] = cloud_profile_id
+			if cloud_proxy_country_code is not None:
+				payload['cloud_proxy_country_code'] = cloud_proxy_country_code
+			if cloud_timeout is not None:
+				payload['cloud_timeout'] = cloud_timeout
 
 			url = server_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
 

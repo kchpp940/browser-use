@@ -335,6 +335,11 @@ Available tabs:
 {_todo_contents}
 </todo_contents>
 """
+		if self.file_system and self.file_system.manifest:
+			manifest_summary = self.file_system.manifest.summary()
+			if manifest_summary:
+				agent_state += f'{manifest_summary}\n'
+
 		if self.plan_description:
 			agent_state += f'<plan>\n{self.plan_description}\n</plan>\n'
 
