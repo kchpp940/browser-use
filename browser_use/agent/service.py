@@ -19,11 +19,11 @@ from dotenv import load_dotenv
 from browser_use.agent.cloud_events import (
 	CreateAgentOutputFileEvent,
 	CreateAgentSessionEvent,
-	CreateAgentStepEvent,
 	CreateAgentTaskEvent,
 	UpdateAgentTaskEvent,
 )
 from browser_use.agent.message_manager.utils import save_conversation
+from browser_use.agent.step_lifecycle import StepLifecycleRecorder
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage, ContentPartImageParam, ContentPartTextParam, UserMessage
@@ -740,6 +740,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.error(f'📸 Failed to initialize screenshot service: {e}.')
 			raise e
 
+		self._step_recorder = StepLifecycleRecorder(
+			state=self.state,
+			history=self.history,
+			eventbus=self.eventbus,
+			logger=self.logger,
+			screenshot_service=self.screenshot_service,
+			message_manager=self._message_manager,
+			fs_saver=self,
+			demo_logger=self,
+			agent_ref=self,
+		)
+
 	def save_file_system_state(self) -> None:
 		"""Save current file system state to agent state"""
 		if self.file_system:
@@ -1303,138 +1315,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		step_result.action_results = [ActionResult(error=error_msg)]
 		step_result.error = error_msg
 
-	async def _commit_step_result(self, ctx: StepExecutionContext, step_result: StepExecutionResult) -> None:
-		"""**Single point of persistence** for a step's result.
-
-		Takes the fully-populated :class:`StepExecutionResult` (LLM output +
-		action results + optional error) and performs *all* side-effects
-		atomically:
-
-		1. Syncs ``self.state.last_model_output`` / ``last_result`` so the
-		   **next** step's ``_prepare_context`` can snapshot them.
-		2. Updates ``self.state.consecutive_failures`` based on
-		   ``result.has_action_error`` / ``result.error`` — never write to
-		   this field anywhere else.
-		3. Builds :class:`StepMetadata` + writes the :class:`AgentHistory`
-		   item.
-		4. Logs step completion summary and ``done()`` final-result banner.
-		5. Persists file-system state.
-		6. Dispatches the ``CreateAgentStepEvent`` cloud event.
-		7. Bumps ``self.state.n_steps`` — do not do this anywhere else.
-
-		Phases (``_get_next_action`` / ``_execute_actions`` /
-		``_handle_step_error``) must **never** perform any of the above
-		themselves.
-		"""
-		bss = ctx.browser_state_summary
-
-		# 1. Sync cross-step state. Always write these so the *next* step's
-		#    ``_prepare_context`` can snapshot the correct previous values
-		#    even if the current step had no model output (e.g. step 0 or
-		#    a hard error).
-		self.state.last_model_output = step_result.model_output
-		self.state.last_result = step_result.action_results if step_result.action_results else None
-
-		# 2. Update consecutive_failures.
-		#    - ``has_action_error`` means the single-action step error
-		#      pattern we already count (ActionResult.error present,
-		#      len==1).
-		#    - ``result.error`` (but no action_results.error) covers the
-		#      pure-step-error path (e.g. InterruptedError with no error
-		#      action result injected).
-		error_for_counting = step_result.has_action_error or (
-			step_result.error is not None and not step_result.action_results
-		)
-
-		if error_for_counting:
-			self.state.consecutive_failures += 1
-			self.logger.debug(
-				f'🔄 Step {self.state.n_steps}: Consecutive failures: {self.state.consecutive_failures}'
-			)
-		elif step_result.action_results or step_result.model_output is not None:
-			# There was a model output and/or action results, and none of
-			# them signalled an error-count condition → reset counter.
-			if self.state.consecutive_failures > 0:
-				self.state.consecutive_failures = 0
-				self.logger.debug(
-					f'🔄 Step {self.state.n_steps}: Consecutive failures reset to: {self.state.consecutive_failures}'
-				)
-
-		# 3. Skip the rest if there is literally nothing to persist.
-		if step_result.is_empty and bss is None:
-			return
-
-		step_end_time = time.time()
-
-		# 4. History write.
-		if bss is not None and not step_result.is_empty:
-			step_interval = None
-			if len(self.history.history) > 0:
-				last_history_item = self.history.history[-1]
-				if last_history_item.metadata:
-					previous_end_time = last_history_item.metadata.step_end_time
-					previous_start_time = last_history_item.metadata.step_start_time
-					step_interval = max(0, previous_end_time - previous_start_time)
-			metadata = StepMetadata(
-				step_number=self.state.n_steps,
-				step_start_time=ctx.step_start_time,
-				step_end_time=step_end_time,
-				step_interval=step_interval,
-			)
-
-			await self._make_history_item(
-				step_result.model_output,
-				bss,
-				step_result.action_results,
-				metadata,
-				state_message=self._message_manager.last_state_message_text,
-			)
-
-		# 5. Informational logs (step summary + done() banner).
-		summary_message = self._log_step_completion_summary(
-			ctx.step_start_time, step_result.action_results
-		)
-		if summary_message:
-			await self._demo_mode_log(summary_message, 'info', {'step': self.state.n_steps})
-
-		if step_result.is_done:
-			last = step_result.action_results[-1]
-			if last.success:
-				self.logger.info(f'\n📄 \033[32m Final Result:\033[0m \n{last.extracted_content}\n\n')
-			else:
-				self.logger.info(f'\n📄 \033[31m Final Result:\033[0m \n{last.extracted_content}\n\n')
-			if last.attachments:
-				total_attachments = len(last.attachments)
-				for i, file_path in enumerate(last.attachments):
-					self.logger.info(f'👉 Attachment {i + 1 if total_attachments > 1 else ""}: {file_path}')
-
-		# 6. Persist file system state.
-		self.save_file_system_state()
-
-		# 7. Cloud step event.
-		if bss is not None and step_result.model_output:
-			actions_data = []
-			if step_result.model_output.action:
-				for action in step_result.model_output.action:
-					action_dict = action.model_dump() if hasattr(action, 'model_dump') else {}
-					actions_data.append(action_dict)
-
-			step_event = CreateAgentStepEvent.from_agent_step(
-				self,
-				step_result.model_output,
-				step_result.action_results,
-				actions_data,
-				bss,
-			)
-			self.eventbus.dispatch(step_event)
-
-		# 8. Bump step counter. Do this last so, if anything above threw,
-		#    the next attempt still reports the same step number in logs.
-		self.state.n_steps += 1
-
 	async def _finalize(self, ctx: StepExecutionContext, step_result: StepExecutionResult) -> None:
-		"""End of step lifecycle: defer to the single commit point."""
-		await self._commit_step_result(ctx, step_result)
+		"""End of step lifecycle: delegate to the StepLifecycleRecorder."""
+		await self._step_recorder.commit(ctx, step_result)
 
 	def _is_connection_like_error(self, error: Exception) -> bool:
 		"""Check if the error looks like a CDP/WebSocket connection failure.
@@ -1794,50 +1677,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				self.settings.save_conversation_path_encoding,
 			)
 
-	async def _make_history_item(
-		self,
-		model_output: AgentOutput | None,
-		browser_state_summary: BrowserStateSummary,
-		result: list[ActionResult],
-		metadata: StepMetadata | None = None,
-		state_message: str | None = None,
-	) -> None:
-		"""Create and store history item"""
-
-		if model_output:
-			interacted_elements = AgentHistory.get_interacted_element(model_output, browser_state_summary.dom_state.selector_map)
-		else:
-			interacted_elements = [None]
-
-		# Store screenshot and get path
-		screenshot_path = None
-		if browser_state_summary.screenshot:
-			self.logger.debug(
-				f'📸 Storing screenshot for step {self.state.n_steps}, screenshot length: {len(browser_state_summary.screenshot)}'
-			)
-			screenshot_path = await self.screenshot_service.store_screenshot(browser_state_summary.screenshot, self.state.n_steps)
-			self.logger.debug(f'📸 Screenshot stored at: {screenshot_path}')
-		else:
-			self.logger.debug(f'📸 No screenshot in browser_state_summary for step {self.state.n_steps}')
-
-		state_history = BrowserStateHistory(
-			url=browser_state_summary.url,
-			title=browser_state_summary.title,
-			tabs=browser_state_summary.tabs,
-			interacted_element=interacted_elements,
-			screenshot_path=screenshot_path,
-		)
-
-		history_item = AgentHistory(
-			model_output=model_output,
-			result=result,
-			state=state_history,
-			metadata=metadata,
-			state_message=state_message,
-		)
-
-		self.history.add_item(history_item)
-
 	def _remove_think_tags(self, text: str) -> str:
 		THINK_TAGS = re.compile(r'<think>.*?</think>', re.DOTALL)
 		STRAY_CLOSE_TAG = re.compile(r'.*?</think>', re.DOTALL)
@@ -2194,31 +2033,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if state.next_goal:
 			await self._demo_mode_log(f'Next goal: {state.next_goal}', 'info', step_meta)
 
-	def _log_step_completion_summary(self, step_start_time: float, result: list[ActionResult]) -> str | None:
-		"""Log step completion summary with action count, timing, and success/failure stats"""
-		if not result:
-			return None
-
-		step_duration = time.time() - step_start_time
-		action_count = len(result)
-
-		# Count success and failures
-		success_count = sum(1 for r in result if not r.error)
-		failure_count = action_count - success_count
-
-		# Format success/failure indicators
-		success_indicator = f'✅ {success_count}' if success_count > 0 else ''
-		failure_indicator = f'❌ {failure_count}' if failure_count > 0 else ''
-		status_parts = [part for part in [success_indicator, failure_indicator] if part]
-		status_str = ' | '.join(status_parts) if status_parts else '✅ 0'
-
-		message = (
-			f'📍 Step {self.state.n_steps}: Ran {action_count} action{"" if action_count == 1 else "s"} '
-			f'in {step_duration:.2f}s: {status_str}'
-		)
-		self.logger.debug(message)
-		return message
-
 	def _log_final_outcome_messages(self) -> None:
 		"""Log helpful messages to user based on agent run outcome"""
 		# Check if agent failed
@@ -2540,7 +2354,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				action_results=[ActionResult(error=error_msg)],
 				error=error_msg,
 			)
-			await self._commit_step_result(timeout_ctx, timeout_result)
+			await self._step_recorder.commit(timeout_ctx, timeout_result)
 			step_result = timeout_result
 
 		if on_step_end is not None:
