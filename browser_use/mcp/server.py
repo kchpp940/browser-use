@@ -91,7 +91,7 @@ logging.disable(logging.CRITICAL)
 
 # Import browser_use modules
 from browser_use import ActionModel, Agent
-from browser_use.agent.views import ActionResult
+from browser_use.agent.views import AgentHistoryList, ResultAssembler, RuntimeExecutionResult
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
@@ -207,15 +207,6 @@ class BrowserUseServer:
 		self.session_timeout_minutes = session_timeout_minutes
 		self._cleanup_task: Any = None
 
-		# Unified tool registry adapter — single source of truth for all tool metadata
-		# and execution. This replaces the old separate _tool_capabilities list.
-		self.tool_registry_adapter: Any | None = None
-
-		# Initialize tools and metadata early so list_tools works before browser session is created
-		# This ensures tool names, descriptions, and schemas are always available
-		self.tools = Tools()
-		self._init_tool_registry()
-
 		# Setup handlers
 		self._setup_handlers()
 
@@ -224,32 +215,237 @@ class BrowserUseServer:
 
 		@self.server.list_tools()
 		async def handle_list_tools() -> list[types.Tool]:
-			"""List all available browser-use tools.
-
-			All tool metadata is sourced from the unified ToolRegistryAdapter.
-			This ensures consistent tool names, descriptions, and parameter
-			schemas across all entry points (Python API, MCP, skill_cli).
-			"""
-			assert self.tool_registry_adapter is not None, 'Tool registry adapter must be initialized'
-
-			# Use the unified adapter to generate MCP format tools
-			# list_mcp_tools already handles name mappings and external capabilities
-			mcp_tool_dicts = self.tool_registry_adapter.list_mcp_tools(
-				name_prefix='',  # External tools already have full names (browser_*)
-			)
-
-			# Convert dicts to MCP Tool objects
-			mcp_tools = []
-			for tool_dict in mcp_tool_dicts:
-				mcp_tools.append(
-					types.Tool(
-						name=tool_dict['name'],
-						description=tool_dict['description'],
-						inputSchema=tool_dict['inputSchema'],
-					)
-				)
-
-			return mcp_tools
+			"""List all available browser-use tools."""
+			return [
+				# Agent tools
+				# Direct browser control tools
+				types.Tool(
+					name='browser_navigate',
+					description='Navigate to a URL in the browser',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'url': {'type': 'string', 'description': 'The URL to navigate to'},
+							'new_tab': {'type': 'boolean', 'description': 'Whether to open in a new tab', 'default': False},
+						},
+						'required': ['url'],
+					},
+				),
+				types.Tool(
+					name='browser_click',
+					description='Click an element by index or at specific viewport coordinates. Use index for elements from browser_get_state, or coordinate_x/coordinate_y for pixel-precise clicking.',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'index': {
+								'type': 'integer',
+								'description': 'The index of the element to click (from browser_get_state). Provide this OR coordinate_x+coordinate_y.',
+							},
+							'coordinate_x': {
+								'type': 'integer',
+								'description': 'X coordinate in pixels from the left edge of the viewport. Must be used together with coordinate_y. Provide this OR index.',
+							},
+							'coordinate_y': {
+								'type': 'integer',
+								'description': 'Y coordinate in pixels from the top edge of the viewport. Must be used together with coordinate_x. Provide this OR index.',
+							},
+							'new_tab': {
+								'type': 'boolean',
+								'description': 'Whether to open any resulting navigation in a new tab',
+								'default': False,
+							},
+						},
+					},
+				),
+				types.Tool(
+					name='browser_type',
+					description='Type text into an input field. Clears existing text by default; pass text="" to clear only.',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'index': {
+								'type': 'integer',
+								'description': 'The index of the input element (from browser_get_state)',
+							},
+							'text': {
+								'type': 'string',
+								'description': 'The text to type. Pass an empty string ("") to clear the field without typing.',
+							},
+						},
+						'required': ['index', 'text'],
+					},
+				),
+				types.Tool(
+					name='browser_get_state',
+					description='Get the current state of the page including all interactive elements',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'include_screenshot': {
+								'type': 'boolean',
+								'description': 'Whether to include a screenshot of the current page',
+								'default': False,
+							}
+						},
+					},
+				),
+				types.Tool(
+					name='browser_extract_content',
+					description='Extract structured content from the current page based on a query',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'query': {'type': 'string', 'description': 'What information to extract from the page'},
+							'extract_links': {
+								'type': 'boolean',
+								'description': 'Whether to include links in the extraction',
+								'default': False,
+							},
+						},
+						'required': ['query'],
+					},
+				),
+				types.Tool(
+					name='browser_get_html',
+					description='Get the raw HTML of the current page or a specific element by CSS selector',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'selector': {
+								'type': 'string',
+								'description': 'Optional CSS selector to get HTML of a specific element. If omitted, returns full page HTML.',
+							},
+						},
+					},
+				),
+				types.Tool(
+					name='browser_screenshot',
+					description='Take a screenshot of the current page. Returns viewport metadata as text and the screenshot as an image.',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'full_page': {
+								'type': 'boolean',
+								'description': 'Whether to capture the full scrollable page or just the visible viewport',
+								'default': False,
+							},
+						},
+					},
+				),
+				types.Tool(
+					name='browser_scroll',
+					description='Scroll the page',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'direction': {
+								'type': 'string',
+								'enum': ['up', 'down'],
+								'description': 'Direction to scroll',
+								'default': 'down',
+							}
+						},
+					},
+				),
+				types.Tool(
+					name='browser_go_back',
+					description='Go back to the previous page',
+					inputSchema={'type': 'object', 'properties': {}},
+				),
+				# Tab management
+				types.Tool(
+					name='browser_list_tabs', description='List all open tabs', inputSchema={'type': 'object', 'properties': {}}
+				),
+				types.Tool(
+					name='browser_switch_tab',
+					description='Switch to a different tab',
+					inputSchema={
+						'type': 'object',
+						'properties': {'tab_id': {'type': 'string', 'description': '4 Character Tab ID of the tab to switch to'}},
+						'required': ['tab_id'],
+					},
+				),
+				types.Tool(
+					name='browser_close_tab',
+					description='Close a tab',
+					inputSchema={
+						'type': 'object',
+						'properties': {'tab_id': {'type': 'string', 'description': '4 Character Tab ID of the tab to close'}},
+						'required': ['tab_id'],
+					},
+				),
+				# types.Tool(
+				# 	name="browser_close",
+				# 	description="Close the browser session",
+				# 	inputSchema={
+				# 		"type": "object",
+				# 		"properties": {}
+				# 	}
+				# ),
+				types.Tool(
+					name='retry_with_browser_use_agent',
+					description='Retry a task using the browser-use agent. Only use this as a last resort if you fail to interact with a page multiple times.',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'task': {
+								'type': 'string',
+								'description': 'The high-level goal and detailed step-by-step description of the task the AI browser agent needs to attempt, along with any relevant data needed to complete the task and info about previous attempts.',
+							},
+							'max_steps': {
+								'type': 'integer',
+								'description': 'Maximum number of steps an agent can take.',
+								'default': 100,
+							},
+							'model': {
+								'type': 'string',
+								'description': 'LLM model to use (e.g., gpt-4o, claude-3-opus-20240229). Defaults to the configured model.',
+							},
+							'allowed_domains': {
+								'type': 'array',
+								'items': {'type': 'string'},
+								'description': (
+									'List of domains the agent is allowed to visit (security feature). '
+									'Omit to use the server-configured profile defaults. '
+									'An empty list is treated the same as omitting the argument and '
+									'will NOT disable server-configured restrictions.'
+								),
+							},
+							'use_vision': {
+								'type': 'boolean',
+								'description': 'Whether to use vision capabilities (screenshots) for the agent',
+								'default': True,
+							},
+						},
+						'required': ['task'],
+					},
+				),
+				# Browser session management tools
+				types.Tool(
+					name='browser_list_sessions',
+					description='List all active browser sessions with their details and last activity time',
+					inputSchema={'type': 'object', 'properties': {}},
+				),
+				types.Tool(
+					name='browser_close_session',
+					description='Close a specific browser session by its ID',
+					inputSchema={
+						'type': 'object',
+						'properties': {
+							'session_id': {
+								'type': 'string',
+								'description': 'The browser session ID to close (get from browser_list_sessions)',
+							}
+						},
+						'required': ['session_id'],
+					},
+				),
+				types.Tool(
+					name='browser_close_all',
+					description='Close all active browser sessions and clean up resources',
+					inputSchema={'type': 'object', 'properties': {}},
+				),
+			]
 
 		@self.server.list_resources()
 		async def handle_list_resources() -> list[types.Resource]:
@@ -263,20 +459,18 @@ class BrowserUseServer:
 
 		@self.server.call_tool()
 		async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent | types.ImageContent]:
-			"""Handle tool execution.
-
-			All results are formatted using the unified ToolResult format
-			to ensure consistent output structure across all entry points.
-			"""
+			"""Handle tool execution."""
 			start_time = time.time()
 			error_msg = None
 			try:
 				result = await self._execute_tool(name, arguments or {})
-				return self._format_result_from_action_result(result)
+				if isinstance(result, list):
+					return result
+				return [types.TextContent(type='text', text=result)]
 			except Exception as e:
 				error_msg = str(e)
 				logger.error(f'Tool execution failed: {e}', exc_info=True)
-				return self._format_result_from_action_result({'error': str(e)})
+				return [types.TextContent(type='text', text=f'Error: {str(e)}')]
 			finally:
 				# Capture telemetry for tool calls
 				duration = time.time() - start_time
@@ -293,74 +487,87 @@ class BrowserUseServer:
 	async def _execute_tool(
 		self, tool_name: str, arguments: dict[str, Any]
 	) -> str | list[types.TextContent | types.ImageContent]:
-		"""Execute a browser-use tool via the unified ToolRegistryAdapter.
+		"""Execute a browser-use tool. Returns str for most tools, or a content list for tools with image output."""
 
-		All tool execution now goes through a single path:
-		1. Resolve name aliases (MCP names -> canonical names)
-		2. Check if browser session is required
-		3. Execute via adapter.execute_tool()
-		4. Result is formatted consistently via _format_result_from_action_result()
-
-		There are NO separate if/elif branches for different tools anymore.
-		"""
-		assert self.tool_registry_adapter is not None, 'Tool registry adapter must be initialized'
-
-		# Step 1: Get tool capability to check requirements
-		cap = self.tool_registry_adapter.get_tool_capability(tool_name)
-
-		# Step 2: Initialize browser session if the tool requires it
-		if cap is not None and cap.requires_browser and not self.browser_session:
-			await self._init_browser_session()
-
-		# Step 3: Execute via unified adapter
-		# This handles both core tools (via name mapping) and external tools (via registered executors)
-		try:
-			result = await self.tool_registry_adapter.execute_tool(
-				tool_name=tool_name,
-				arguments=arguments,
-				browser_session=self.browser_session,
-				page_extraction_llm=self.llm,
-				file_system=self.file_system,
+		# Agent-based tools
+		if tool_name == 'retry_with_browser_use_agent':
+			return await self._retry_with_browser_use_agent(
+				task=arguments['task'],
+				max_steps=arguments.get('max_steps', 100),
+				model=arguments.get('model'),
+				allowed_domains=arguments.get('allowed_domains'),
+				use_vision=arguments.get('use_vision', True),
 			)
-		except ValueError as e:
-			# Handle unknown tool
-			if 'Tool not found' in str(e):
-				return f'Unknown tool: {tool_name}'
-			raise
 
-		# Step 4: Handle special result with embedded image data (_state_json + _screenshot_b64 pattern)
-		# This comes from browser_get_state and browser_screenshot executors
-		if isinstance(result, dict) and ('_state_json' in result or '_screenshot_b64' in result):
-			content_list: list[types.TextContent | types.ImageContent] = []
-			if '_state_json' in result and result['_state_json'] is not None:
-				content_list.append(types.TextContent(type='text', text=str(result['_state_json'])))
-			if '_screenshot_b64' in result and result['_screenshot_b64'] is not None:
-				content_list.append(types.ImageContent(type='image', data=str(result['_screenshot_b64']), mimeType='image/png'))
-			return content_list
+		# Browser session management tools (don't require active session)
+		if tool_name == 'browser_list_sessions':
+			return await self._list_sessions()
 
-		# Step 5: Convert all other result types to string for MCP compatibility
-		# MCP CallToolResult requires str or list[TextContent|ImageContent]
-		if isinstance(result, ActionResult):
-			return self._format_result_from_action_result(result)
-		if result is None:
-			return 'Success'
-		if isinstance(result, str):
-			return result
-		# For dict/list/other Pydantic models, serialize to JSON string
-		import json
+		elif tool_name == 'browser_close_session':
+			return await self._close_session(arguments['session_id'])
 
-		try:
-			if isinstance(result, dict):
-				result_dict: Any = result
-			elif hasattr(result, 'model_dump'):
-				result_dict = result.model_dump()
-			elif hasattr(result, '__dict__'):
-				result_dict = result.__dict__
-			else:
-				result_dict = result
-			return json.dumps(result_dict, default=str, ensure_ascii=False)
-		except Exception:
-			return str(result)
+		elif tool_name == 'browser_close_all':
+			return await self._close_all_sessions()
+
+		# Direct browser control tools (require active session)
+		elif tool_name.startswith('browser_'):
+			# Ensure browser session exists
+			if not self.browser_session:
+				await self._init_browser_session()
+
+			if tool_name == 'browser_navigate':
+				return await self._navigate(arguments['url'], arguments.get('new_tab', False))
+
+			elif tool_name == 'browser_click':
+				return await self._click(
+					index=arguments.get('index'),
+					coordinate_x=arguments.get('coordinate_x'),
+					coordinate_y=arguments.get('coordinate_y'),
+					new_tab=arguments.get('new_tab', False),
+				)
+
+			elif tool_name == 'browser_type':
+				return await self._type_text(arguments['index'], arguments['text'])
+
+			elif tool_name == 'browser_get_state':
+				state_json, screenshot_b64 = await self._get_browser_state(arguments.get('include_screenshot', False))
+				content: list[types.TextContent | types.ImageContent] = [types.TextContent(type='text', text=state_json)]
+				if screenshot_b64:
+					content.append(types.ImageContent(type='image', data=screenshot_b64, mimeType='image/png'))
+				return content
+
+			elif tool_name == 'browser_get_html':
+				return await self._get_html(arguments.get('selector'))
+
+			elif tool_name == 'browser_screenshot':
+				meta_json, screenshot_b64 = await self._screenshot(arguments.get('full_page', False))
+				content: list[types.TextContent | types.ImageContent] = [types.TextContent(type='text', text=meta_json)]
+				if screenshot_b64:
+					content.append(types.ImageContent(type='image', data=screenshot_b64, mimeType='image/png'))
+				return content
+
+			elif tool_name == 'browser_extract_content':
+				return await self._extract_content(arguments['query'], arguments.get('extract_links', False))
+
+			elif tool_name == 'browser_scroll':
+				return await self._scroll(arguments.get('direction', 'down'))
+
+			elif tool_name == 'browser_go_back':
+				return await self._go_back()
+
+			elif tool_name == 'browser_close':
+				return await self._close_browser()
+
+			elif tool_name == 'browser_list_tabs':
+				return await self._list_tabs()
+
+			elif tool_name == 'browser_switch_tab':
+				return await self._switch_tab(arguments['tab_id'])
+
+			elif tool_name == 'browser_close_tab':
+				return await self._close_tab(arguments['tab_id'])
+
+		return f'Unknown tool: {tool_name}'
 
 	async def _init_browser_session(self, allowed_domains: list[str] | None = None, **kwargs):
 		"""Initialize browser session using config"""
@@ -405,9 +612,8 @@ class BrowserUseServer:
 		# Track the session for management
 		self._track_session(self.browser_session)
 
-		# Initialize tool metadata from the unified ToolRegistryAdapter
-		# (already initialized in __init__, but refresh in case tools changed)
-		self._init_tool_registry()
+		# Create tools for direct actions
+		self.tools = Tools()
 
 		# Initialize LLM from config
 		llm_config = get_default_llm(self.config)
@@ -429,86 +635,6 @@ class BrowserUseServer:
 
 		logger.debug('Browser session initialized')
 
-	def _init_tool_registry(self) -> None:
-		"""Initialize the unified ToolRegistryAdapter via the centralized MCP registry.
-
-		All tool metadata (capabilities, param schemas, descriptions) and executor
-		factories now live in browser_use/mcp/registry.py. This method simply
-		delegates to register_all_mcp_tools() with the current adapter and server.
-		"""
-		from browser_use.mcp.registry import register_all_mcp_tools
-
-		assert self.tools is not None, 'Tools must be initialized before _init_tool_registry'
-		adapter = self.tools.get_tool_registry_adapter()
-
-		# Single call wires in ALL core mappings, MCP-specific capabilities,
-		# custom param overrides, and server-bound executors.
-		register_all_mcp_tools(adapter=adapter, server=self)
-
-		# Store the unified adapter
-		self.tool_registry_adapter = adapter
-
-	def _format_result_from_action_result(self, action_result: Any) -> list[types.TextContent | types.ImageContent]:
-		"""Format any tool result using the unified ToolResult format for MCP responses.
-
-		This is the single entry point for formatting all tool execution results.
-		It handles:
-		- ActionResult objects (from core tools)
-		- Strings (plain text results)
-		- Dicts (structured results)
-		- Lists (already formatted content, e.g., with images)
-		- Tuples (e.g., (metadata_json, screenshot_b64))
-
-		All output is converted to MCP TextContent/ImageContent objects.
-		"""
-		from browser_use.tools.registry.views import ToolResult
-
-		# Handle lists of already-formatted content (backward compatibility)
-		if isinstance(action_result, list) and action_result:
-			converted = []
-			for item in action_result:
-				if isinstance(item, dict):
-					if item.get('type') == 'text':
-						converted.append(types.TextContent(type='text', text=item.get('text', '')))
-					elif item.get('type') == 'image':
-						converted.append(
-							types.ImageContent(
-								type='image',
-								data=item.get('data', ''),
-								mimeType=item.get('mimeType', 'image/png'),
-							)
-						)
-				else:
-					converted.append(types.TextContent(type='text', text=str(item)))
-			return converted
-
-		# Handle tuples (e.g., (metadata_json, screenshot_b64) from screenshot tools)
-		if isinstance(action_result, tuple) and len(action_result) >= 1:
-			text_content = str(action_result[0]) if action_result[0] is not None else ''
-			images = []
-			if len(action_result) >= 2 and action_result[1] is not None:
-				images.append({'data': action_result[1], 'mime_type': 'image/png'})
-			action_result = {'extracted_content': text_content, 'images': images}
-
-		# Convert to ToolResult and then to MCP format
-		tool_result = ToolResult.from_action_result(action_result)
-		mcp_content = tool_result.to_mcp_content()
-
-		# Convert dict format to MCP content objects
-		result = []
-		for item in mcp_content:
-			if item.get('type') == 'text':
-				result.append(types.TextContent(type='text', text=item.get('text', '')))
-			elif item.get('type') == 'image':
-				result.append(
-					types.ImageContent(
-						type='image',
-						data=item.get('data', ''),
-						mimeType=item.get('mimeType', 'image/png'),
-					)
-				)
-		return result
-
 	async def _retry_with_browser_use_agent(
 		self,
 		task: str,
@@ -516,7 +642,7 @@ class BrowserUseServer:
 		model: str | None = None,
 		allowed_domains: list[str] | None = None,
 		use_vision: bool = True,
-	) -> str:
+	) -> str | list[types.TextContent | types.ImageContent]:
 		"""Run an autonomous agent task."""
 		logger.debug(f'Running agent task: {task}')
 
@@ -579,36 +705,95 @@ class BrowserUseServer:
 		)
 
 		try:
-			history = await agent.run(max_steps=max_steps)
+			# Use the new unified result API
+			result: RuntimeExecutionResult = await agent.run_with_result(max_steps=max_steps)
 
-			# Format results
-			results = []
-			results.append(f'Task completed in {len(history.history)} steps')
-			results.append(f'Success: {history.is_successful()}')
+			# Build return value: human-readable summary + structured JSON
+			# so MCP callers can parse either.
+			contents: list[types.TextContent | types.ImageContent] = []
 
-			# Get final result if available
-			final_result = history.final_result()
-			if final_result:
-				results.append(f'\nFinal result:\n{final_result}')
+			# 1) Human-readable summary
+			try:
+				human_summary = result.to_human_readable()
+			except Exception:
+				human_summary = ''
+			contents.append(types.TextContent(type='text', text=human_summary))
 
-			# Include any errors
-			errors = history.errors()
-			if errors:
-				results.append(f'\nErrors encountered:\n{json.dumps(errors, indent=2)}')
+			# 2) Structured JSON payload (programmatic callers use this)
+			try:
+				structured_json = result.model_dump_json(indent=2)
+			except Exception as _json_err:
+				structured_json = json.dumps(
+					{
+						'status': 'failed',
+						'error': f'Failed to serialize RuntimeExecutionResult: {_json_err}',
+					},
+					indent=2,
+				)
+			contents.append(
+				types.TextContent(
+					type='text',
+					text=f'--- STRUCTURED RESULT (JSON) ---\n{structured_json}',
+				)
+			)
 
-			# Include URLs visited
-			urls = history.urls()
-			if urls:
-				# Filter out None values and convert to strings
-				valid_urls = [str(url) for url in urls if url is not None]
-				if valid_urls:
-					results.append(f'\nURLs visited: {", ".join(valid_urls)}')
+			# 3) Include last screenshot if available
+			last_screenshot_b64 = None
+			if result.screenshot_paths:
+				last_path = result.screenshot_paths[-1]
+				try:
+					from pathlib import Path as _Path
 
-			return '\n'.join(results)
+					if _Path(last_path).exists():
+						import base64
+
+						last_screenshot_b64 = base64.b64encode(_Path(last_path).read_bytes()).decode('utf-8')
+				except Exception:
+					last_screenshot_b64 = None
+			if last_screenshot_b64:
+				contents.append(types.ImageContent(type='image', data=last_screenshot_b64, mimeType='image/png'))
+
+			return contents
 
 		except Exception as e:
 			logger.error(f'Agent task failed: {e}', exc_info=True)
-			return f'Agent task failed: {str(e)}'
+
+			# Even on exception, assemble a partial RuntimeExecutionResult so the
+			# caller still receives a stable, structured payload rather than
+			# just a free-form error string.
+			try:
+				import uuid
+
+				history_fallback = getattr(agent, 'history', None) or AgentHistoryList(history=[], usage=None)
+				fallback_result = (
+					ResultAssembler(
+						task_id=getattr(agent, 'task_id', uuid.uuid4().hex[:12]),
+						task=task,
+					)
+					.from_history(history_fallback)
+					.with_max_steps(max_steps)
+					.with_fatal_error(str(e))
+					.with_entry_point('mcp')
+					.with_metadata(model_name=getattr(llm, 'model', 'unknown'))
+					.assemble()
+				)
+				structured_json = fallback_result.model_dump_json(indent=2)
+				human_summary = fallback_result.to_human_readable()
+				return [
+					types.TextContent(type='text', text=human_summary),
+					types.TextContent(
+						type='text',
+						text=f'--- STRUCTURED RESULT (JSON) ---\n{structured_json}',
+					),
+				]
+			except Exception as _fallback_err:
+				return [
+					types.TextContent(type='text', text=f'Agent task failed: {str(e)}'),
+					types.TextContent(
+						type='text',
+						text=f'--- STRUCTURED RESULT (JSON) ---\n{{"status":"failed","error":{json.dumps(str(e))}}}',
+					),
+				]
 		finally:
 			# Clean up
 			await agent.close()

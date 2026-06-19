@@ -47,7 +47,15 @@ base_subprocess.BaseSubprocessTransport.__del__ = _patched_del
 if TYPE_CHECKING:
 	from browser_use.agent.prompts import SystemPrompt
 	from browser_use.agent.service import Agent
-	from browser_use.agent.views import ActionModel, ActionResult, AgentHistoryList
+	from browser_use.agent.views import (
+		ActionModel,
+		ActionResult,
+		AgentHistoryList,
+		OutputFile,
+		ResultAssembler,
+		RuntimeExecutionResult,
+		StepExecutionResult,
+	)
 	from browser_use.browser import BrowserProfile, BrowserSession
 	from browser_use.browser import BrowserSession as Browser
 	from browser_use.dom.service import DomService
@@ -66,7 +74,7 @@ if TYPE_CHECKING:
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
 
-	# Lazy imports mapping - only import when actually accessed
+# Lazy imports mapping - only import when actually accessed
 _LAZY_IMPORTS = {
 	# Agent service (heavy due to dependencies)
 	'Agent': ('browser_use.agent.service', 'Agent'),
@@ -76,6 +84,11 @@ _LAZY_IMPORTS = {
 	'ActionModel': ('browser_use.agent.views', 'ActionModel'),
 	'ActionResult': ('browser_use.agent.views', 'ActionResult'),
 	'AgentHistoryList': ('browser_use.agent.views', 'AgentHistoryList'),
+	# Unified execution result (new in this refactor)
+	'RuntimeExecutionResult': ('browser_use.agent.views', 'RuntimeExecutionResult'),
+	'ResultAssembler': ('browser_use.agent.views', 'ResultAssembler'),
+	'StepExecutionResult': ('browser_use.agent.views', 'StepExecutionResult'),
+	'OutputFile': ('browser_use.agent.views', 'OutputFile'),
 	'BrowserSession': ('browser_use.browser', 'BrowserSession'),
 	'Browser': ('browser_use.browser', 'BrowserSession'),  # Alias for BrowserSession
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
@@ -136,6 +149,11 @@ __all__ = [
 	'ActionResult',
 	'ActionModel',
 	'AgentHistoryList',
+	# Unified execution result (new in this refactor)
+	'RuntimeExecutionResult',
+	'ResultAssembler',
+	'StepExecutionResult',
+	'OutputFile',
 	# Chat models
 	'ChatOpenAI',
 	'ChatGoogle',

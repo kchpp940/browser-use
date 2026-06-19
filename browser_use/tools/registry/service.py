@@ -6,7 +6,7 @@ import re
 from collections.abc import Callable
 from inspect import Parameter, iscoroutinefunction, signature
 from types import UnionType
-from typing import Any, Generic, Literal, Optional, TypeVar, Union, get_args, get_origin
+from typing import Any, Generic, Optional, TypeVar, Union, get_args, get_origin
 
 import pyotp
 from pydantic import BaseModel, Field, RootModel, create_model
@@ -25,9 +25,6 @@ from browser_use.tools.registry.views import (
 from browser_use.utils import is_new_tab_page, match_url_with_domain_pattern, time_execution_async
 
 Context = TypeVar('Context')
-
-# Re-export category literal type for convenience
-ToolCategory = Literal['navigation', 'interaction', 'extraction', 'tab_management', 'file', 'system', 'custom']
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +294,6 @@ class Registry(Generic[Context]):
 		domains: list[str] | None = None,
 		allowed_domains: list[str] | None = None,
 		terminates_sequence: bool = False,
-		category: ToolCategory = 'custom',
 	):
 		"""Decorator for registering actions"""
 		# Handle aliases: domains and allowed_domains are the same parameter
@@ -321,7 +317,6 @@ class Registry(Generic[Context]):
 				param_model=actual_param_model,
 				domains=final_domains,
 				terminates_sequence=terminates_sequence,
-				category=category,
 			)
 			self.registry.actions[func.__name__] = action
 

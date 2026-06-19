@@ -10,6 +10,30 @@ from browser_use.skill_cli.sessions import SessionInfo
 
 logger = logging.getLogger(__name__)
 
+COMMANDS = {
+	'open',
+	'click',
+	'type',
+	'input',
+	'scroll',
+	'back',
+	'screenshot',
+	'state',
+	'tab',
+	'keys',
+	'select',
+	'upload',
+	'eval',
+	'extract',
+	'cookies',
+	'wait',
+	'hover',
+	'dblclick',
+	'rightclick',
+	'get',
+	'record',
+}
+
 
 async def _execute_js(session: SessionInfo, js: str) -> Any:
 	"""Execute JavaScript in the browser via CDP."""
