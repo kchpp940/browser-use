@@ -1,7 +1,11 @@
-import importlib.resources
 from typing import TYPE_CHECKING, Literal, Optional
 
-from browser_use.agent.prompt_context import PromptContextBuilder, PromptSectionContext
+from browser_use.agent.prompt_context import (
+	PromptContextBuilder,
+	PromptSectionContext,
+	SystemPromptBuilder,
+	_is_anthropic_4_5_model,
+)
 from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL, SystemMessage, UserMessage
 from browser_use.observability import observe_debug
 
@@ -9,17 +13,6 @@ if TYPE_CHECKING:
 	from browser_use.agent.views import AgentStepInfo
 	from browser_use.browser.views import BrowserStateSummary
 	from browser_use.filesystem.file_system import FileSystem
-
-
-def _is_anthropic_4_5_model(model_name: str | None) -> bool:
-	"""Check if the model is Claude Opus 4.5 or Haiku 4.5 (requires 4096+ token prompts for caching)."""
-	if not model_name:
-		return False
-	model_lower = model_name.lower()
-	# Check for Opus 4.5 or Haiku 4.5 variants
-	is_opus_4_5 = 'opus' in model_lower and ('4.5' in model_lower or '4-5' in model_lower)
-	is_haiku_4_5 = 'haiku' in model_lower and ('4.5' in model_lower or '4-5' in model_lower)
-	return is_opus_4_5 or is_haiku_4_5
 
 
 class SystemPrompt:
@@ -40,53 +33,21 @@ class SystemPrompt:
 		self.is_anthropic = is_anthropic
 		self.is_browser_use_model = is_browser_use_model
 		self.model_name = model_name
-		# Check if this is an Anthropic 4.5 model that needs longer prompts for caching
 		self.is_anthropic_4_5 = _is_anthropic_4_5_model(model_name)
-		prompt = ''
-		if override_system_message is not None:
-			prompt = override_system_message
-		else:
-			self._load_prompt_template()
-			prompt = self.prompt_template.format(max_actions=self.max_actions_per_step)
 
-		if extend_system_message:
-			prompt += f'\n{extend_system_message}'
-
-		self.system_message = SystemMessage(content=prompt, cache=True)
-
-	def _load_prompt_template(self) -> None:
-		"""Load the prompt template from the markdown file."""
-		try:
-			# Choose the appropriate template based on model type and mode
-			# Browser-use models use simplified prompts optimized for fine-tuned models
-			if self.is_browser_use_model:
-				if self.flash_mode:
-					template_filename = 'system_prompt_browser_use_flash.md'
-				elif self.use_thinking:
-					template_filename = 'system_prompt_browser_use.md'
-				else:
-					template_filename = 'system_prompt_browser_use_no_thinking.md'
-			# Anthropic 4.5 models (Opus 4.5, Haiku 4.5) need 4096+ token prompts for caching
-			elif self.is_anthropic_4_5 and self.flash_mode:
-				template_filename = 'system_prompt_anthropic_flash.md'
-			elif self.flash_mode and self.is_anthropic:
-				template_filename = 'system_prompt_flash_anthropic.md'
-			elif self.flash_mode:
-				template_filename = 'system_prompt_flash.md'
-			elif self.use_thinking:
-				template_filename = 'system_prompt.md'
-			else:
-				template_filename = 'system_prompt_no_thinking.md'
-
-			# This works both in development and when installed as a package
-			with (
-				importlib.resources.files('browser_use.agent.system_prompts')
-				.joinpath(template_filename)
-				.open('r', encoding='utf-8') as f
-			):
-				self.prompt_template = f.read()
-		except Exception as e:
-			raise RuntimeError(f'Failed to load system prompt template: {e}')
+		self.builder = SystemPromptBuilder()
+		self.builder.set_context(
+			max_actions_per_step=max_actions_per_step,
+			use_thinking=use_thinking,
+			flash_mode=flash_mode,
+			is_anthropic=is_anthropic,
+			is_browser_use_model=is_browser_use_model,
+			model_name=model_name,
+			is_anthropic_4_5=self.is_anthropic_4_5,
+			override_system_message=override_system_message,
+			extend_system_message=extend_system_message,
+		)
+		self.system_message = self.builder.build_system_message()
 
 	def get_system_message(self) -> SystemMessage:
 		"""

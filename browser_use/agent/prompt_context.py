@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.resources
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -8,7 +9,13 @@ from typing import TYPE_CHECKING, Any
 
 from browser_use.browser.views import PLACEHOLDER_4PX_SCREENSHOT
 from browser_use.dom.views import NodeType, SimplifiedNode
-from browser_use.llm.messages import ContentPartImageParam, ContentPartTextParam, ImageURL
+from browser_use.llm.messages import (
+	ContentPartImageParam,
+	ContentPartTextParam,
+	ImageURL,
+	SystemMessage,
+	UserMessage,
+)
 from browser_use.utils import is_new_tab_page, sanitize_surrogates
 
 if TYPE_CHECKING:
@@ -535,3 +542,321 @@ class PromptContextBuilder:
 			return content_parts
 
 		return text
+
+	def build_state_and_context_messages(
+		self,
+		use_vision: bool,
+		screenshots: list[str],
+		read_state_images: list[dict[str, Any]],
+		sample_images: list[ContentPartTextParam | ContentPartImageParam],
+		vision_detail_level: str,
+		llm_screenshot_size: tuple[int, int] | None,
+	) -> tuple[UserMessage, list[UserMessage]]:
+		"""Build the main state message and any follow-up context messages (nudges)."""
+		state_content = self.build_content_parts(
+			use_vision=use_vision,
+			screenshots=screenshots,
+			read_state_images=read_state_images,
+			sample_images=sample_images,
+			vision_detail_level=vision_detail_level,
+			llm_screenshot_size=llm_screenshot_size,
+		)
+		state_message = UserMessage(content=state_content, cache=True)
+
+		context_messages: list[UserMessage] = []
+		ctx_msg_section = self.get_section('context_messages')
+		if isinstance(ctx_msg_section, ContextMessageSection):
+			for msg in ctx_msg_section._messages:
+				context_messages.append(UserMessage(content=msg))
+
+		return state_message, context_messages
+
+	def nudge_budget_warning(self, steps_used: int, max_steps: int, steps_remaining: int) -> None:
+		"""Inject budget warning nudge."""
+		pct = int(steps_used / max_steps * 100)
+		msg = (
+			f'BUDGET WARNING: You have used {steps_used}/{max_steps} steps '
+			f'({pct}%). {steps_remaining} steps remaining. '
+			f'If the task cannot be completed in the remaining steps, prioritize: '
+			f'(1) consolidate your results (save to files if the file system is in use), '
+			f'(2) call done with what you have. '
+			f'Partial results are far more valuable than exhausting all steps with nothing saved.'
+		)
+		self.add_context_message(msg)
+
+	def nudge_replan(self, consecutive_failures: int) -> None:
+		"""Inject replan nudge after consecutive failures."""
+		msg = (
+			f'REPLAN SUGGESTED: You have failed {consecutive_failures} consecutive times. '
+			'Your current plan may need revision. '
+			'Output a new `plan_update` with revised steps to recover.'
+		)
+		self.add_context_message(msg)
+
+	def nudge_exploration(self, n_steps: int) -> None:
+		"""Inject planning nudge after exploring without a plan."""
+		msg = (
+			f'PLANNING NUDGE: You have taken {n_steps} steps without creating a plan. '
+			'If the task is complex, output a `plan_update` with clear todo items now. '
+			'If the task is already done or nearly done, call `done` instead.'
+		)
+		self.add_context_message(msg)
+
+	def nudge_loop_detection(self, message: str) -> None:
+		"""Inject loop detection nudge."""
+		self.add_context_message(message)
+
+	def nudge_last_step(self, max_steps: int) -> None:
+		"""Inject last-step warning."""
+		msg = (
+			f'You reached max_steps ({max_steps}) - this is your last step. '
+			'Your only tool available is the "done" tool. No other tool is available. '
+			'All other tools which you see in history or examples are not available.'
+			'\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! '
+			'E.g. if not all steps are fully completed. Else success to true.'
+			'\nInclude everything you found out for the ultimate task in the done text.'
+		)
+		self.add_context_message(msg)
+
+	def nudge_force_done(self, max_failures: int) -> None:
+		"""Inject force-done after max failures."""
+		msg = (
+			f'You failed {max_failures} times. Therefore we terminate the agent.'
+			'\nYour only tool available is the "done" tool. No other tool is available. '
+			'All other tools which you see in history or examples are not available.'
+			'\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! '
+			'E.g. if not all steps are fully completed. Else success to true.'
+			'\nInclude everything you found out for the ultimate task in the done text.'
+		)
+		self.add_context_message(msg)
+
+
+# =============================================================================
+# System Prompt Section System
+# =============================================================================
+
+
+@dataclass
+class SystemPromptSectionContext:
+	"""Data available for system prompt section rendering."""
+
+	max_actions_per_step: int = 3
+	use_thinking: bool = True
+	flash_mode: bool = False
+	is_anthropic: bool = False
+	is_browser_use_model: bool = False
+	model_name: str | None = None
+	is_anthropic_4_5: bool = False
+	override_system_message: str | None = None
+	extend_system_message: str | None = None
+
+
+class SystemPromptSection(ABC):
+	"""Base class for system prompt sections."""
+
+	name: str
+	enabled: bool = True
+
+	def __init__(self, name: str, enabled: bool = True):
+		self.name = name
+		self.enabled = enabled
+
+	@abstractmethod
+	def render(self, ctx: SystemPromptSectionContext) -> str | None:
+		...
+
+
+class SystemCoreTemplateSection(SystemPromptSection):
+	"""Loads the core system prompt template from markdown based on provider/mode."""
+
+	def __init__(self):
+		super().__init__(name='core_template')
+
+	def _select_template_filename(self, ctx: SystemPromptSectionContext) -> str:
+		if ctx.is_browser_use_model:
+			if ctx.flash_mode:
+				return 'system_prompt_browser_use_flash.md'
+			elif ctx.use_thinking:
+				return 'system_prompt_browser_use.md'
+			else:
+				return 'system_prompt_browser_use_no_thinking.md'
+		elif ctx.is_anthropic_4_5 and ctx.flash_mode:
+			return 'system_prompt_anthropic_flash.md'
+		elif ctx.flash_mode and ctx.is_anthropic:
+			return 'system_prompt_flash_anthropic.md'
+		elif ctx.flash_mode:
+			return 'system_prompt_flash.md'
+		elif ctx.use_thinking:
+			return 'system_prompt.md'
+		else:
+			return 'system_prompt_no_thinking.md'
+
+	def render(self, ctx: SystemPromptSectionContext) -> str | None:
+		if ctx.override_system_message is not None:
+			return ctx.override_system_message
+
+		filename = self._select_template_filename(ctx)
+		try:
+			with (
+				importlib.resources.files('browser_use.agent.system_prompts')
+				.joinpath(filename)
+				.open('r', encoding='utf-8') as f
+			):
+				template = f.read()
+			return template.format(max_actions=ctx.max_actions_per_step)
+		except Exception as e:
+			raise RuntimeError(f'Failed to load system prompt template {filename}: {e}')
+
+
+class SystemExtendMessageSection(SystemPromptSection):
+	"""Appends user-provided extend_system_message."""
+
+	def __init__(self):
+		super().__init__(name='extend_message')
+
+	def render(self, ctx: SystemPromptSectionContext) -> str | None:
+		return ctx.extend_system_message
+
+
+class SystemPromptBuilder:
+	"""Assembles the system prompt from ordered, toggleable sections."""
+
+	sections: list[SystemPromptSection]
+	context: SystemPromptSectionContext
+
+	def __init__(self):
+		self.sections: list[SystemPromptSection] = [
+			SystemCoreTemplateSection(),
+			SystemExtendMessageSection(),
+		]
+		self.context = SystemPromptSectionContext()
+
+	def get_section(self, name: str) -> SystemPromptSection | None:
+		for s in self.sections:
+			if s.name == name:
+				return s
+		return None
+
+	def enable_section(self, name: str) -> None:
+		s = self.get_section(name)
+		if s is not None:
+			s.enabled = True
+
+	def disable_section(self, name: str) -> None:
+		s = self.get_section(name)
+		if s is not None:
+			s.enabled = False
+
+	def set_context(self, **kwargs: Any) -> None:
+		for key, value in kwargs.items():
+			if hasattr(self.context, key):
+				setattr(self.context, key, value)
+
+	def build_text(self) -> str:
+		parts: list[str] = []
+		for section in self.sections:
+			if not section.enabled:
+				continue
+			rendered = section.render(self.context)
+			if rendered is not None and rendered.strip():
+				parts.append(rendered.strip('\n'))
+		return '\n'.join(parts)
+
+	def build_system_message(self) -> SystemMessage:
+		return SystemMessage(content=self.build_text(), cache=True)
+
+
+def _is_anthropic_4_5_model(model_name: str | None) -> bool:
+	"""Check if the model is Claude Opus 4.5 or Haiku 4.5 (requires 4096+ token prompts for caching)."""
+	if not model_name:
+		return False
+	model_lower = model_name.lower()
+	is_opus_4_5 = 'opus' in model_lower and ('4.5' in model_lower or '4-5' in model_lower)
+	is_haiku_4_5 = 'haiku' in model_lower and ('4.5' in model_lower or '4-5' in model_lower)
+	return is_opus_4_5 or is_haiku_4_5
+
+
+class PromptSectionConfig:
+	"""Configuration for which prompt sections to enable, based on provider and runtime mode.
+
+	Used by Agent.__init__ to configure both SystemPromptBuilder and PromptContextBuilder
+	in a single place, instead of scattering enable/disable logic across files.
+	"""
+
+	enable_user_request: bool = True
+	enable_agent_history: bool = True
+	enable_file_system: bool = True
+	enable_plan: bool = True
+	enable_sensitive_data: bool = True
+	enable_available_file_paths: bool = True
+	enable_browser_state: bool = True
+	enable_read_state: bool = True
+	enable_page_specific_actions: bool = True
+	enable_unavailable_skills: bool = True
+	enable_context_messages: bool = True
+	enable_step_meta: bool = True
+
+	enable_system_core_template: bool = True
+	enable_system_extend_message: bool = True
+
+	@classmethod
+	def for_provider(
+		cls,
+		provider: str,
+		flash_mode: bool = False,
+		use_thinking: bool = True,
+		enable_planning: bool = True,
+	) -> 'PromptSectionConfig':
+		"""Factory: build a config based on provider name and runtime mode."""
+		cfg = cls()
+		provider_lower = provider.lower() if provider else ''
+
+		if flash_mode:
+			cfg.enable_plan = False
+			cfg.enable_step_meta = True
+
+		if not enable_planning:
+			cfg.enable_plan = False
+
+		if 'browser-use' in provider_lower:
+			pass
+
+		if 'anthropic' in provider_lower:
+			pass
+
+		return cfg
+
+	def apply_to_user_builder(self, builder: PromptContextBuilder) -> None:
+		"""Apply this config to a user-state PromptContextBuilder."""
+		builder.sections  # ensure not None
+		toggles = {
+			'user_request': self.enable_user_request,
+			'agent_history': self.enable_agent_history,
+			'file_system': self.enable_file_system,
+			'plan': self.enable_plan,
+			'sensitive_data': self.enable_sensitive_data,
+			'available_file_paths': self.enable_available_file_paths,
+			'browser_state': self.enable_browser_state,
+			'read_state': self.enable_read_state,
+			'page_specific_actions': self.enable_page_specific_actions,
+			'unavailable_skills': self.enable_unavailable_skills,
+			'context_messages': self.enable_context_messages,
+			'step_meta': self.enable_step_meta,
+		}
+		for name, enabled in toggles.items():
+			if enabled:
+				builder.enable_section(name)
+			else:
+				builder.disable_section(name)
+
+	def apply_to_system_builder(self, builder: SystemPromptBuilder) -> None:
+		"""Apply this config to a SystemPromptBuilder."""
+		toggles = {
+			'core_template': self.enable_system_core_template,
+			'extend_message': self.enable_system_extend_message,
+		}
+		for name, enabled in toggles.items():
+			if enabled:
+				builder.enable_section(name)
+			else:
+				builder.disable_section(name)

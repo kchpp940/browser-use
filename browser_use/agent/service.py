@@ -493,13 +493,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Check if LLM is ChatAnthropic instance
 		from browser_use.llm.anthropic.chat import ChatAnthropic
 
-		is_anthropic = isinstance(self.llm, ChatAnthropic)
+		from browser_use.agent.prompt_context import PromptSectionConfig
 
-		# Check if model is a browser-use fine-tuned model (uses simplified prompts)
+		is_anthropic = isinstance(self.llm, ChatAnthropic)
 		is_browser_use_model = 'browser-use/' in self.llm.model.lower()
 
-		# Initialize message manager with state
-		# Initial system prompt with all actions - will be updated during each step
+		provider = 'browser-use' if is_browser_use_model else ('anthropic' if is_anthropic else 'default')
+		section_config = PromptSectionConfig.for_provider(
+			provider=provider,
+			flash_mode=self.settings.flash_mode,
+			use_thinking=self.settings.use_thinking,
+			enable_planning=self.settings.enable_planning,
+		)
+
 		self._message_manager = MessageManager(
 			task=self.task,
 			system_message=SystemPrompt(
@@ -525,6 +531,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			sample_images=self.sample_images,
 			llm_screenshot_size=llm_screenshot_size,
 			max_clickable_elements_length=self.settings.max_clickable_elements_length,
+			section_config=section_config,
 		)
 
 		if self.sensitive_data:
@@ -1149,6 +1156,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self._inject_loop_detection_nudge()
 		await self._force_done_after_last_step(step_info)
 		await self._force_done_after_failure()
+
 		return browser_state_summary
 
 	async def _maybe_compact_messages(self, step_info: AgentStepInfo | None = None) -> None:
@@ -1460,14 +1468,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.settings.planning_replan_on_stall <= 0:
 			return
 		if self.state.consecutive_failures >= self.settings.planning_replan_on_stall:
-			msg = (
-				'REPLAN SUGGESTED: You have failed '
-				f'{self.state.consecutive_failures} consecutive times. '
-				'Your current plan may need revision. '
-				'Output a new `plan_update` with revised steps to recover.'
-			)
 			self.logger.info(f'📋 Replan nudge injected after {self.state.consecutive_failures} consecutive failures')
-			self._message_manager._add_context_message(UserMessage(content=msg))
+			builder = self._message_manager.prompt_builder
+			if builder is not None:
+				builder.nudge_replan(self.state.consecutive_failures)
+				self._message_manager._sync_builder_context_to_history()
+			else:
+				self._message_manager._add_context_message(
+					UserMessage(content=f'REPLAN SUGGESTED: You have failed {self.state.consecutive_failures} consecutive times. Your current plan may need revision. Output a new `plan_update` with revised steps to recover.')
+				)
 
 	def _inject_exploration_nudge(self) -> None:
 		"""Nudge the agent to create a plan (or call done) after exploring without one."""
@@ -1476,14 +1485,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.settings.planning_exploration_limit <= 0:
 			return
 		if self.state.n_steps >= self.settings.planning_exploration_limit:
-			msg = (
-				'PLANNING NUDGE: You have taken '
-				f'{self.state.n_steps} steps without creating a plan. '
-				'If the task is complex, output a `plan_update` with clear todo items now. '
-				'If the task is already done or nearly done, call `done` instead.'
-			)
 			self.logger.info(f'📋 Exploration nudge injected after {self.state.n_steps} steps without a plan')
-			self._message_manager._add_context_message(UserMessage(content=msg))
+			builder = self._message_manager.prompt_builder
+			if builder is not None:
+				builder.nudge_exploration(self.state.n_steps)
+				self._message_manager._sync_builder_context_to_history()
+			else:
+				self._message_manager._add_context_message(
+					UserMessage(content=f'PLANNING NUDGE: You have taken {self.state.n_steps} steps without creating a plan. If the task is complex, output a `plan_update` with clear todo items now. If the task is already done or nearly done, call `done` instead.')
+				)
 
 	def _inject_loop_detection_nudge(self) -> None:
 		"""Inject an escalating nudge when behavioral loops are detected."""
@@ -1495,7 +1505,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				f'🔁 Loop detection nudge injected (repetition={self.state.loop_detector.max_repetition_count}, '
 				f'stagnation={self.state.loop_detector.consecutive_stagnant_pages})'
 			)
-			self._message_manager._add_context_message(UserMessage(content=nudge))
+			builder = self._message_manager.prompt_builder
+			if builder is not None:
+				builder.nudge_loop_detection(nudge)
+				self._message_manager._sync_builder_context_to_history()
+			else:
+				self._message_manager._add_context_message(UserMessage(content=nudge))
 
 	def _update_loop_detector_actions(self) -> None:
 		"""Record the actions from the latest step into the loop detector."""
@@ -1532,53 +1547,61 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.state.loop_detector.record_page_state(url, dom_text, element_count)
 
 	async def _inject_budget_warning(self, step_info: AgentStepInfo | None = None) -> None:
-		"""Inject a prominent budget warning when the agent has used >= 75% of its step budget.
-
-		This gives the LLM advance notice to wrap up, save partial results, and call done
-		rather than exhausting all steps with nothing saved.
-		"""
+		"""Inject a prominent budget warning when the agent has used >= 75% of its step budget."""
 		if step_info is None:
 			return
 
-		steps_used = step_info.step_number + 1  # Convert 0-indexed to 1-indexed
+		steps_used = step_info.step_number + 1
 		budget_ratio = steps_used / step_info.max_steps
 
 		if budget_ratio >= 0.75 and not step_info.is_last_step():
 			steps_remaining = step_info.max_steps - steps_used
 			pct = int(budget_ratio * 100)
-			msg = (
-				f'BUDGET WARNING: You have used {steps_used}/{step_info.max_steps} steps '
-				f'({pct}%). {steps_remaining} steps remaining. '
-				f'If the task cannot be completed in the remaining steps, prioritize: '
-				f'(1) consolidate your results (save to files if the file system is in use), '
-				f'(2) call done with what you have. '
-				f'Partial results are far more valuable than exhausting all steps with nothing saved.'
-			)
 			self.logger.info(f'Step budget warning: {steps_used}/{step_info.max_steps} ({pct}%)')
-			self._message_manager._add_context_message(UserMessage(content=msg))
+			builder = self._message_manager.prompt_builder
+			if builder is not None:
+				builder.nudge_budget_warning(steps_used, step_info.max_steps, steps_remaining)
+				self._message_manager._sync_builder_context_to_history()
+			else:
+				msg = (
+					f'BUDGET WARNING: You have used {steps_used}/{step_info.max_steps} steps '
+					f'({pct}%). {steps_remaining} steps remaining. '
+					f'If the task cannot be completed in the remaining steps, prioritize: '
+					f'(1) consolidate your results (save to files if the file system is in use), '
+					f'(2) call done with what you have. '
+					f'Partial results are far more valuable than exhausting all steps with nothing saved.'
+				)
+				self._message_manager._add_context_message(UserMessage(content=msg))
 
 	async def _force_done_after_last_step(self, step_info: AgentStepInfo | None = None) -> None:
 		"""Handle special processing for the last step"""
 		if step_info and step_info.is_last_step():
-			# Add last step warning if needed
-			msg = 'You reached max_steps - this is your last step. Your only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
-			msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
-			msg += '\nInclude everything you found out for the ultimate task in the done text.'
 			self.logger.debug('Last step finishing up')
-			self._message_manager._add_context_message(UserMessage(content=msg))
+			builder = self._message_manager.prompt_builder
+			if builder is not None:
+				builder.nudge_last_step(step_info.max_steps)
+				self._message_manager._sync_builder_context_to_history()
+			else:
+				msg = 'You reached max_steps - this is your last step. Your only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
+				msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
+				msg += '\nInclude everything you found out for the ultimate task in the done text.'
+				self._message_manager._add_context_message(UserMessage(content=msg))
 			self.AgentOutput = self.DoneAgentOutput
 
 	async def _force_done_after_failure(self) -> None:
 		"""Force done after failure"""
-		# Create recovery message
 		if self.state.consecutive_failures >= self.settings.max_failures and self.settings.final_response_after_failure:
-			msg = f'You failed {self.settings.max_failures} times. Therefore we terminate the agent.'
-			msg += '\nYour only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
-			msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
-			msg += '\nInclude everything you found out for the ultimate task in the done text.'
-
 			self.logger.debug('Force done action, because we reached max_failures.')
-			self._message_manager._add_context_message(UserMessage(content=msg))
+			builder = self._message_manager.prompt_builder
+			if builder is not None:
+				builder.nudge_force_done(self.settings.max_failures)
+				self._message_manager._sync_builder_context_to_history()
+			else:
+				msg = f'You failed {self.settings.max_failures} times. Therefore we terminate the agent.'
+				msg += '\nYour only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
+				msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
+				msg += '\nInclude everything you found out for the ultimate task in the done text.'
+				self._message_manager._add_context_message(UserMessage(content=msg))
 			self.AgentOutput = self.DoneAgentOutput
 
 	@observe(ignore_input=True, ignore_output=False)
