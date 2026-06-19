@@ -491,12 +491,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.browser_session.llm_screenshot_size = llm_screenshot_size
 
 		# Check if LLM is ChatAnthropic instance
+		from browser_use.agent.prompt_context import PromptSectionConfig, default_registry
 		from browser_use.llm.anthropic.chat import ChatAnthropic
-
-		from browser_use.agent.prompt_context import PromptSectionConfig
 
 		is_anthropic = isinstance(self.llm, ChatAnthropic)
 		is_browser_use_model = 'browser-use/' in self.llm.model.lower()
+
+		registry = default_registry()
 
 		provider = 'browser-use' if is_browser_use_model else ('anthropic' if is_anthropic else 'default')
 		section_config = PromptSectionConfig.for_provider(
@@ -517,6 +518,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				is_anthropic=is_anthropic,
 				is_browser_use_model=is_browser_use_model,
 				model_name=self.llm.model,
+				registry=registry,
 			).get_system_message(),
 			file_system=self.file_system,
 			state=self.state.message_manager_state,
@@ -532,6 +534,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			llm_screenshot_size=llm_screenshot_size,
 			max_clickable_elements_length=self.settings.max_clickable_elements_length,
 			section_config=section_config,
+			registry=registry,
 		)
 
 		if self.sensitive_data:

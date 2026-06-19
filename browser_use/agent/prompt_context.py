@@ -378,6 +378,86 @@ class ContextMessageSection(PromptSection):
 		return '\n\n'.join(self._messages)
 
 
+# =============================================================================
+# Prompt Section Registry
+# =============================================================================
+
+
+class PromptSectionRegistry:
+	"""Central registry for prompt sections — both user-state and system-prompt.
+
+	Instead of hardcoding section lists inside builders, all sections are
+	registered here with an explicit ordering.  Builders consume the registry
+	to build their section lists.  Adding a new section only requires calling
+	``registry.register_user_section(MyNewSection())`` (or the system
+	equivalent); no builder code needs to change.
+	"""
+
+	def __init__(self) -> None:
+		self._user_entries: list[tuple[int, PromptSection]] = []
+		self._system_entries: list[tuple[int, SystemPromptSection]] = []
+
+	def register_user_section(self, section: PromptSection, order: int = 0) -> None:
+		self._user_entries.append((order, section))
+
+	def register_system_section(self, section: SystemPromptSection, order: int = 0) -> None:
+		self._system_entries.append((order, section))
+
+	def build_user_sections(self) -> list[PromptSection]:
+		self._user_entries.sort(key=lambda e: e[0])
+		return [s for _, s in self._user_entries]
+
+	def build_system_sections(self) -> list[SystemPromptSection]:
+		self._system_entries.sort(key=lambda e: e[0])
+		return [s for _, s in self._system_entries]
+
+	def user_section_names(self) -> list[str]:
+		return [s.name for _, s in self._user_entries]
+
+	def system_section_names(self) -> list[str]:
+		return [s.name for _, s in self._system_entries]
+
+	def get_user_section(self, name: str) -> PromptSection | None:
+		for _, s in self._user_entries:
+			if s.name == name:
+				return s
+			if isinstance(s, AgentStateGroupSection):
+				sub = s.get_section(name)
+				if sub is not None:
+					return sub
+		return None
+
+	def get_system_section(self, name: str) -> SystemPromptSection | None:
+		for _, s in self._system_entries:
+			if s.name == name:
+				return s
+		return None
+
+
+def default_registry() -> PromptSectionRegistry:
+	"""Build the default registry containing all built-in sections.
+
+	Sections are ordered so that the assembled prompt matches the original
+	hardcoded layout exactly.
+	"""
+	reg = PromptSectionRegistry()
+
+	reg.register_user_section(UserRequestSection(), order=100)
+	reg.register_user_section(AgentHistorySection(), order=200)
+	reg.register_user_section(AgentStateGroupSection(), order=300)
+	reg.register_user_section(BrowserStateSection(), order=400)
+	reg.register_user_section(ReadStateSection(), order=500)
+	reg.register_user_section(PageSpecificActionsSection(), order=600)
+	reg.register_user_section(UnavailableSkillsSection(), order=700)
+	reg.register_user_section(ContextMessageSection(), order=800)
+	reg.register_user_section(StepMetaSection(), order=900)
+
+	reg.register_system_section(SystemCoreTemplateSection(), order=100)
+	reg.register_system_section(SystemExtendMessageSection(), order=200)
+
+	return reg
+
+
 @dataclass
 class PromptImage:
 	label: str
@@ -393,18 +473,11 @@ class PromptContextBuilder:
 	images: list[PromptImage] = field(default_factory=list)
 	sample_images: list[ContentPartTextParam | ContentPartImageParam] = field(default_factory=list)
 
-	def __init__(self):
-		self.sections: list[PromptSection] = [
-			UserRequestSection(),
-			AgentHistorySection(),
-			AgentStateGroupSection(),
-			BrowserStateSection(),
-			ReadStateSection(),
-			PageSpecificActionsSection(),
-			UnavailableSkillsSection(),
-			ContextMessageSection(),
-			StepMetaSection(),
-		]
+	def __init__(self, registry: PromptSectionRegistry | None = None):
+		if registry is not None:
+			self.sections = registry.build_user_sections()
+		else:
+			self.sections = default_registry().build_user_sections()
 		self.context = PromptSectionContext()
 		self.images = []
 		self.sample_images = []
@@ -724,11 +797,11 @@ class SystemPromptBuilder:
 	sections: list[SystemPromptSection]
 	context: SystemPromptSectionContext
 
-	def __init__(self):
-		self.sections: list[SystemPromptSection] = [
-			SystemCoreTemplateSection(),
-			SystemExtendMessageSection(),
-		]
+	def __init__(self, registry: PromptSectionRegistry | None = None):
+		if registry is not None:
+			self.sections = registry.build_system_sections()
+		else:
+			self.sections = default_registry().build_system_sections()
 		self.context = SystemPromptSectionContext()
 
 	def get_section(self, name: str) -> SystemPromptSection | None:
@@ -779,47 +852,46 @@ def _is_anthropic_4_5_model(model_name: str | None) -> bool:
 class PromptSectionConfig:
 	"""Configuration for which prompt sections to enable, based on provider and runtime mode.
 
-	Used by Agent.__init__ to configure both SystemPromptBuilder and PromptContextBuilder
-	in a single place, instead of scattering enable/disable logic across files.
+	Instead of hardcoding boolean toggles that must be kept in sync with
+	section registrations, this config tracks **disabled** section names only.
+	By default every registered section is enabled.  ``apply_to_*_builder``
+	iterates the builder's actual sections — no manual toggle dict needed.
+
+	To add a new section: register it in ``default_registry()`` (or a custom
+	registry).  The config will automatically discover it.
 	"""
 
-	enable_user_request: bool = True
-	enable_agent_history: bool = True
-	enable_file_system: bool = True
-	enable_plan: bool = True
-	enable_sensitive_data: bool = True
-	enable_available_file_paths: bool = True
-	enable_browser_state: bool = True
-	enable_read_state: bool = True
-	enable_page_specific_actions: bool = True
-	enable_unavailable_skills: bool = True
-	enable_context_messages: bool = True
-	enable_step_meta: bool = True
+	def __init__(self) -> None:
+		self.disabled_names: set[str] = set()
 
-	enable_system_core_template: bool = True
-	enable_system_extend_message: bool = True
+	def enable(self, name: str) -> None:
+		self.disabled_names.discard(name)
+
+	def disable(self, name: str) -> None:
+		self.disabled_names.add(name)
+
+	def is_enabled(self, name: str) -> bool:
+		return name not in self.disabled_names
 
 	@classmethod
 	def for_provider(
 		cls,
-		provider: str,
+		provider: str = '',
 		flash_mode: bool = False,
 		use_thinking: bool = True,
 		enable_planning: bool = True,
 	) -> 'PromptSectionConfig':
 		"""Factory: build a config based on provider name and runtime mode."""
 		cfg = cls()
-		provider_lower = provider.lower() if provider else ''
 
 		if flash_mode:
-			cfg.enable_plan = False
-			cfg.enable_step_meta = True
+			cfg.disable('plan')
+			cfg.enable('step_meta')
 
 		if not enable_planning:
-			cfg.enable_plan = False
+			cfg.disable('plan')
 
-		if 'browser-use' in provider_lower:
-			pass
+		provider_lower = provider.lower() if provider else ''
 
 		if 'anthropic' in provider_lower:
 			pass
@@ -827,36 +899,27 @@ class PromptSectionConfig:
 		return cfg
 
 	def apply_to_user_builder(self, builder: PromptContextBuilder) -> None:
-		"""Apply this config to a user-state PromptContextBuilder."""
-		builder.sections  # ensure not None
-		toggles = {
-			'user_request': self.enable_user_request,
-			'agent_history': self.enable_agent_history,
-			'file_system': self.enable_file_system,
-			'plan': self.enable_plan,
-			'sensitive_data': self.enable_sensitive_data,
-			'available_file_paths': self.enable_available_file_paths,
-			'browser_state': self.enable_browser_state,
-			'read_state': self.enable_read_state,
-			'page_specific_actions': self.enable_page_specific_actions,
-			'unavailable_skills': self.enable_unavailable_skills,
-			'context_messages': self.enable_context_messages,
-			'step_meta': self.enable_step_meta,
-		}
-		for name, enabled in toggles.items():
-			if enabled:
-				builder.enable_section(name)
+		"""Apply this config to a user-state PromptContextBuilder.
+
+		Iterates the builder's actual sections (which come from the registry)
+		so there is no hardcoded name list to maintain.
+		"""
+		for section in builder.sections:
+			if self.is_enabled(section.name):
+				section.enabled = True
 			else:
-				builder.disable_section(name)
+				section.enabled = False
+			if isinstance(section, AgentStateGroupSection):
+				for sub in section.sub_sections:
+					if self.is_enabled(sub.name):
+						sub.enabled = True
+					else:
+						sub.enabled = False
 
 	def apply_to_system_builder(self, builder: SystemPromptBuilder) -> None:
 		"""Apply this config to a SystemPromptBuilder."""
-		toggles = {
-			'core_template': self.enable_system_core_template,
-			'extend_message': self.enable_system_extend_message,
-		}
-		for name, enabled in toggles.items():
-			if enabled:
-				builder.enable_section(name)
+		for section in builder.sections:
+			if self.is_enabled(section.name):
+				section.enabled = True
 			else:
-				builder.disable_section(name)
+				section.enabled = False

@@ -6,7 +6,12 @@ from typing import Literal
 from browser_use.agent.message_manager.views import (
 	HistoryItem,
 )
-from browser_use.agent.prompt_context import ContextMessageSection, PromptContextBuilder, PromptSectionConfig
+from browser_use.agent.prompt_context import (
+	ContextMessageSection,
+	PromptContextBuilder,
+	PromptSectionConfig,
+	PromptSectionRegistry,
+)
 from browser_use.agent.prompts import AgentMessagePrompt
 from browser_use.agent.views import (
 	ActionResult,
@@ -122,6 +127,7 @@ class MessageManager:
 		llm_screenshot_size: tuple[int, int] | None = None,
 		max_clickable_elements_length: int = 40000,
 		section_config: PromptSectionConfig | None = None,
+		registry: PromptSectionRegistry | None = None,
 	):
 		self.task = task
 		self.state = state
@@ -137,6 +143,7 @@ class MessageManager:
 		self.llm_screenshot_size = llm_screenshot_size
 		self.max_clickable_elements_length = max_clickable_elements_length
 		self.section_config = section_config or PromptSectionConfig()
+		self.registry = registry
 
 		assert max_history_items is None or max_history_items > 5, 'max_history_items must be None or greater than 5'
 
@@ -509,6 +516,7 @@ class MessageManager:
 			llm_screenshot_size=self.llm_screenshot_size,
 			unavailable_skills_info=unavailable_skills_info,
 			plan_description=plan_description,
+			registry=self.registry,
 		)
 
 		self.section_config.apply_to_user_builder(self.current_prompt.builder)

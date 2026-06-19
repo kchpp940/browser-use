@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING, Literal, Optional
 from browser_use.agent.prompt_context import (
 	PromptContextBuilder,
 	PromptSectionContext,
+	PromptSectionRegistry,
 	SystemPromptBuilder,
 	_is_anthropic_4_5_model,
 )
@@ -26,6 +27,7 @@ class SystemPrompt:
 		is_anthropic: bool = False,
 		is_browser_use_model: bool = False,
 		model_name: str | None = None,
+		registry: PromptSectionRegistry | None = None,
 	):
 		self.max_actions_per_step = max_actions_per_step
 		self.use_thinking = use_thinking
@@ -35,7 +37,7 @@ class SystemPrompt:
 		self.model_name = model_name
 		self.is_anthropic_4_5 = _is_anthropic_4_5_model(model_name)
 
-		self.builder = SystemPromptBuilder()
+		self.builder = SystemPromptBuilder(registry=registry)
 		self.builder.set_context(
 			max_actions_per_step=max_actions_per_step,
 			use_thinking=use_thinking,
@@ -83,8 +85,9 @@ class AgentMessagePrompt:
 		llm_screenshot_size: tuple[int, int] | None = None,
 		unavailable_skills_info: str | None = None,
 		plan_description: str | None = None,
+		registry: PromptSectionRegistry | None = None,
 	):
-		self.builder = PromptContextBuilder()
+		self.builder = PromptContextBuilder(registry=registry)
 		self.builder.set_context(
 			browser_state_summary=browser_state_summary,
 			file_system=file_system,
