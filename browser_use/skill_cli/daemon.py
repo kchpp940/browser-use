@@ -322,13 +322,14 @@ class Daemon:
 				return {'id': req_id, 'success': True, 'data': result_data}
 
 			from browser_use.skill_cli.commands import browser, python_exec
+			from browser_use.skill_cli.registry import COMMANDS
 
 			# Get or create the single session
 			session = await self._get_or_create_session()
 
 			# Apply unified command filtering via ToolRegistryAdapter.is_command_allowed().
 			# This ensures the same tool whitelist applies across Agent, MCP, and skill_cli.
-			if action in browser.COMMANDS:
+			if action in COMMANDS:
 				if not session.is_command_allowed(action):
 					return {
 						'id': req_id,

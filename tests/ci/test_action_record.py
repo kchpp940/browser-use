@@ -179,6 +179,6 @@ def test_cli_argparse_record_start_stop():
 
 def test_cli_record_is_routed_to_browser_handler():
 	"""Daemon dispatch should route 'record' to browser.handle()."""
-	from browser_use.skill_cli.commands import browser as browser_cmd
+	from browser_use.skill_cli.registry import COMMANDS
 
-	assert 'record' in browser_cmd.COMMANDS
+	assert 'record' in COMMANDS
