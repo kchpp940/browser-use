@@ -11,6 +11,12 @@ if TYPE_CHECKING:
 	pass
 
 
+class EmptyParams(BaseModel):
+	"""Placeholder for tools that take no parameters."""
+
+	pass
+
+
 class RegisteredAction(BaseModel):
 	"""Model for a registered action"""
 
@@ -201,17 +207,26 @@ class ToolCapability(BaseModel):
 	- MCP list_tools
 	- Task template allowed tools filtering
 	- Result formatting
+	- skill_cli command registry
 	"""
 
 	name: str
 	description: str
 	category: Literal['navigation', 'interaction', 'extraction', 'tab_management', 'file', 'system', 'custom'] = 'custom'
-	param_schema: type[BaseModel]
+	param_schema: type[BaseModel] = EmptyParams
 	domains: list[str] | None = None
 	terminates_sequence: bool = False
 	requires_browser: bool = False
 	requires_llm: bool = False
 	result_is_structured: bool = False
+
+	# --- Entry-point-specific fields (all optional) ---
+
+	# For skill_cli commands: the canonical core tool name this command maps to.
+	# Used by ToolRegistryAdapter.filter_allowed_tools() to check availability.
+	# If None, the command is considered CLI-specific and always allowed (unless
+	# explicitly excluded).
+	core_tool_name: str | None = None
 
 	model_config = ConfigDict(arbitrary_types_allowed=True)
 

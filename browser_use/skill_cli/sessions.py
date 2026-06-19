@@ -53,10 +53,7 @@ class SessionInfo:
 			allowed_categories: Optional list of allowed categories.
 				If provided, only commands in these categories are allowed.
 		"""
-		from browser_use.skill_cli.commands.browser import (
-			CLI_SPECIFIC_COMMANDS,
-			COMMAND_TO_TOOL_MAPPING,
-		)
+		from browser_use.skill_cli.registry import CLI_COMMAND_CAPABILITIES, COMMANDS
 		from browser_use.tools.service import Tools
 
 		# Create a unified Tools registry and get its adapter
@@ -80,22 +77,23 @@ class SessionInfo:
 		# Build set of allowed core tool names from the filtered adapter
 		allowed_core_tools: set[str] = {cap.name for cap in adapter.list_tool_capabilities()}
 
-		# Build set of allowed CLI commands by checking the mapping
+		# Build allowed CLI commands directly from CLI_COMMAND_CAPABILITIES.
+		# Each capability has a core_tool_name field that maps it to a core tool.
+		# Commands with core_tool_name=None are CLI-specific and always allowed
+		# (unless explicitly excluded elsewhere).
 		allowed_commands: set[str] = set()
 
-		# Add CLI-specific commands that don't map to core tools
-		allowed_commands.update(CLI_SPECIFIC_COMMANDS)
-
-		# Add commands whose mapped core tools are in the allowed set
-		for cmd, core_tool in COMMAND_TO_TOOL_MAPPING.items():
-			if core_tool in allowed_core_tools:
-				allowed_commands.add(cmd)
-
-		# If no filters were specified, allow everything in COMMANDS
+		# If no filters were specified, allow everything — short-circuit
 		if allowed_tool_names is None and allowed_categories is None:
-			from browser_use.skill_cli.commands.browser import COMMANDS
-
 			allowed_commands = set(COMMANDS)
+		else:
+			for cap in CLI_COMMAND_CAPABILITIES:
+				if cap.core_tool_name is None:
+					# CLI-specific command — always allowed
+					allowed_commands.add(cap.name)
+				elif cap.core_tool_name in allowed_core_tools:
+					# Command maps to an allowed core tool
+					allowed_commands.add(cap.name)
 
 		self.tool_registry_adapter = adapter
 		self.allowed_commands = allowed_commands
