@@ -2131,6 +2131,65 @@ Validated Code (after quote fixing):
 		self._apply_default_categories()
 		return ToolRegistryAdapter(registry=self.registry.registry)
 
+	@classmethod
+	def with_allowed_tools(
+		cls,
+		allowed_tool_names: list[str],
+		output_model: type[T] | None = None,
+		display_files_in_done_text: bool = True,
+	) -> 'Tools':
+		"""Create a Tools instance with only the specified tools allowed.
+
+		This is the recommended way to create tool whitelists for task templates
+		and skill_cli workflows. It ensures consistent tool availability checking
+		across all entry points by using the unified ToolRegistryAdapter.
+
+		Args:
+			allowed_tool_names: List of tool names to allow. Use the same names
+				as registered in the core tools registry.
+			output_model: Optional Pydantic model for structured output.
+			display_files_in_done_text: Whether to include file info in done messages.
+
+		Returns:
+			A Tools instance with only the specified tools available.
+
+		Example:
+			>>> # Create a tools instance with only navigation and extraction tools
+			>>> tools = Tools.with_allowed_tools(['navigate', 'extract', 'done'])
+			>>> # Use in a task template
+			>>> agent = Agent(task='Extract data', tools=tools, llm=llm)
+		"""
+		# First create a full tools instance
+		tools = cls(
+			output_model=output_model,
+			display_files_in_done_text=display_files_in_done_text,
+		)
+
+		# Get the adapter to validate allowed tool names
+		adapter = tools.get_tool_registry_adapter()
+		all_tool_names = {cap.name for cap in adapter.list_tool_capabilities()}
+
+		# Validate that all requested tools exist
+		invalid_tools = [name for name in allowed_tool_names if name not in all_tool_names]
+		if invalid_tools:
+			available = ', '.join(sorted(all_tool_names))
+			raise ValueError(f'Invalid tool names in allowed list: {invalid_tools}. Available tools: {available}')
+
+		# Create exclude list with all tools NOT in allowed list
+		# Always keep 'done' action unless explicitly excluded
+		exclude_actions = [name for name in all_tool_names if name not in allowed_tool_names and name != 'done']
+
+		# If 'done' is not in allowed list, add it to exclude
+		if 'done' not in allowed_tool_names:
+			exclude_actions.append('done')
+
+		# Recreate tools with proper exclusions
+		return cls(
+			exclude_actions=exclude_actions,
+			output_model=output_model,
+			display_files_in_done_text=display_files_in_done_text,
+		)
+
 	def _apply_default_categories(self) -> None:
 		"""Apply default categories to all registered tools.
 

@@ -209,6 +209,11 @@ class BrowserUseServer:
 		# Cached tool capabilities for consistent metadata across list_tools calls
 		self._tool_capabilities: list | None = None
 
+		# Initialize tools and metadata early so list_tools works before browser session is created
+		# This ensures tool names, descriptions, and schemas are always available
+		self.tools = Tools()
+		self._init_tool_metadata()
+
 		# Setup handlers
 		self._setup_handlers()
 
@@ -217,237 +222,29 @@ class BrowserUseServer:
 
 		@self.server.list_tools()
 		async def handle_list_tools() -> list[types.Tool]:
-			"""List all available browser-use tools."""
-			return [
-				# Agent tools
-				# Direct browser control tools
-				types.Tool(
-					name='browser_navigate',
-					description='Navigate to a URL in the browser',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'url': {'type': 'string', 'description': 'The URL to navigate to'},
-							'new_tab': {'type': 'boolean', 'description': 'Whether to open in a new tab', 'default': False},
-						},
-						'required': ['url'],
-					},
-				),
-				types.Tool(
-					name='browser_click',
-					description='Click an element by index or at specific viewport coordinates. Use index for elements from browser_get_state, or coordinate_x/coordinate_y for pixel-precise clicking.',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'index': {
-								'type': 'integer',
-								'description': 'The index of the element to click (from browser_get_state). Provide this OR coordinate_x+coordinate_y.',
-							},
-							'coordinate_x': {
-								'type': 'integer',
-								'description': 'X coordinate in pixels from the left edge of the viewport. Must be used together with coordinate_y. Provide this OR index.',
-							},
-							'coordinate_y': {
-								'type': 'integer',
-								'description': 'Y coordinate in pixels from the top edge of the viewport. Must be used together with coordinate_x. Provide this OR index.',
-							},
-							'new_tab': {
-								'type': 'boolean',
-								'description': 'Whether to open any resulting navigation in a new tab',
-								'default': False,
-							},
-						},
-					},
-				),
-				types.Tool(
-					name='browser_type',
-					description='Type text into an input field. Clears existing text by default; pass text="" to clear only.',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'index': {
-								'type': 'integer',
-								'description': 'The index of the input element (from browser_get_state)',
-							},
-							'text': {
-								'type': 'string',
-								'description': 'The text to type. Pass an empty string ("") to clear the field without typing.',
-							},
-						},
-						'required': ['index', 'text'],
-					},
-				),
-				types.Tool(
-					name='browser_get_state',
-					description='Get the current state of the page including all interactive elements',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'include_screenshot': {
-								'type': 'boolean',
-								'description': 'Whether to include a screenshot of the current page',
-								'default': False,
-							}
-						},
-					},
-				),
-				types.Tool(
-					name='browser_extract_content',
-					description='Extract structured content from the current page based on a query',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'query': {'type': 'string', 'description': 'What information to extract from the page'},
-							'extract_links': {
-								'type': 'boolean',
-								'description': 'Whether to include links in the extraction',
-								'default': False,
-							},
-						},
-						'required': ['query'],
-					},
-				),
-				types.Tool(
-					name='browser_get_html',
-					description='Get the raw HTML of the current page or a specific element by CSS selector',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'selector': {
-								'type': 'string',
-								'description': 'Optional CSS selector to get HTML of a specific element. If omitted, returns full page HTML.',
-							},
-						},
-					},
-				),
-				types.Tool(
-					name='browser_screenshot',
-					description='Take a screenshot of the current page. Returns viewport metadata as text and the screenshot as an image.',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'full_page': {
-								'type': 'boolean',
-								'description': 'Whether to capture the full scrollable page or just the visible viewport',
-								'default': False,
-							},
-						},
-					},
-				),
-				types.Tool(
-					name='browser_scroll',
-					description='Scroll the page',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'direction': {
-								'type': 'string',
-								'enum': ['up', 'down'],
-								'description': 'Direction to scroll',
-								'default': 'down',
-							}
-						},
-					},
-				),
-				types.Tool(
-					name='browser_go_back',
-					description='Go back to the previous page',
-					inputSchema={'type': 'object', 'properties': {}},
-				),
-				# Tab management
-				types.Tool(
-					name='browser_list_tabs', description='List all open tabs', inputSchema={'type': 'object', 'properties': {}}
-				),
-				types.Tool(
-					name='browser_switch_tab',
-					description='Switch to a different tab',
-					inputSchema={
-						'type': 'object',
-						'properties': {'tab_id': {'type': 'string', 'description': '4 Character Tab ID of the tab to switch to'}},
-						'required': ['tab_id'],
-					},
-				),
-				types.Tool(
-					name='browser_close_tab',
-					description='Close a tab',
-					inputSchema={
-						'type': 'object',
-						'properties': {'tab_id': {'type': 'string', 'description': '4 Character Tab ID of the tab to close'}},
-						'required': ['tab_id'],
-					},
-				),
-				# types.Tool(
-				# 	name="browser_close",
-				# 	description="Close the browser session",
-				# 	inputSchema={
-				# 		"type": "object",
-				# 		"properties": {}
-				# 	}
-				# ),
-				types.Tool(
-					name='retry_with_browser_use_agent',
-					description='Retry a task using the browser-use agent. Only use this as a last resort if you fail to interact with a page multiple times.',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'task': {
-								'type': 'string',
-								'description': 'The high-level goal and detailed step-by-step description of the task the AI browser agent needs to attempt, along with any relevant data needed to complete the task and info about previous attempts.',
-							},
-							'max_steps': {
-								'type': 'integer',
-								'description': 'Maximum number of steps an agent can take.',
-								'default': 100,
-							},
-							'model': {
-								'type': 'string',
-								'description': 'LLM model to use (e.g., gpt-4o, claude-3-opus-20240229). Defaults to the configured model.',
-							},
-							'allowed_domains': {
-								'type': 'array',
-								'items': {'type': 'string'},
-								'description': (
-									'List of domains the agent is allowed to visit (security feature). '
-									'Omit to use the server-configured profile defaults. '
-									'An empty list is treated the same as omitting the argument and '
-									'will NOT disable server-configured restrictions.'
-								),
-							},
-							'use_vision': {
-								'type': 'boolean',
-								'description': 'Whether to use vision capabilities (screenshots) for the agent',
-								'default': True,
-							},
-						},
-						'required': ['task'],
-					},
-				),
-				# Browser session management tools
-				types.Tool(
-					name='browser_list_sessions',
-					description='List all active browser sessions with their details and last activity time',
-					inputSchema={'type': 'object', 'properties': {}},
-				),
-				types.Tool(
-					name='browser_close_session',
-					description='Close a specific browser session by its ID',
-					inputSchema={
-						'type': 'object',
-						'properties': {
-							'session_id': {
-								'type': 'string',
-								'description': 'The browser session ID to close (get from browser_list_sessions)',
-							}
-						},
-						'required': ['session_id'],
-					},
-				),
-				types.Tool(
-					name='browser_close_all',
-					description='Close all active browser sessions and clean up resources',
-					inputSchema={'type': 'object', 'properties': {}},
-				),
-			]
+			"""List all available browser-use tools.
+
+			All tool metadata is sourced from the unified ToolCapability model
+			defined in _init_tool_metadata(). This ensures consistent tool names,
+			descriptions, and parameter schemas across all entry points.
+			"""
+			if self._tool_capabilities is None:
+				self._init_tool_metadata()
+
+			# Convert each ToolCapability to MCP Tool format
+			mcp_tools = []
+			assert self._tool_capabilities is not None, 'Tool capabilities must be initialized'
+			for cap in self._tool_capabilities:
+				tool_dict = cap.to_mcp_tool()
+				mcp_tools.append(
+					types.Tool(
+						name=tool_dict['name'],
+						description=tool_dict['description'],
+						inputSchema=tool_dict['inputSchema'],
+					)
+				)
+
+			return mcp_tools
 
 		@self.server.list_resources()
 		async def handle_list_resources() -> list[types.Resource]:
@@ -461,18 +258,20 @@ class BrowserUseServer:
 
 		@self.server.call_tool()
 		async def handle_call_tool(name: str, arguments: dict[str, Any] | None) -> list[types.TextContent | types.ImageContent]:
-			"""Handle tool execution."""
+			"""Handle tool execution.
+
+			All results are formatted using the unified ToolResult format
+			to ensure consistent output structure across all entry points.
+			"""
 			start_time = time.time()
 			error_msg = None
 			try:
 				result = await self._execute_tool(name, arguments or {})
-				if isinstance(result, list):
-					return result
-				return [types.TextContent(type='text', text=result)]
+				return self._format_result_from_action_result(result)
 			except Exception as e:
 				error_msg = str(e)
 				logger.error(f'Tool execution failed: {e}', exc_info=True)
-				return [types.TextContent(type='text', text=f'Error: {str(e)}')]
+				return self._format_result_from_action_result({'error': str(e)})
 			finally:
 				# Capture telemetry for tool calls
 				duration = time.time() - start_time
@@ -614,10 +413,8 @@ class BrowserUseServer:
 		# Track the session for management
 		self._track_session(self.browser_session)
 
-		# Create tools for direct actions
-		self.tools = Tools()
-
 		# Initialize tool metadata from the unified ToolCapability model
+		# (already initialized in __init__, but refresh in case tools changed)
 		self._init_tool_metadata()
 
 		# Initialize LLM from config
@@ -643,21 +440,33 @@ class BrowserUseServer:
 	def _init_tool_metadata(self) -> None:
 		"""Initialize tool metadata using the unified ToolCapability model.
 
-		This ensures consistent tool metadata across all entry points:
-		- Agent tools registry
-		- MCP list_tools
-		- Template allowed tools filtering
+		This is the single source of truth for all MCP tool metadata.
+		All tool names, descriptions, parameter schemas, permissions, and
+		result formats are defined here and consumed by both list_tools
+		and call_tool handlers.
 
-		For MCP-specific tools, we define their metadata here.
-		For tools shared with the browser-use core, we reuse metadata from the Tools registry.
+		For tools shared with the browser-use core, we reuse metadata from
+		the Tools registry with an MCP-specific name prefix.
+		For MCP-specific tools, we define their complete metadata here.
 		"""
+		from browser_use.mcp.views import (
+			CloseAllSessionsParams,
+			CloseSessionParams,
+			GetHtmlParams,
+			GetStateParams,
+			ListSessionsParams,
+			ListTabsParams,
+			RetryWithAgentParams,
+			TypeTextParams,
+		)
 		from browser_use.tools.registry.views import ToolCapability
 
-		# Get core tool names that map to MCP tools (with browser_ prefix)
-		# These reuse the metadata from the Tools registry for consistency
-		core_tool_mappings = {
+		# Mapping of MCP tool names -> core tool names (with browser_ prefix)
+		# These reuse metadata from the core Tools registry for consistency
+		core_tool_mappings: dict[str, str] = {
 			'browser_navigate': 'navigate',
 			'browser_click': 'click',
+			'browser_type': 'input',
 			'browser_scroll': 'scroll',
 			'browser_go_back': 'go_back',
 			'browser_switch_tab': 'switch',
@@ -666,21 +475,94 @@ class BrowserUseServer:
 			'browser_extract_content': 'extract',
 		}
 
-		tool_caps = []
+		# MCP-specific tool definitions (not in core Tools registry)
+		# These are defined inline with their complete metadata
+		mcp_specific_tools: list[ToolCapability] = [
+			ToolCapability(
+				name='browser_get_state',
+				description='Get the current state of the page including all interactive elements',
+				category='extraction',
+				param_schema=GetStateParams,
+				requires_browser=True,
+				result_is_structured=True,
+			),
+			ToolCapability(
+				name='browser_get_html',
+				description='Get the raw HTML of the current page or a specific element by CSS selector',
+				category='extraction',
+				param_schema=GetHtmlParams,
+				requires_browser=True,
+			),
+			ToolCapability(
+				name='browser_list_tabs',
+				description='List all open tabs',
+				category='tab_management',
+				param_schema=ListTabsParams,
+				requires_browser=True,
+			),
+			ToolCapability(
+				name='retry_with_browser_use_agent',
+				description='Retry a task using the browser-use agent. Only use this as a last resort if you fail to interact with a page multiple times.',
+				category='system',
+				param_schema=RetryWithAgentParams,
+				requires_browser=True,
+				requires_llm=True,
+			),
+			ToolCapability(
+				name='browser_list_sessions',
+				description='List all active browser sessions with their details and last activity time',
+				category='system',
+				param_schema=ListSessionsParams,
+				requires_browser=False,
+			),
+			ToolCapability(
+				name='browser_close_session',
+				description='Close a specific browser session by its ID',
+				category='system',
+				param_schema=CloseSessionParams,
+				requires_browser=False,
+			),
+			ToolCapability(
+				name='browser_close_all',
+				description='Close all active browser sessions and clean up resources',
+				category='system',
+				param_schema=CloseAllSessionsParams,
+				requires_browser=False,
+			),
+		]
 
+		tool_caps: list[ToolCapability] = []
+
+		# Add core tools with MCP naming
 		if self.tools is not None:
 			adapter = self.tools.get_tool_registry_adapter()
 
 			for mcp_name, core_name in core_tool_mappings.items():
 				core_cap = adapter.get_tool_capability(core_name)
 				if core_cap is not None:
-					# Create MCP-specific version with prefixed name
-					# We keep the same param schema and description for consistency
+					# For browser_type, we use a custom param model with clearer field names for MCP users
+					param_schema = TypeTextParams if mcp_name == 'browser_type' else core_cap.param_schema
+
+					# Custom descriptions for MCP context
+					custom_descriptions: dict[str, str] = {
+						'browser_navigate': 'Navigate to a URL in the browser',
+						'browser_click': 'Click an element by index or at specific viewport coordinates. Use index for elements from browser_get_state, or coordinate_x/coordinate_y for pixel-precise clicking.',
+						'browser_type': 'Type text into an input field. Clears existing text by default; pass text="" to clear only.',
+						'browser_scroll': 'Scroll the page',
+						'browser_go_back': 'Go back to the previous page',
+						'browser_switch_tab': 'Switch to a different tab',
+						'browser_close_tab': 'Close a tab',
+						'browser_screenshot': 'Take a screenshot of the current page. Returns viewport metadata as text and the screenshot as an image.',
+						'browser_extract_content': 'Extract structured content from the current page based on a query',
+					}
+
+					description = custom_descriptions.get(mcp_name, core_cap.description) or ''
+
 					mcp_cap = ToolCapability(
 						name=mcp_name,
-						description=core_cap.description,
+						description=description,
 						category=core_cap.category,
-						param_schema=core_cap.param_schema,
+						param_schema=param_schema,
 						domains=core_cap.domains,
 						terminates_sequence=core_cap.terminates_sequence,
 						requires_browser=core_cap.requires_browser,
@@ -689,21 +571,71 @@ class BrowserUseServer:
 					)
 					tool_caps.append(mcp_cap)
 
-		# TODO: Add MCP-specific tool capabilities here
-		# (browser_get_state, browser_get_html, browser_list_tabs, etc.)
-		# These are defined directly in MCP but should also use ToolCapability
+		# Add MCP-specific tools
+		tool_caps.extend(mcp_specific_tools)
 
 		self._tool_capabilities = tool_caps
 
-	def _format_result_from_action_result(self, action_result: Any) -> list:
-		"""Format an ActionResult using the unified ToolResult format for MCP responses.
+	def _format_result_from_action_result(self, action_result: Any) -> list[types.TextContent | types.ImageContent]:
+		"""Format any tool result using the unified ToolResult format for MCP responses.
 
-		This ensures consistent result formatting across all entry points.
+		This is the single entry point for formatting all tool execution results.
+		It handles:
+		- ActionResult objects (from core tools)
+		- Strings (plain text results)
+		- Dicts (structured results)
+		- Lists (already formatted content, e.g., with images)
+		- Tuples (e.g., (metadata_json, screenshot_b64))
+
+		All output is converted to MCP TextContent/ImageContent objects.
 		"""
 		from browser_use.tools.registry.views import ToolResult
 
+		# Handle lists of already-formatted content (backward compatibility)
+		if isinstance(action_result, list) and action_result:
+			converted = []
+			for item in action_result:
+				if isinstance(item, dict):
+					if item.get('type') == 'text':
+						converted.append(types.TextContent(type='text', text=item.get('text', '')))
+					elif item.get('type') == 'image':
+						converted.append(
+							types.ImageContent(
+								type='image',
+								data=item.get('data', ''),
+								mimeType=item.get('mimeType', 'image/png'),
+							)
+						)
+				else:
+					converted.append(types.TextContent(type='text', text=str(item)))
+			return converted
+
+		# Handle tuples (e.g., (metadata_json, screenshot_b64) from screenshot tools)
+		if isinstance(action_result, tuple) and len(action_result) >= 1:
+			text_content = str(action_result[0]) if action_result[0] is not None else ''
+			images = []
+			if len(action_result) >= 2 and action_result[1] is not None:
+				images.append({'data': action_result[1], 'mime_type': 'image/png'})
+			action_result = {'extracted_content': text_content, 'images': images}
+
+		# Convert to ToolResult and then to MCP format
 		tool_result = ToolResult.from_action_result(action_result)
-		return tool_result.to_mcp_content()
+		mcp_content = tool_result.to_mcp_content()
+
+		# Convert dict format to MCP content objects
+		result = []
+		for item in mcp_content:
+			if item.get('type') == 'text':
+				result.append(types.TextContent(type='text', text=item.get('text', '')))
+			elif item.get('type') == 'image':
+				result.append(
+					types.ImageContent(
+						type='image',
+						data=item.get('data', ''),
+						mimeType=item.get('mimeType', 'image/png'),
+					)
+				)
+		return result
 
 	async def _retry_with_browser_use_agent(
 		self,

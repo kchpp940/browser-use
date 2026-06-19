@@ -318,6 +318,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			exclude_actions = ['screenshot'] if use_vision != 'auto' else []
 			self.tools = Tools(exclude_actions=exclude_actions, display_files_in_done_text=display_files_in_done_text)
 
+		# Unified tool registry adapter - single source of truth for all tool metadata
+		# This adapter is used by: action model creation, template filtering, prompt generation
+		self.tool_registry_adapter = self.tools.get_tool_registry_adapter()
+
 		# Enforce screenshot exclusion when use_vision != 'auto', even if user passed custom tools
 		if use_vision != 'auto':
 			self.tools.exclude_action('screenshot')
@@ -770,9 +774,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.source = source
 
 	def _setup_action_models(self) -> None:
-		"""Setup dynamic action models from tools registry"""
+		"""Setup dynamic action models from tools registry using the unified ToolRegistryAdapter.
+
+		The ToolRegistryAdapter provides a single source of truth for all tool metadata,
+		ensuring consistent filtering and schema generation across all entry points.
+		"""
 		# Initially only include actions with no filters
-		self.ActionModel = self.tools.registry.create_action_model()
+		self.ActionModel = self.tool_registry_adapter.create_action_model()
 		# Create output model with the dynamic actions
 		if self.settings.flash_mode:
 			self.AgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.ActionModel)
@@ -782,7 +790,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.AgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.ActionModel)
 
 		# used to force the done action when max_steps is reached
-		self.DoneActionModel = self.tools.registry.create_action_model(include_actions=['done'])
+		self.DoneActionModel = self.tool_registry_adapter.create_action_model(include_actions=['done'])
 		if self.settings.flash_mode:
 			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.DoneActionModel)
 		elif self.settings.use_thinking:
@@ -4002,9 +4010,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.error(f'Error during cleanup: {e}')
 
 	async def _update_action_models_for_page(self, page_url: str) -> None:
-		"""Update action models with page-specific actions"""
+		"""Update action models with page-specific actions using the unified ToolRegistryAdapter.
+
+		This ensures consistent domain-based tool filtering across all entry points.
+		"""
 		# Create new action model with current page's filtered actions
-		self.ActionModel = self.tools.registry.create_action_model(page_url=page_url)
+		self.ActionModel = self.tool_registry_adapter.create_action_model(page_url=page_url)
 		# Update output model with the new actions
 		if self.settings.flash_mode:
 			self.AgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.ActionModel)
@@ -4014,7 +4025,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.AgentOutput = AgentOutput.type_with_custom_actions_no_thinking(self.ActionModel)
 
 		# Update done action model too
-		self.DoneActionModel = self.tools.registry.create_action_model(include_actions=['done'], page_url=page_url)
+		self.DoneActionModel = self.tool_registry_adapter.create_action_model(include_actions=['done'], page_url=page_url)
 		if self.settings.flash_mode:
 			self.DoneAgentOutput = AgentOutput.type_with_custom_actions_flash_mode(self.DoneActionModel)
 		elif self.settings.use_thinking:
