@@ -53,9 +53,9 @@ if TYPE_CHECKING:
 		AgentHistoryList,
 		OutputFile,
 		ResultAssembler,
+		ResultSerializer,
 		RuntimeExecutionResult,
 		StepExecutionResult,
-		ToolExecutionResult,
 	)
 	from browser_use.browser import BrowserProfile, BrowserSession
 	from browser_use.browser import BrowserSession as Browser
@@ -88,9 +88,9 @@ _LAZY_IMPORTS = {
 	# Unified execution result (new in this refactor)
 	'RuntimeExecutionResult': ('browser_use.agent.views', 'RuntimeExecutionResult'),
 	'ResultAssembler': ('browser_use.agent.views', 'ResultAssembler'),
+	'ResultSerializer': ('browser_use.agent.views', 'ResultSerializer'),
 	'StepExecutionResult': ('browser_use.agent.views', 'StepExecutionResult'),
 	'OutputFile': ('browser_use.agent.views', 'OutputFile'),
-	'ToolExecutionResult': ('browser_use.agent.views', 'ToolExecutionResult'),
 	'BrowserSession': ('browser_use.browser', 'BrowserSession'),
 	'Browser': ('browser_use.browser', 'BrowserSession'),  # Alias for BrowserSession
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
@@ -154,9 +154,9 @@ __all__ = [
 	# Unified execution result (new in this refactor)
 	'RuntimeExecutionResult',
 	'ResultAssembler',
+	'ResultSerializer',
 	'StepExecutionResult',
 	'OutputFile',
-	'ToolExecutionResult',
 	# Chat models
 	'ChatOpenAI',
 	'ChatGoogle',

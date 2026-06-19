@@ -1064,7 +1064,10 @@ class ToolExecutionResult(BaseModel):
 		"""Convert to daemon socket response dict.
 
 		Preserves backwards compatibility with existing ``{success, data, error}`` format
-		while embedding the full ToolExecutionResult as ``_structured`` in data.
+		while embedding the full RuntimeExecutionResult as ``_structured`` in data.
+
+		.. deprecated::
+		    Use :meth:`RuntimeExecutionResult.to_daemon_response` instead.
 		"""
 		result_data: dict[str, Any] = dict(self.data)
 		result_data['_structured'] = self.model_dump(exclude={'data'})
@@ -1699,3 +1702,119 @@ class ResultAssembler:
 			raw_history=history,
 			metadata=metadata,
 		)
+
+
+class ResultSerializer:
+	"""Unified serializer for RuntimeExecutionResult — single entry point for all output formats.
+
+	All entry points (Python API, CLI, MCP, template scripts) should use this class
+	to convert a ``RuntimeExecutionResult`` into whatever format their caller needs.
+	This avoids ad-hoc ``to_human_readable`` / ``model_dump_json`` calls scattered
+	across the codebase and ensures consistent serialization behaviour.
+
+	Output modes:
+	    - ``"text"``      — human-readable summary (CLI default, logs)
+	    - ``"json"``      — compact JSON (programmatic consumers, ``--json`` flag)
+	    - ``"json_pretty"`` — indented JSON (debugging, trace dumps)
+	    - ``"both"``      — text summary followed by ``--- JSON ---`` separator (MCP dual-format)
+
+	Usage::
+
+	    serializer = ResultSerializer(result)
+	    print(serializer.to_text())                    # CLI human-readable
+	    print(serializer.to_json(indent=2))            # Python API
+	    for item in serializer.to_mcp_contents():      # MCP server
+	        ...
+	    click.echo(serializer.output(mode='json'))     # CLI --json flag
+	"""
+
+	def __init__(self, result: RuntimeExecutionResult[Any]):
+		self._result = result
+
+	# ------------------------------------------------------------------
+	# Core formatters
+	# ------------------------------------------------------------------
+
+	def to_text(self) -> str:
+		"""Human-readable summary (equivalent to RuntimeExecutionResult.to_human_readable)."""
+		return self._result.to_human_readable()
+
+	def to_json(self, indent: int | None = None, include_raw_history: bool = False) -> str:
+		"""Serialize to JSON string.
+
+		Args:
+		    indent: If set, pretty-print with this many spaces per level.
+		    include_raw_history: Include the raw AgentHistoryList (very large; off by default).
+		"""
+		exclude: set[str] = set() if include_raw_history else {'raw_history'}
+		return self._result.model_dump_json(indent=indent, exclude=exclude)
+
+	def to_dict(self, include_raw_history: bool = False) -> dict[str, Any]:
+		"""Serialize to dict."""
+		exclude: set[str] = set() if include_raw_history else {'raw_history'}
+		return self._result.model_dump(exclude=exclude)
+
+	# ------------------------------------------------------------------
+	# Protocol-specific output
+	# ------------------------------------------------------------------
+
+	def to_mcp_contents(self) -> list[dict[str, Any]]:
+		"""MCP dual-format output: human text + structured JSON block when non-trivial.
+
+		Matches the contract used by the MCP server's direct browser tools.
+		"""
+		return self._result.to_mcp_contents()
+
+	def to_daemon_response(self, req_id: str = '') -> dict[str, Any]:
+		"""skill_cli daemon socket response: {id, success, data, error?} with _structured key."""
+		return self._result.to_daemon_response(req_id=req_id)
+
+	def to_exit_code(self) -> int:
+		"""Unix-style exit code: 0 on success, 1 on failure, 130 on cancellation."""
+		s = self._result.status
+		if s in ('success', 'partial_success'):
+			return 0
+		if s == 'cancelled':
+			return 130
+		return 1
+
+	# ------------------------------------------------------------------
+	# High-level dispatcher used by CLI / template scripts
+	# ------------------------------------------------------------------
+
+	def output(
+		self,
+		mode: Literal['text', 'json', 'json_pretty', 'both'] = 'text',
+		exit_on_failure: bool = False,
+	) -> str:
+		"""Produce output string based on the selected mode.
+
+		Args:
+		    mode: Output format selector.
+		    exit_on_failure: If True and result status is not success/partial_success,
+		        raise ``SystemExit`` with the appropriate exit code *after* producing
+		        the output string — callers should print/save the string before
+		        the exception propagates.
+
+		Returns:
+		    Formatted output string ready for stdout or file writing.
+		"""
+		if mode == 'text':
+			out = self.to_text()
+		elif mode == 'json':
+			out = self.to_json()
+		elif mode == 'json_pretty':
+			out = self.to_json(indent=2)
+		elif mode == 'both':
+			text_part = self.to_text()
+			json_part = self.to_json(indent=2)
+			out = f'{text_part}\n\n--- STRUCTURED RESULT (JSON) ---\n{json_part}'
+		else:
+			raise ValueError(f'Unknown output mode: {mode}')
+
+		if exit_on_failure:
+			code = self.to_exit_code()
+			if code != 0:
+				raise SystemExit(code)
+
+		return out

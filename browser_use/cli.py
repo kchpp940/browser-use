@@ -144,7 +144,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from dotenv import load_dotenv
 
@@ -155,7 +155,7 @@ from browser_use.llm.openai.chat import ChatOpenAI
 load_dotenv()
 
 from browser_use import Agent, Controller
-from browser_use.agent.views import AgentSettings, RuntimeExecutionResult
+from browser_use.agent.views import AgentSettings, ResultSerializer, RuntimeExecutionResult
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
@@ -1488,7 +1488,12 @@ class BrowserUseApp(App):
 		tasks_panel.scroll_end(animate=False)
 
 
-async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
+async def run_prompt_mode(
+	prompt: str,
+	ctx: click.Context,
+	debug: bool = False,
+	output_mode: Literal['text', 'json', 'json_pretty', 'both'] = 'text',
+):
 	"""Run browser-use in non-interactive mode with a single prompt."""
 	# Import and call setup_logging to ensure proper initialization
 	from browser_use.logging_config import setup_logging
@@ -1548,7 +1553,8 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 			**agent_settings.model_dump(),
 		)
 
-		await agent.run()
+		result: RuntimeExecutionResult = await agent.run_with_result()
+		serializer = ResultSerializer(result)
 
 		# Ensure the browser session is fully stopped
 		# The agent's close() method only kills the browser if keep_alive=False,
@@ -1560,6 +1566,16 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 			except Exception:
 				# Ignore errors during cleanup
 				pass
+
+		# Produce output based on selected mode — ALWAYS emit structured result
+		# so that shell pipelines (e.g. `uvx browser-use -p "..." --json | jq`) work reliably
+		try:
+			output_text = serializer.output(mode=output_mode)
+			print(output_text)
+		except Exception as _out_err:
+			# Never let serialization errors swallow the actual task result
+			print(f'[Output serialization failed: {_out_err}]')
+			print(f'[Status: {result.status}, Steps: {result.steps_completed}/{result.max_steps}]')
 
 		# Capture telemetry for successful completion
 		telemetry.capture(
@@ -2014,6 +2030,8 @@ async def run_auth_command():
 @click.option('--proxy-username', type=str, help='Proxy auth username')
 @click.option('--proxy-password', type=str, help='Proxy auth password')
 @click.option('-p', '--prompt', type=str, help='Run a single task without the TUI (headless mode)')
+@click.option('--json', 'json_output', is_flag=True, help='Output result as RuntimeExecutionResult JSON (with --prompt)')
+@click.option('--json-pretty', 'json_pretty_output', is_flag=True, help='Output result as indented RuntimeExecutionResult JSON (with --prompt)')
 @click.option('--mcp', is_flag=True, help='Run as MCP server (exposes JSON RPC via stdin/stdout)')
 @click.pass_context
 def main(ctx: click.Context, debug: bool = False, **kwargs):
@@ -2070,8 +2088,15 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 	if kwargs.get('prompt'):
 		# Set environment variable for prompt mode before running
 		os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'result'
+		# Resolve output mode
+		if kwargs.get('json_pretty_output'):
+			mode = 'json_pretty'
+		elif kwargs.get('json_output'):
+			mode = 'json'
+		else:
+			mode = 'text'
 		# Run in non-interactive mode
-		asyncio.run(run_prompt_mode(kwargs['prompt'], ctx, debug))
+		asyncio.run(run_prompt_mode(kwargs['prompt'], ctx, debug, output_mode=mode))
 		return
 
 	# Configure console logging
