@@ -405,23 +405,207 @@ def _get_func_params(func: Callable) -> list[str]:
 		return []
 
 
-class ToolRegistryAdapter(BaseModel):
-	"""Adapter that provides unified tool metadata from an action registry.
+def create_action_model_instance_from_params(
+	action_name: str,
+	params: dict[str, Any],
+	registry: 'ActionRegistry',
+) -> Any:
+	"""Create an action model instance from raw params dict.
 
-	This is the central adapter that ensures consistency across:
-	1. Agent tools registry
-	2. MCP list_tools
-	3. Template allowed tools filtering
-	4. Execution result packaging
+	This is a convenience function used by unified tool execution entry points.
+	(MCP, skill_cli, etc.) to build action instances from raw arguments.
+	"""
+	action = registry.actions.get(action_name)
+	if action is None:
+		raise ValueError(f'Action not found: {action_name}')
+
+	# Create a dynamic action model with only this action
+	from browser_use.tools.registry.service import Registry
+
+	temp_registry = Registry()
+	filtered_registry = ActionRegistry(actions={action_name: action})
+	temp_registry.registry = filtered_registry
+	ActionModel = temp_registry.create_action_model()
+
+	# Build instance with the action params
+	action_instance = ActionModel.model_validate({action_name: params})
+	return action_instance
+
+
+class ToolRegistryAdapter(BaseModel):
+	"""Unified adapter for consistent tool metadata access across all entry points.
+
+	This adapter provides a single interface for:
+	- Agent tools registry
+	- MCP list_tools and call_tool
+	- Template allowed tools filtering
+	- Tool result formatting
+	- External tool registration (for MCP-specific and other tools)
 	"""
 
 	registry: 'ActionRegistry'
 
 	model_config = ConfigDict(arbitrary_types_allowed=True)
 
+	# External capabilities registered outside the core registry
+	_external_capabilities: dict[str, ToolCapability] = {}
+
+	# External executors (callable functions for each external tool)
+	_external_executors: dict[str, Callable[..., Any]] = {}
+
+	# Name mappings: alias_name -> canonical_name (used for MCP prefix mapping)
+	_name_mappings: dict[str, str] = {}
+
+	def register_external_capability(
+		self,
+		capability: ToolCapability,
+		executor: Callable[..., Any] | None = None,
+		canonical_alias: str | None = None,
+	) -> None:
+		"""Register an external tool capability and optional executor.
+
+		This allows extending the unified registry with tools not in the core,
+		such as MCP-specific tools or integration-specific tools.
+
+		Args:
+			capability: The ToolCapability describing the tool
+			executor: Optional async callable to execute the tool
+			canonical_alias: Optional alias for the canonical name (e.g., MCP name)
+		"""
+		self._external_capabilities[capability.name] = capability
+		if executor is not None:
+			self._external_executors[capability.name] = executor
+		if canonical_alias is not None:
+			self._name_mappings[canonical_alias] = capability.name
+
+	def register_name_mapping(self, alias_name: str, canonical_name: str) -> None:
+		"""Register a name mapping from alias to canonical name.
+
+		This is used for MCP-style prefixed names like "browser_navigate" -> "navigate".
+		"""
+		self._name_mappings[alias_name] = canonical_name
+
+	def resolve_name(self, name: str) -> str:
+		"""Resolve an alias name to its canonical name.
+
+		Returns the canonical name if a mapping exists, otherwise returns the input.
+		"""
+		return self._name_mappings.get(name, name)
+
+	def _get_all_capabilities(self) -> dict[str, ToolCapability]:
+		"""Get all capabilities including core registry and external."""
+		all_caps: dict[str, ToolCapability] = {}
+
+		# First add core capabilities from registry
+		for name, action in self.registry.actions.items():
+			all_caps[name] = ToolCapability.from_registered_action(action)
+
+		# Then add external (override core if same name)
+		for name, cap in self._external_capabilities.items():
+			all_caps[name] = cap
+
+		return all_caps
+
+	async def execute_tool(
+		self,
+		tool_name: str,
+		arguments: dict[str, Any],
+		browser_session: Any | None = None,
+		page_extraction_llm: Any | None = None,
+		file_system: Any | None = None,
+		sensitive_data: Any | None = None,
+		available_file_paths: Any | None = None,
+		extraction_schema: Any | None = None,
+	) -> Any:
+		"""Execute a tool by name with unified parameter handling.
+
+		This handles both core registry tools and external tools through a single interface.
+
+		Args:
+			tool_name: The tool name (may be an alias that gets resolved)
+			arguments: Dictionary of tool arguments
+			browser_session: Optional browser session context
+			page_extraction_llm: Optional LLM for extraction
+			file_system: Optional file system context
+			sensitive_data: Optional sensitive data wrapper
+			available_file_paths: Optional file path allowlist
+			extraction_schema: Optional extraction schema
+
+		Returns:
+			The tool execution result (ActionResult-compatible format)
+		"""
+		# Resolve alias name to canonical name
+		canonical_name = self.resolve_name(tool_name)
+
+		# First check if it's an external tool
+		if canonical_name in self._external_executors:
+			executor = self._external_executors[canonical_name]
+			cap = self._external_capabilities.get(canonical_name)
+
+			# Validate and parse arguments using param_schema if available
+			params_kwargs = dict(arguments)
+			if cap is not None:
+				try:
+					parsed = cap.param_schema(**arguments)
+					params_kwargs = parsed.model_dump()
+				except Exception:
+					pass
+
+			# Inject special parameters if executor accepts them
+			import inspect
+
+			sig = inspect.signature(executor)
+			executor_kwargs = dict(params_kwargs)
+			param_names = set(sig.parameters.keys())
+
+			if 'browser_session' in param_names and browser_session is not None:
+				executor_kwargs['browser_session'] = browser_session
+			if 'page_extraction_llm' in param_names and page_extraction_llm is not None:
+				executor_kwargs['page_extraction_llm'] = page_extraction_llm
+			if 'file_system' in param_names and file_system is not None:
+				executor_kwargs['file_system'] = file_system
+			if 'self' in param_names:
+				raise ValueError('Executor must be a static or module-level function, not a bound method')
+
+			if inspect.iscoroutinefunction(executor):
+				return await executor(**executor_kwargs)
+			return executor(**executor_kwargs)
+
+		# Otherwise it's a core tool - execute through the standard mechanism
+		if canonical_name in self.registry.actions:
+			from browser_use.tools.registry.service import Registry
+
+			# Create a temp registry instance to use its execute_action method
+			temp_registry = Registry()
+			temp_registry.registry = self.registry
+			result = await temp_registry.execute_action(
+				action_name=canonical_name,
+				params=arguments,
+				browser_session=browser_session,
+				page_extraction_llm=page_extraction_llm,
+				file_system=file_system,
+				sensitive_data=sensitive_data,
+				available_file_paths=available_file_paths,
+				extraction_schema=extraction_schema,
+			)
+			return result
+
+		# Tool not found
+		raise ValueError(f'Tool not found: {tool_name} (resolved: {canonical_name})')
+
 	def get_tool_capability(self, tool_name: str) -> ToolCapability | None:
-		"""Get a ToolCapability for a specific tool."""
-		action = self.registry.actions.get(tool_name)
+		"""Get a ToolCapability for a specific tool.
+
+		Resolves name aliases automatically.
+		"""
+		canonical_name = self.resolve_name(tool_name)
+
+		# Check external first
+		if canonical_name in self._external_capabilities:
+			return self._external_capabilities[canonical_name]
+
+		# Check core registry
+		action = self.registry.actions.get(canonical_name)
 		if action is None:
 			return None
 		return ToolCapability.from_registered_action(action)
@@ -429,11 +613,14 @@ class ToolRegistryAdapter(BaseModel):
 	def list_tool_capabilities(
 		self, page_url: str | None = None, include_categories: list[str] | None = None
 	) -> list[ToolCapability]:
-		"""List all tool capabilities, optionally filtered by URL and category."""
-		tools = []
-		for action in self.registry.actions.values():
-			capability = ToolCapability.from_registered_action(action)
+		"""List all tool capabilities, optionally filtered by URL and category.
 
+		Includes both core registry tools and externally registered tools.
+		"""
+		tools = []
+		all_caps = self._get_all_capabilities()
+
+		for capability in all_caps.values():
 			if page_url is not None and not capability.is_available_for_url(page_url):
 				continue
 
@@ -443,18 +630,123 @@ class ToolRegistryAdapter(BaseModel):
 			tools.append(capability)
 		return tools
 
-	def list_mcp_tools(self, page_url: str | None = None) -> list[dict]:
-		"""List all tools in MCP format."""
-		return [cap.to_mcp_tool() for cap in self.list_tool_capabilities(page_url=page_url)]
+	def list_mcp_tools(
+		self,
+		page_url: str | None = None,
+		name_prefix: str = '',
+		name_mappings: dict[str, str] | None = None,
+	) -> list[dict]:
+		"""List all tools in MCP format.
 
-	def filter_allowed_tools(self, allowed_tool_names: list[str]) -> 'ToolRegistryAdapter':
+		Args:
+			page_url: Filter by page URL availability
+			name_prefix: Optional prefix to add to all tool names (e.g., 'browser_')
+			name_mappings: Optional custom name mappings {canonical: mcp_name}
+		"""
+		result = []
+		caps = self.list_tool_capabilities(page_url=page_url)
+
+		# Build reverse mapping: canonical_name -> mcp_name
+		reverse_map: dict[str, str] = {}
+		if name_mappings:
+			for mcp, canonical in name_mappings.items():
+				reverse_map[canonical] = mcp
+
+		for cap in caps:
+			# Determine MCP tool name
+			mcp_name = reverse_map.get(cap.name)
+			if mcp_name is None:
+				# Check if the capability's name itself is already an alias (external)
+				# Otherwise add prefix
+				if cap.name in reverse_map:
+					mcp_name = reverse_map[cap.name]
+				elif cap.name in self._name_mappings.values():
+					# Find which alias maps to this canonical name
+					for alias, canonical in self._name_mappings.items():
+						if canonical == cap.name and alias.startswith(name_prefix):
+							mcp_name = alias
+							break
+					if mcp_name is None:
+						mcp_name = name_prefix + cap.name
+				else:
+					mcp_name = name_prefix + cap.name
+
+			# Create MCP tool dict with adjusted name
+			mcp_tool = cap.to_mcp_tool()
+			mcp_tool['name'] = mcp_name
+			result.append(mcp_tool)
+
+		return result
+
+	def filter_allowed_tools(
+		self,
+		allowed_tool_names: list[str] | None = None,
+		allowed_categories: list[str] | None = None,
+		resolve_aliases: bool = True,
+	) -> 'ToolRegistryAdapter':
 		"""Create a new adapter with only allowed tools.
 
-		Used for task template tool whitelisting.
+		Used for task template tool whitelisting and skill_cli command filtering.
+
+		Args:
+			allowed_tool_names: List of allowed tool names (may contain aliases).
+				If None, all names are allowed (subject to category filter).
+			allowed_categories: List of allowed categories. If None, all categories
+				are allowed (subject to name filter).
+			resolve_aliases: If True, automatically resolves aliases before filtering
 		"""
-		filtered_actions = {name: action for name, action in self.registry.actions.items() if name in allowed_tool_names}
+		# Resolve all aliases in allowed list
+		allowed_canonical: set[str] | None = None
+		if allowed_tool_names is not None:
+			allowed_canonical = set()
+			for name in allowed_tool_names:
+				if resolve_aliases:
+					canonical = self.resolve_name(name)
+				else:
+					canonical = name
+				allowed_canonical.add(canonical)
+
+		# Filter core actions
+		# Logic: if both names and categories are specified, use OR — an action
+		# passes if its name is in the allow-list OR its category is allowed.
+		# This matches the common use case of "allow these specific tools PLUS
+		# all tools in these categories".
+		filtered_actions: dict[str, RegisteredAction] = {}
+		for name, action in self.registry.actions.items():
+			name_ok = allowed_canonical is None or name in allowed_canonical
+			cat_ok = allowed_categories is None or action.category in allowed_categories
+
+			if allowed_canonical is not None and allowed_categories is not None:
+				passes = name_ok or cat_ok
+			else:
+				passes = name_ok and cat_ok
+
+			if passes:
+				filtered_actions[name] = action
+
+		# Create adapter with filtered core registry
 		filtered_registry = ActionRegistry(actions=filtered_actions)
-		return ToolRegistryAdapter(registry=filtered_registry)
+		new_adapter = ToolRegistryAdapter(registry=filtered_registry)
+
+		# Copy name mappings
+		new_adapter._name_mappings = dict(self._name_mappings)
+
+		# Filter external capabilities — same OR logic as core actions
+		for ext_name, ext_cap in self._external_capabilities.items():
+			name_ok = allowed_canonical is None or ext_name in allowed_canonical
+			cat_ok = allowed_categories is None or ext_cap.category in allowed_categories
+
+			if allowed_canonical is not None and allowed_categories is not None:
+				passes = name_ok or cat_ok
+			else:
+				passes = name_ok and cat_ok
+
+			if passes:
+				new_adapter._external_capabilities[ext_name] = ext_cap
+				if ext_name in self._external_executors:
+					new_adapter._external_executors[ext_name] = self._external_executors[ext_name]
+
+		return new_adapter
 
 	def get_prompt_description(self, page_url: str | None = None) -> str:
 		"""Get a human-readable description of all tools for prompts."""

@@ -34,6 +34,38 @@ COMMANDS = {
 	'record',
 }
 
+# Mapping from skill_cli command names to core browser-use tool names.
+# This is the single source of truth for command-to-tool mapping.
+# The unified ToolRegistryAdapter.filter_allowed_tools() uses this mapping
+# to filter commands based on tool availability.
+COMMAND_TO_TOOL_MAPPING: dict[str, str] = {
+	'open': 'navigate',
+	'click': 'click',
+	'type': 'input',
+	'input': 'input',
+	'scroll': 'scroll',
+	'back': 'go_back',
+	'screenshot': 'screenshot',
+	'state': 'extract',
+	'eval': 'evaluate',
+	'extract': 'extract',
+	'keys': 'send_keys',
+	'select': 'select_dropdown',
+	'upload': 'upload_file',
+	'tab': 'switch',
+	'wait': 'wait',
+	'get': 'extract',
+	'hover': 'click',
+	'dblclick': 'click',
+	'rightclick': 'click',
+	'cookies': 'evaluate',
+	'record': 'evaluate',
+}
+
+# Commands that are purely skill_cli-specific and don't map to core tools.
+# These are always allowed (unless explicitly excluded).
+CLI_SPECIFIC_COMMANDS: set[str] = set()
+
 
 async def _execute_js(session: SessionInfo, js: str) -> Any:
 	"""Execute JavaScript in the browser via CDP."""

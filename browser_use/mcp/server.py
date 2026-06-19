@@ -91,6 +91,7 @@ logging.disable(logging.CRITICAL)
 
 # Import browser_use modules
 from browser_use import ActionModel, Agent
+from browser_use.agent.views import ActionResult
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
@@ -206,13 +207,14 @@ class BrowserUseServer:
 		self.session_timeout_minutes = session_timeout_minutes
 		self._cleanup_task: Any = None
 
-		# Cached tool capabilities for consistent metadata across list_tools calls
-		self._tool_capabilities: list | None = None
+		# Unified tool registry adapter — single source of truth for all tool metadata
+		# and execution. This replaces the old separate _tool_capabilities list.
+		self.tool_registry_adapter: Any | None = None
 
 		# Initialize tools and metadata early so list_tools works before browser session is created
 		# This ensures tool names, descriptions, and schemas are always available
 		self.tools = Tools()
-		self._init_tool_metadata()
+		self._init_tool_registry()
 
 		# Setup handlers
 		self._setup_handlers()
@@ -224,18 +226,21 @@ class BrowserUseServer:
 		async def handle_list_tools() -> list[types.Tool]:
 			"""List all available browser-use tools.
 
-			All tool metadata is sourced from the unified ToolCapability model
-			defined in _init_tool_metadata(). This ensures consistent tool names,
-			descriptions, and parameter schemas across all entry points.
+			All tool metadata is sourced from the unified ToolRegistryAdapter.
+			This ensures consistent tool names, descriptions, and parameter
+			schemas across all entry points (Python API, MCP, skill_cli).
 			"""
-			if self._tool_capabilities is None:
-				self._init_tool_metadata()
+			assert self.tool_registry_adapter is not None, 'Tool registry adapter must be initialized'
 
-			# Convert each ToolCapability to MCP Tool format
+			# Use the unified adapter to generate MCP format tools
+			# list_mcp_tools already handles name mappings and external capabilities
+			mcp_tool_dicts = self.tool_registry_adapter.list_mcp_tools(
+				name_prefix='',  # External tools already have full names (browser_*)
+			)
+
+			# Convert dicts to MCP Tool objects
 			mcp_tools = []
-			assert self._tool_capabilities is not None, 'Tool capabilities must be initialized'
-			for cap in self._tool_capabilities:
-				tool_dict = cap.to_mcp_tool()
+			for tool_dict in mcp_tool_dicts:
 				mcp_tools.append(
 					types.Tool(
 						name=tool_dict['name'],
@@ -288,87 +293,73 @@ class BrowserUseServer:
 	async def _execute_tool(
 		self, tool_name: str, arguments: dict[str, Any]
 	) -> str | list[types.TextContent | types.ImageContent]:
-		"""Execute a browser-use tool. Returns str for most tools, or a content list for tools with image output."""
+		"""Execute a browser-use tool via the unified ToolRegistryAdapter.
 
-		# Agent-based tools
-		if tool_name == 'retry_with_browser_use_agent':
-			return await self._retry_with_browser_use_agent(
-				task=arguments['task'],
-				max_steps=arguments.get('max_steps', 100),
-				model=arguments.get('model'),
-				allowed_domains=arguments.get('allowed_domains'),
-				use_vision=arguments.get('use_vision', True),
+		All tool execution now goes through a single path:
+		1. Resolve name aliases (MCP names -> canonical names)
+		2. Check if browser session is required
+		3. Execute via adapter.execute_tool()
+		4. Result is formatted consistently via _format_result_from_action_result()
+
+		There are NO separate if/elif branches for different tools anymore.
+		"""
+		assert self.tool_registry_adapter is not None, 'Tool registry adapter must be initialized'
+
+		# Step 1: Get tool capability to check requirements
+		cap = self.tool_registry_adapter.get_tool_capability(tool_name)
+
+		# Step 2: Initialize browser session if the tool requires it
+		if cap is not None and cap.requires_browser and not self.browser_session:
+			await self._init_browser_session()
+
+		# Step 3: Execute via unified adapter
+		# This handles both core tools (via name mapping) and external tools (via registered executors)
+		try:
+			result = await self.tool_registry_adapter.execute_tool(
+				tool_name=tool_name,
+				arguments=arguments,
+				browser_session=self.browser_session,
+				page_extraction_llm=self.llm,
+				file_system=self.file_system,
 			)
+		except ValueError as e:
+			# Handle unknown tool
+			if 'Tool not found' in str(e):
+				return f'Unknown tool: {tool_name}'
+			raise
 
-		# Browser session management tools (don't require active session)
-		if tool_name == 'browser_list_sessions':
-			return await self._list_sessions()
+		# Step 4: Handle special result with embedded image data (_state_json + _screenshot_b64 pattern)
+		# This comes from browser_get_state and browser_screenshot executors
+		if isinstance(result, dict) and ('_state_json' in result or '_screenshot_b64' in result):
+			content_list: list[types.TextContent | types.ImageContent] = []
+			if '_state_json' in result and result['_state_json'] is not None:
+				content_list.append(types.TextContent(type='text', text=str(result['_state_json'])))
+			if '_screenshot_b64' in result and result['_screenshot_b64'] is not None:
+				content_list.append(types.ImageContent(type='image', data=str(result['_screenshot_b64']), mimeType='image/png'))
+			return content_list
 
-		elif tool_name == 'browser_close_session':
-			return await self._close_session(arguments['session_id'])
-
-		elif tool_name == 'browser_close_all':
-			return await self._close_all_sessions()
-
-		# Direct browser control tools (require active session)
-		elif tool_name.startswith('browser_'):
-			# Ensure browser session exists
-			if not self.browser_session:
-				await self._init_browser_session()
-
-			if tool_name == 'browser_navigate':
-				return await self._navigate(arguments['url'], arguments.get('new_tab', False))
-
-			elif tool_name == 'browser_click':
-				return await self._click(
-					index=arguments.get('index'),
-					coordinate_x=arguments.get('coordinate_x'),
-					coordinate_y=arguments.get('coordinate_y'),
-					new_tab=arguments.get('new_tab', False),
-				)
-
-			elif tool_name == 'browser_type':
-				return await self._type_text(arguments['index'], arguments['text'])
-
-			elif tool_name == 'browser_get_state':
-				state_json, screenshot_b64 = await self._get_browser_state(arguments.get('include_screenshot', False))
-				content: list[types.TextContent | types.ImageContent] = [types.TextContent(type='text', text=state_json)]
-				if screenshot_b64:
-					content.append(types.ImageContent(type='image', data=screenshot_b64, mimeType='image/png'))
-				return content
-
-			elif tool_name == 'browser_get_html':
-				return await self._get_html(arguments.get('selector'))
-
-			elif tool_name == 'browser_screenshot':
-				meta_json, screenshot_b64 = await self._screenshot(arguments.get('full_page', False))
-				content: list[types.TextContent | types.ImageContent] = [types.TextContent(type='text', text=meta_json)]
-				if screenshot_b64:
-					content.append(types.ImageContent(type='image', data=screenshot_b64, mimeType='image/png'))
-				return content
-
-			elif tool_name == 'browser_extract_content':
-				return await self._extract_content(arguments['query'], arguments.get('extract_links', False))
-
-			elif tool_name == 'browser_scroll':
-				return await self._scroll(arguments.get('direction', 'down'))
-
-			elif tool_name == 'browser_go_back':
-				return await self._go_back()
-
-			elif tool_name == 'browser_close':
-				return await self._close_browser()
-
-			elif tool_name == 'browser_list_tabs':
-				return await self._list_tabs()
-
-			elif tool_name == 'browser_switch_tab':
-				return await self._switch_tab(arguments['tab_id'])
-
-			elif tool_name == 'browser_close_tab':
-				return await self._close_tab(arguments['tab_id'])
-
-		return f'Unknown tool: {tool_name}'
+		# Step 5: Convert all other result types to string for MCP compatibility
+		# MCP CallToolResult requires str or list[TextContent|ImageContent]
+		if isinstance(result, ActionResult):
+			return self._format_result_from_action_result(result)
+		if result is None:
+			return 'Success'
+		if isinstance(result, str):
+			return result
+		# For dict/list/other Pydantic models, serialize to JSON string
+		import json
+		try:
+			if isinstance(result, dict):
+				result_dict: Any = result
+			elif hasattr(result, 'model_dump'):
+				result_dict = result.model_dump()
+			elif hasattr(result, '__dict__'):
+				result_dict = result.__dict__
+			else:
+				result_dict = result
+			return json.dumps(result_dict, default=str, ensure_ascii=False)
+		except Exception:
+			return str(result)
 
 	async def _init_browser_session(self, allowed_domains: list[str] | None = None, **kwargs):
 		"""Initialize browser session using config"""
@@ -413,9 +404,9 @@ class BrowserUseServer:
 		# Track the session for management
 		self._track_session(self.browser_session)
 
-		# Initialize tool metadata from the unified ToolCapability model
+		# Initialize tool metadata from the unified ToolRegistryAdapter
 		# (already initialized in __init__, but refresh in case tools changed)
-		self._init_tool_metadata()
+		self._init_tool_registry()
 
 		# Initialize LLM from config
 		llm_config = get_default_llm(self.config)
@@ -437,17 +428,15 @@ class BrowserUseServer:
 
 		logger.debug('Browser session initialized')
 
-	def _init_tool_metadata(self) -> None:
-		"""Initialize tool metadata using the unified ToolCapability model.
+	def _init_tool_registry(self) -> None:
+		"""Initialize the unified ToolRegistryAdapter.
 
-		This is the single source of truth for all MCP tool metadata.
-		All tool names, descriptions, parameter schemas, permissions, and
-		result formats are defined here and consumed by both list_tools
-		and call_tool handlers.
+		This is the single source of truth for ALL MCP tool metadata and execution.
+		All tools (both core browser-use and MCP-specific) are registered here
+		and consumed by both list_tools and call_tool handlers.
 
-		For tools shared with the browser-use core, we reuse metadata from
-		the Tools registry with an MCP-specific name prefix.
-		For MCP-specific tools, we define their complete metadata here.
+		- Core tools: Reused from Tools registry via name mappings (browser_* -> core)
+		- MCP-specific tools: Registered as external capabilities with their executors
 		"""
 		from browser_use.mcp.views import (
 			CloseAllSessionsParams,
@@ -461,8 +450,11 @@ class BrowserUseServer:
 		)
 		from browser_use.tools.registry.views import ToolCapability
 
-		# Mapping of MCP tool names -> core tool names (with browser_ prefix)
-		# These reuse metadata from the core Tools registry for consistency
+		assert self.tools is not None, 'Tools must be initialized before _init_tool_registry'
+		adapter = self.tools.get_tool_registry_adapter()
+
+		# Step 1: Register name mappings for core tools
+		# MCP names (browser_*) -> canonical core tool names
 		core_tool_mappings: dict[str, str] = {
 			'browser_navigate': 'navigate',
 			'browser_click': 'click',
@@ -475,10 +467,116 @@ class BrowserUseServer:
 			'browser_extract_content': 'extract',
 		}
 
-		# MCP-specific tool definitions (not in core Tools registry)
-		# These are defined inline with their complete metadata
-		mcp_specific_tools: list[ToolCapability] = [
-			ToolCapability(
+		for mcp_name, core_name in core_tool_mappings.items():
+			adapter.register_name_mapping(mcp_name, core_name)
+
+			# For browser_type, register a custom param model override
+			# by creating an external capability with clearer field names for MCP users
+			if mcp_name == 'browser_type':
+				core_cap = adapter.get_tool_capability(core_name)
+				if core_cap is not None:
+					mcp_cap = ToolCapability(
+						name=mcp_name,
+						description='Type text into an input field. Clears existing text by default; pass text="" to clear only.',
+						category=core_cap.category,
+						param_schema=TypeTextParams,
+						domains=core_cap.domains,
+						terminates_sequence=core_cap.terminates_sequence,
+						requires_browser=core_cap.requires_browser,
+						requires_llm=core_cap.requires_llm,
+						result_is_structured=core_cap.result_is_structured,
+					)
+
+					# Register an adapter executor that maps MCP params -> core params
+					async def _type_text_executor(
+						index: int,
+						text: str,
+						browser_session: Any | None = None,
+					) -> Any:
+						core_result = await adapter.execute_tool(
+							tool_name='input',
+							arguments={'index': index, 'text': text},
+							browser_session=browser_session,
+						)
+						return core_result
+
+					adapter.register_external_capability(
+						capability=mcp_cap,
+						executor=_type_text_executor,
+						canonical_alias=mcp_name,
+					)
+
+			# For browser_click, ensure coordinate params are well-documented
+			elif mcp_name == 'browser_click':
+				core_cap = adapter.get_tool_capability(core_name)
+				if core_cap is not None:
+					mcp_cap = ToolCapability(
+						name=mcp_name,
+						description=(
+							'Click an element by index or at specific viewport coordinates. '
+							'Use index for elements from browser_get_state, or coordinate_x/coordinate_y '
+							'for pixel-precise clicking.'
+						),
+						category=core_cap.category,
+						param_schema=core_cap.param_schema,
+						domains=core_cap.domains,
+						terminates_sequence=core_cap.terminates_sequence,
+						requires_browser=core_cap.requires_browser,
+						requires_llm=core_cap.requires_llm,
+						result_is_structured=core_cap.result_is_structured,
+					)
+					adapter.register_external_capability(
+						capability=mcp_cap,
+						executor=None,  # Uses default execute_tool with name mapping
+						canonical_alias=mcp_name,
+					)
+
+			# For browser_navigate and other core tools, add custom descriptions
+			else:
+				custom_descriptions: dict[str, str] = {
+					'browser_navigate': 'Navigate to a URL in the browser',
+					'browser_scroll': 'Scroll the page',
+					'browser_go_back': 'Go back to the previous page',
+					'browser_switch_tab': 'Switch to a different tab',
+					'browser_close_tab': 'Close a tab',
+					'browser_screenshot': (
+						'Take a screenshot of the current page. Returns viewport metadata as text and the screenshot as an image.'
+					),
+					'browser_extract_content': 'Extract structured content from the current page based on a query',
+				}
+				core_cap = adapter.get_tool_capability(core_name)
+				if core_cap is not None and mcp_name in custom_descriptions:
+					mcp_cap = ToolCapability(
+						name=mcp_name,
+						description=custom_descriptions[mcp_name],
+						category=core_cap.category,
+						param_schema=core_cap.param_schema,
+						domains=core_cap.domains,
+						terminates_sequence=core_cap.terminates_sequence,
+						requires_browser=core_cap.requires_browser,
+						requires_llm=core_cap.requires_llm,
+						result_is_structured=core_cap.result_is_structured,
+					)
+					adapter.register_external_capability(
+						capability=mcp_cap,
+						executor=None,
+						canonical_alias=mcp_name,
+					)
+
+		# Step 2: Register MCP-specific external tools WITH their executors
+		# browser_get_state
+		async def _get_state_executor(
+			include_screenshot: bool = False,
+			browser_session: Any | None = None,
+		) -> Any:
+			state_json, screenshot_b64 = await self._get_browser_state(include_screenshot)
+			result: dict[str, Any] = {'_state_json': state_json}
+			if screenshot_b64:
+				result['_screenshot_b64'] = screenshot_b64
+			return result
+
+		adapter.register_external_capability(
+			capability=ToolCapability(
 				name='browser_get_state',
 				description='Get the current state of the page including all interactive elements',
 				category='extraction',
@@ -486,95 +584,123 @@ class BrowserUseServer:
 				requires_browser=True,
 				result_is_structured=True,
 			),
-			ToolCapability(
+			executor=_get_state_executor,
+		)
+
+		# browser_get_html
+		async def _get_html_executor(
+			selector: str | None = None,
+			browser_session: Any | None = None,
+		) -> Any:
+			return await self._get_html(selector)
+
+		adapter.register_external_capability(
+			capability=ToolCapability(
 				name='browser_get_html',
 				description='Get the raw HTML of the current page or a specific element by CSS selector',
 				category='extraction',
 				param_schema=GetHtmlParams,
 				requires_browser=True,
 			),
-			ToolCapability(
+			executor=_get_html_executor,
+		)
+
+		# browser_list_tabs
+		async def _list_tabs_executor(
+			browser_session: Any | None = None,
+		) -> Any:
+			return await self._list_tabs()
+
+		adapter.register_external_capability(
+			capability=ToolCapability(
 				name='browser_list_tabs',
 				description='List all open tabs',
 				category='tab_management',
 				param_schema=ListTabsParams,
 				requires_browser=True,
 			),
-			ToolCapability(
+			executor=_list_tabs_executor,
+		)
+
+		# retry_with_browser_use_agent
+		async def _retry_agent_executor(
+			task: str,
+			max_steps: int = 100,
+			model: str | None = None,
+			allowed_domains: list[str] | None = None,
+			use_vision: bool = True,
+			browser_session: Any | None = None,
+		) -> Any:
+			return await self._retry_with_browser_use_agent(
+				task=task,
+				max_steps=max_steps,
+				model=model,
+				allowed_domains=allowed_domains,
+				use_vision=use_vision,
+			)
+
+		adapter.register_external_capability(
+			capability=ToolCapability(
 				name='retry_with_browser_use_agent',
-				description='Retry a task using the browser-use agent. Only use this as a last resort if you fail to interact with a page multiple times.',
+				description=(
+					'Retry a task using the browser-use agent. Only use this as a last resort '
+					'if you fail to interact with a page multiple times.'
+				),
 				category='system',
 				param_schema=RetryWithAgentParams,
 				requires_browser=True,
 				requires_llm=True,
 			),
-			ToolCapability(
+			executor=_retry_agent_executor,
+		)
+
+		# browser_list_sessions
+		async def _list_sessions_executor() -> Any:
+			return await self._list_sessions()
+
+		adapter.register_external_capability(
+			capability=ToolCapability(
 				name='browser_list_sessions',
 				description='List all active browser sessions with their details and last activity time',
 				category='system',
 				param_schema=ListSessionsParams,
 				requires_browser=False,
 			),
-			ToolCapability(
+			executor=_list_sessions_executor,
+		)
+
+		# browser_close_session
+		async def _close_session_executor(session_id: str) -> Any:
+			return await self._close_session(session_id)
+
+		adapter.register_external_capability(
+			capability=ToolCapability(
 				name='browser_close_session',
 				description='Close a specific browser session by its ID',
 				category='system',
 				param_schema=CloseSessionParams,
 				requires_browser=False,
 			),
-			ToolCapability(
+			executor=_close_session_executor,
+		)
+
+		# browser_close_all
+		async def _close_all_executor() -> Any:
+			return await self._close_all_sessions()
+
+		adapter.register_external_capability(
+			capability=ToolCapability(
 				name='browser_close_all',
 				description='Close all active browser sessions and clean up resources',
 				category='system',
 				param_schema=CloseAllSessionsParams,
 				requires_browser=False,
 			),
-		]
+			executor=_close_all_executor,
+		)
 
-		tool_caps: list[ToolCapability] = []
-
-		# Add core tools with MCP naming
-		if self.tools is not None:
-			adapter = self.tools.get_tool_registry_adapter()
-
-			for mcp_name, core_name in core_tool_mappings.items():
-				core_cap = adapter.get_tool_capability(core_name)
-				if core_cap is not None:
-					# For browser_type, we use a custom param model with clearer field names for MCP users
-					param_schema = TypeTextParams if mcp_name == 'browser_type' else core_cap.param_schema
-
-					# Custom descriptions for MCP context
-					custom_descriptions: dict[str, str] = {
-						'browser_navigate': 'Navigate to a URL in the browser',
-						'browser_click': 'Click an element by index or at specific viewport coordinates. Use index for elements from browser_get_state, or coordinate_x/coordinate_y for pixel-precise clicking.',
-						'browser_type': 'Type text into an input field. Clears existing text by default; pass text="" to clear only.',
-						'browser_scroll': 'Scroll the page',
-						'browser_go_back': 'Go back to the previous page',
-						'browser_switch_tab': 'Switch to a different tab',
-						'browser_close_tab': 'Close a tab',
-						'browser_screenshot': 'Take a screenshot of the current page. Returns viewport metadata as text and the screenshot as an image.',
-						'browser_extract_content': 'Extract structured content from the current page based on a query',
-					}
-
-					description = custom_descriptions.get(mcp_name, core_cap.description) or ''
-
-					mcp_cap = ToolCapability(
-						name=mcp_name,
-						description=description,
-						category=core_cap.category,
-						param_schema=param_schema,
-						domains=core_cap.domains,
-						terminates_sequence=core_cap.terminates_sequence,
-						requires_browser=core_cap.requires_browser,
-						requires_llm=core_cap.requires_llm,
-						result_is_structured=core_cap.result_is_structured,
-					)
-					tool_caps.append(mcp_cap)
-
-		# Add MCP-specific tools
-		tool_caps.extend(mcp_specific_tools)
-
-		self._tool_capabilities = tool_caps
+		# Store the unified adapter
+		self.tool_registry_adapter = adapter
 
 	def _format_result_from_action_result(self, action_result: Any) -> list[types.TextContent | types.ImageContent]:
 		"""Format any tool result using the unified ToolResult format for MCP responses.

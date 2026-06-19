@@ -41,6 +41,8 @@ class Daemon:
 		cloud_proxy_country_code: str | None = None,
 		cloud_timeout: int | None = None,
 		session: str = 'default',
+		allowed_tool_names: list[str] | None = None,
+		allowed_categories: list[str] | None = None,
 	) -> None:
 		from browser_use.skill_cli.utils import validate_session_name
 
@@ -65,6 +67,12 @@ class Daemon:
 		self._idle_watchdog_task: asyncio.Task | None = None
 		self._is_shutting_down: bool = False
 		self._auth_token: str = ''
+
+		# Unified tool whitelist — applied via ToolRegistryAdapter.filter_allowed_tools().
+		# This is the single source of truth for command availability in skill_cli,
+		# ensuring consistent tool restrictions across Agent, MCP, and skill_cli.
+		self._allowed_tool_names: list[str] | None = allowed_tool_names
+		self._allowed_categories: list[str] | None = allowed_categories
 
 	def _write_state(self, phase: str) -> None:
 		"""Atomically write session state file for CLI observability."""
@@ -152,6 +160,13 @@ class Daemon:
 					browser_session=bs,
 					actions=actions,
 					use_cloud=self.use_cloud,
+				)
+
+				# Initialize unified tool registry with whitelist filtering
+				# This ensures consistent command availability across Agent, MCP, skill_cli
+				self._session.init_tool_registry(
+					allowed_tool_names=self._allowed_tool_names,
+					allowed_categories=self._allowed_categories,
 				)
 				self._browser_watchdog_task = asyncio.create_task(self._watch_browser())
 
@@ -311,8 +326,18 @@ class Daemon:
 			# Get or create the single session
 			session = await self._get_or_create_session()
 
-			# Dispatch to handler
+			# Apply unified command filtering via ToolRegistryAdapter.is_command_allowed().
+			# This ensures the same tool whitelist applies across Agent, MCP, and skill_cli.
 			if action in browser.COMMANDS:
+				if not session.is_command_allowed(action):
+					return {
+						'id': req_id,
+						'success': False,
+						'error': (
+							f'Command "{action}" is not allowed in this session. '
+							f'Allowed commands are configured via allowed_tool_names or allowed_categories.'
+						),
+					}
 				result = await browser.handle(action, session, params)
 			elif action == 'python':
 				result = await python_exec.handle(session, params)
