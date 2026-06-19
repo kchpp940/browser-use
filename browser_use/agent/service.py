@@ -19,11 +19,11 @@ from dotenv import load_dotenv
 from browser_use.agent.cloud_events import (
 	CreateAgentOutputFileEvent,
 	CreateAgentSessionEvent,
+	CreateAgentStepEvent,
 	CreateAgentTaskEvent,
 	UpdateAgentTaskEvent,
 )
 from browser_use.agent.message_manager.utils import save_conversation
-from browser_use.agent.step_lifecycle import StepLifecycleRecorder
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage, ContentPartImageParam, ContentPartTextParam, UserMessage
@@ -59,8 +59,6 @@ from browser_use.agent.views import (
 	JudgementResult,
 	MessageCompactionSettings,
 	PlanItem,
-	StepExecutionContext,
-	StepExecutionResult,
 	StepMetadata,
 )
 from browser_use.browser.events import _get_timeout
@@ -740,18 +738,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.error(f'📸 Failed to initialize screenshot service: {e}.')
 			raise e
 
-		self._step_recorder = StepLifecycleRecorder(
-			state=self.state,
-			history=self.history,
-			eventbus=self.eventbus,
-			logger=self.logger,
-			screenshot_service=self.screenshot_service,
-			message_manager=self._message_manager,
-			fs_saver=self,
-			demo_logger=self,
-			agent_ref=self,
-		)
-
 	def save_file_system_state(self) -> None:
 		"""Save current file system state to agent state"""
 		if self.file_system:
@@ -1038,140 +1024,132 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 	@observe(name='agent.step', ignore_output=True, ignore_input=True)
 	@time_execution_async('--step')
-	async def step(self, step_info: AgentStepInfo | None = None) -> StepExecutionResult:
-		"""Execute one step of the task.
+	async def step(self, step_info: AgentStepInfo | None = None) -> None:
+		"""Execute one step of the task"""
+		# Initialize timing first, before any exceptions can occur
 
-		Lifecycle:
-		  1. Build :class:`StepExecutionContext` (inputs) by snapshotting the
-		     previous step's result and calling ``_prepare_context``.
-		  2. Run the phases ``_get_next_action`` → ``_execute_actions`` →
-		     ``_post_process``, each writing into :class:`StepExecutionResult`.
-		  3. On any error, ``_handle_step_error`` populates the result with
-		     the error payload.
-		  4. ``_finalize`` calls :meth:`_commit_step_result` once so that all
-		     side-effects — ``state`` updates, history write, events,
-		     ``n_steps`` bump, failure counting — converge in a single place.
+		self.step_start_time = time.time()
 
-		Returns the populated ``StepExecutionResult`` so callers can inspect
-		``.is_done`` / ``.has_action_error`` / ``.error`` directly instead of
-		peeking at ``Agent.state``.
-		"""
-
-		step_start_time = time.time()
-		step_result = StepExecutionResult()
-
-		ctx = StepExecutionContext(
-			step_number=self.state.n_steps,
-			step_start_time=step_start_time,
-			step_info=step_info,
-			last_model_output=self.state.last_model_output,
-			last_action_results=self.state.last_result,
-		)
+		browser_state_summary = None
 
 		try:
 			if self.browser_session:
 				try:
 					captcha_wait = await self.browser_session.wait_if_captcha_solving()
 					if captcha_wait and captcha_wait.waited:
-						ctx.step_start_time = time.time()
+						# Reset step timing to exclude the captcha wait from step duration metrics
+						self.step_start_time = time.time()
 						duration_s = captcha_wait.duration_ms / 1000
-						outcome = captcha_wait.result
+						outcome = captcha_wait.result  # 'success' | 'failed' | 'timeout'
 						msg = f'Waited {duration_s:.1f}s for {captcha_wait.vendor} CAPTCHA to be solved. Result: {outcome}.'
 						self.logger.info(f'🔒 {msg}')
+						# Inject the outcome so the LLM sees what happened
 						captcha_result = ActionResult(long_term_memory=msg)
-						if ctx.last_action_results:
-							ctx.last_action_results = [*ctx.last_action_results, captcha_result]
+						if self.state.last_result:
+							self.state.last_result.append(captcha_result)
 						else:
-							ctx.last_action_results = [captcha_result]
+							self.state.last_result = [captcha_result]
 				except Exception as e:
 					self.logger.warning(f'Phase 0 captcha wait failed (non-fatal): {e}')
 
-			ctx = await self._prepare_context(ctx)
+			# Phase 1: Prepare context and timing
+			browser_state_summary = await self._prepare_context(step_info)
 
-			await self._get_next_action(ctx, step_result)
-			await self._execute_actions(step_result)
-			await self._post_process(ctx, step_result)
+			# Clear previous step state after context preparation (which needs
+			# them for the "previous action result" prompt) but before the LLM
+			# call, so a timeout during _get_next_action or _execute_actions
+			# won't leave stale data from the previous step.
+			self.state.last_model_output = None
+			self.state.last_result = None
+
+			# Phase 2: Get model output and execute actions
+			await self._get_next_action(browser_state_summary)
+			await self._execute_actions()
+
+			# Phase 3: Post-processing
+			await self._post_process()
 
 		except Exception as e:
-			await self._handle_step_error(e, step_result)
+			# Handle ALL exceptions in one place
+			await self._handle_step_error(e)
 
 		finally:
-			await self._finalize(ctx, step_result)
+			await self._finalize(browser_state_summary)
 
-		return step_result
-
-	async def _prepare_context(self, ctx: StepExecutionContext) -> StepExecutionContext:
-		"""Prepare the step's input context: browser state, action models,
-		page actions, message-manager state.
-
-		This method is the sole writer of ``ctx.browser_state_summary`` and
-		``ctx.page_filtered_actions``. It reads previous-step outputs from
-		``ctx.last_model_output`` / ``ctx.last_action_results`` instead of
-		from ``Agent.state`` so the step's read boundary is explicit.
-		"""
+	async def _prepare_context(self, step_info: AgentStepInfo | None = None) -> BrowserStateSummary:
+		"""Prepare the context for the step: browser state, action models, page actions"""
+		# step_start_time is now set in step() method
 
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 
 		self.logger.debug(f'🌐 Step {self.state.n_steps}: Getting browser state...')
+		# Always take screenshots for all steps
 		self.logger.debug('📸 Requesting browser state with include_screenshot=True')
-		ctx.browser_state_summary = await self.browser_session.get_browser_state_summary(
-			include_screenshot=True,
+		browser_state_summary = await self.browser_session.get_browser_state_summary(
+			include_screenshot=True,  # always capture even if use_vision=False so that cloud sync is useful (it's fast now anyway)
 			include_recent_events=self.include_recent_events,
 		)
-		bss = ctx.browser_state_summary
-		if bss.screenshot:
-			self.logger.debug(f'📸 Got browser state WITH screenshot, length: {len(bss.screenshot)}')
+		if browser_state_summary.screenshot:
+			self.logger.debug(f'📸 Got browser state WITH screenshot, length: {len(browser_state_summary.screenshot)}')
 		else:
 			self.logger.debug('📸 Got browser state WITHOUT screenshot')
 
+		# Check for new downloads after getting browser state (catches PDF auto-downloads and previous step downloads)
 		await self._check_and_update_downloads(f'Step {self.state.n_steps}: after getting browser state')
-		self._log_step_context(bss)
+
+		self._log_step_context(browser_state_summary)
 		await self._check_stop_or_pause()
 
+		# Update action models with page-specific actions
 		self.logger.debug(f'📝 Step {self.state.n_steps}: Updating action models...')
-		await self._update_action_models_for_page(bss.url)
-		ctx.page_filtered_actions = self.tools.registry.get_prompt_description(bss.url)
+		await self._update_action_models_for_page(browser_state_summary.url)
 
+		# Get page-specific filtered actions
+		page_filtered_actions = self.tools.registry.get_prompt_description(browser_state_summary.url)
+
+		# Page-specific actions will be included directly in the browser_state message
 		self.logger.debug(f'💬 Step {self.state.n_steps}: Creating state messages for context...')
 
+		# Get unavailable skills info if skills service is enabled
 		unavailable_skills_info = None
 		if self.skill_service is not None:
 			unavailable_skills_info = await self._get_unavailable_skills_info()
 
+		# Render plan description for injection into agent context
 		plan_description = self._render_plan_description()
 
 		self._message_manager.prepare_step_state(
-			browser_state_summary=bss,
-			model_output=ctx.last_model_output,
-			result=ctx.last_action_results,
-			step_info=ctx.step_info,
+			browser_state_summary=browser_state_summary,
+			model_output=self.state.last_model_output,
+			result=self.state.last_result,
+			step_info=step_info,
 			sensitive_data=self.sensitive_data,
 		)
 
-		await self._maybe_compact_messages(ctx.step_info)
+		await self._maybe_compact_messages(step_info)
 
 		self._message_manager.create_state_messages(
-			browser_state_summary=bss,
-			model_output=ctx.last_model_output,
-			result=ctx.last_action_results,
-			step_info=ctx.step_info,
+			browser_state_summary=browser_state_summary,
+			model_output=self.state.last_model_output,
+			result=self.state.last_result,
+			step_info=step_info,
 			use_vision=self.settings.use_vision,
-			page_filtered_actions=ctx.page_filtered_actions if ctx.page_filtered_actions else None,
+			page_filtered_actions=page_filtered_actions if page_filtered_actions else None,
 			sensitive_data=self.sensitive_data,
-			available_file_paths=self.available_file_paths,
+			available_file_paths=self.available_file_paths,  # Always pass current available_file_paths
 			unavailable_skills_info=unavailable_skills_info,
 			plan_description=plan_description,
 			skip_state_update=True,
 		)
 
-		await self._inject_budget_warning(ctx.step_info)
+		await self._inject_budget_warning(step_info)
 		self._inject_replan_nudge()
 		self._inject_exploration_nudge()
-		self._update_loop_detector_page_state(bss)
+		self._update_loop_detector_page_state(browser_state_summary)
 		self._inject_loop_detection_nudge()
-		await self._force_done_after_last_step(ctx.step_info)
+		await self._force_done_after_last_step(step_info)
 		await self._force_done_after_failure()
-		return ctx
+		return browser_state_summary
 
 	async def _maybe_compact_messages(self, step_info: AgentStepInfo | None = None) -> None:
 		"""Optionally compact message history to keep prompts small."""
@@ -1187,15 +1165,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		)
 
 	@observe_debug(ignore_input=True, name='get_next_action')
-	async def _get_next_action(self, ctx: StepExecutionContext, step_result: StepExecutionResult) -> None:
-		"""Execute LLM interaction with retry logic and handle callbacks.
-
-		Writes ``step_result.model_output``. Does NOT touch ``Agent.state``
-		directly — state sync happens in :meth:`_commit_step_result`.
-		"""
-		bss = ctx.browser_state_summary
-		assert bss is not None
-
+	async def _get_next_action(self, browser_state_summary: BrowserStateSummary) -> None:
+		"""Execute LLM interaction with retry logic and handle callbacks"""
 		input_messages = self._message_manager.get_messages()
 		self.logger.debug(
 			f'🤖 Step {self.state.n_steps}: Calling LLM with {len(input_messages)} messages (model: {self.llm.model})...'
@@ -1218,61 +1189,77 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				f'LLM call timed out after {self.settings.llm_timeout} seconds. Keep your thinking and output short.'
 			)
 
-		step_result.model_output = model_output
+		self.state.last_model_output = model_output
 
+		# Check again for paused/stopped state after getting model output
 		await self._check_stop_or_pause()
-		await self._handle_post_llm_processing(bss, input_messages)
+
+		# Handle callbacks and conversation saving
+		await self._handle_post_llm_processing(browser_state_summary, input_messages)
+
+		# check again if Ctrl+C was pressed before we commit the output to history
 		await self._check_stop_or_pause()
 
-	async def _execute_actions(self, step_result: StepExecutionResult) -> None:
-		"""Execute the actions from model output.
-
-		Writes ``step_result.action_results``. Does NOT touch
-		``Agent.state`` directly.
-		"""
-		if step_result.model_output is None:
+	async def _execute_actions(self) -> None:
+		"""Execute the actions from model output"""
+		if self.state.last_model_output is None:
 			raise ValueError('No model output to execute actions from')
 
-		result = await self.multi_act(step_result.model_output.action)
-		step_result.action_results = result
+		result = await self.multi_act(self.state.last_model_output.action)
+		self.state.last_result = result
 
-	async def _post_process(self, ctx: StepExecutionContext, step_result: StepExecutionResult) -> None:
-		"""Handle *pure side-effects* after action execution.
-
-		Pure side-effects = things that do not affect the persisted step
-		inputs / outputs: download tracking, plan state updates, action
-		loop-detection recording, and informational logging.
-
-		Specifically **does NOT**:
-		- Touch ``self.state.last_result`` / ``self.state.last_model_output``
-		- Update ``consecutive_failures``
-		- Emit the final-result log (that happens in :meth:`_commit_step_result`
-		  after we have confirmed the done signal will be persisted)
-		"""
+	async def _post_process(self) -> None:
+		"""Handle post-action processing like download tracking and result logging"""
 		assert self.browser_session is not None, 'BrowserSession is not set up'
 
+		# Check for new downloads after executing actions
 		await self._check_and_update_downloads('after executing actions')
 
-		if step_result.model_output is not None:
-			self._update_plan_from_model_output(step_result.model_output)
+		# Update plan state from model output
+		if self.state.last_model_output is not None:
+			self._update_plan_from_model_output(self.state.last_model_output)
 
-		self._update_loop_detector_actions(step_result)
+		# Record executed actions for loop detection
+		self._update_loop_detector_actions()
 
-	async def _handle_step_error(self, error: Exception, step_result: StepExecutionResult) -> None:
-		"""Translate a thrown exception into a :class:`StepExecutionResult`.
-
-		Fills ``step_result.error`` and ``step_result.action_results`` so
-		the rest of the pipeline can treat errors uniformly. Does **not**
-		write ``Agent.state`` — that is :meth:`_commit_step_result`'s job.
-		"""
-
-		if isinstance(error, InterruptedError):
-			error_msg = 'The agent was interrupted mid-step' + (f' - {str(error)}' if str(error) else '')
-			self.logger.warning(f'{error_msg}')
-			step_result.error = error_msg
+		# check for action errors - only count single-action steps toward consecutive failures;
+		# multi-action steps with errors are handled by loop detection and replan nudges instead
+		if self.state.last_result and len(self.state.last_result) == 1 and self.state.last_result[-1].error:
+			self.state.consecutive_failures += 1
+			self.logger.debug(f'🔄 Step {self.state.n_steps}: Consecutive failures: {self.state.consecutive_failures}')
 			return
 
+		if self.state.consecutive_failures > 0:
+			self.state.consecutive_failures = 0
+			self.logger.debug(f'🔄 Step {self.state.n_steps}: Consecutive failures reset to: {self.state.consecutive_failures}')
+
+		# Log completion results
+		if self.state.last_result and len(self.state.last_result) > 0 and self.state.last_result[-1].is_done:
+			success = self.state.last_result[-1].success
+			if success:
+				# Green color for success
+				self.logger.info(f'\n📄 \033[32m Final Result:\033[0m \n{self.state.last_result[-1].extracted_content}\n\n')
+			else:
+				# Red color for failure
+				self.logger.info(f'\n📄 \033[31m Final Result:\033[0m \n{self.state.last_result[-1].extracted_content}\n\n')
+			if self.state.last_result[-1].attachments:
+				total_attachments = len(self.state.last_result[-1].attachments)
+				for i, file_path in enumerate(self.state.last_result[-1].attachments):
+					self.logger.info(f'👉 Attachment {i + 1 if total_attachments > 1 else ""}: {file_path}')
+
+	async def _handle_step_error(self, error: Exception) -> None:
+		"""Handle all types of errors that can occur during a step"""
+
+		# Handle InterruptedError specially
+		if isinstance(error, InterruptedError):
+			error_msg = 'The agent was interrupted mid-step' + (f' - {str(error)}' if str(error) else '')
+			# NOTE: This is not an error, it's a normal part of the execution when the user interrupts the agent
+			self.logger.warning(f'{error_msg}')
+			return
+
+		# Handle browser closed/disconnected errors
 		if self._is_connection_like_error(error):
+			# If reconnection is in progress, wait for it instead of stopping
 			if self.browser_session.is_reconnecting:
 				wait_timeout = self.browser_session.RECONNECT_WAIT_TIMEOUT
 				self.logger.warning(
@@ -1283,41 +1270,40 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				except TimeoutError:
 					pass
 
+				# Check if reconnection succeeded
 				if self.browser_session.is_cdp_connected:
 					self.logger.info('🔄 Reconnection succeeded, retrying step...')
-					recovery_msg = f'Connection lost and recovered: {error}'
-					step_result.action_results = [ActionResult(error=recovery_msg)]
-					step_result.error = recovery_msg
+					self.state.last_result = [ActionResult(error=f'Connection lost and recovered: {error}')]
 					return
 
+			# Not reconnecting or reconnection failed — check if truly terminal
 			if self._is_browser_closed_error(error):
 				self.logger.warning(f'🛑 Browser closed or disconnected: {error}')
 				self.state.stopped = True
 				self._external_pause_event.set()
-				step_result.error = str(error)
 				return
 
+		# Handle all other exceptions
 		include_trace = self.logger.isEnabledFor(logging.DEBUG)
 		error_msg = AgentError.format_error(error, include_trace=include_trace)
 		max_total_failures = self.settings.max_failures + int(self.settings.final_response_after_failure)
 		prefix = f'❌ Result failed {self.state.consecutive_failures + 1}/{max_total_failures} times: '
+		self.state.consecutive_failures += 1
 
-		is_final_failure = (self.state.consecutive_failures + 1) >= max_total_failures
+		# Use WARNING for partial failures, ERROR only when max failures reached
+		is_final_failure = self.state.consecutive_failures >= max_total_failures
 		log_level = logging.ERROR if is_final_failure else logging.WARNING
 
 		if 'Could not parse response' in error_msg or 'tool_use_failed' in error_msg:
+			# give model a hint how output should look like
 			self.logger.log(log_level, f'Model: {self.llm.model} failed')
 			self.logger.log(log_level, f'{prefix}{error_msg}')
 		else:
 			self.logger.log(log_level, f'{prefix}{error_msg}')
 
 		await self._demo_mode_log(f'Step error: {error_msg}', 'error', {'step': self.state.n_steps})
-		step_result.action_results = [ActionResult(error=error_msg)]
-		step_result.error = error_msg
-
-	async def _finalize(self, ctx: StepExecutionContext, step_result: StepExecutionResult) -> None:
-		"""End of step lifecycle: delegate to the StepLifecycleRecorder."""
-		await self._step_recorder.commit(ctx, step_result)
+		self.state.last_result = [ActionResult(error=error_msg)]
+		return None
 
 	def _is_connection_like_error(self, error: Exception) -> bool:
 		"""Check if the error looks like a CDP/WebSocket connection failure.
@@ -1344,6 +1330,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		parse errors) that happen to coincide with a transient None state during
 		reconnects or resets.
 		"""
+		# During reconnection, don't treat connection errors as terminal
 		if self.browser_session.is_reconnecting:
 			return False
 
@@ -1357,6 +1344,67 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			or 'no browser' in error_str
 		)
 		return is_connection_error and self.browser_session._cdp_client_root is None
+
+	async def _finalize(self, browser_state_summary: BrowserStateSummary | None) -> None:
+		"""Finalize the step with history, logging, and events"""
+		step_end_time = time.time()
+		if not self.state.last_result:
+			return
+
+		if browser_state_summary:
+			step_interval = None
+			if len(self.history.history) > 0:
+				last_history_item = self.history.history[-1]
+
+				if last_history_item.metadata:
+					previous_end_time = last_history_item.metadata.step_end_time
+					previous_start_time = last_history_item.metadata.step_start_time
+					step_interval = max(0, previous_end_time - previous_start_time)
+			metadata = StepMetadata(
+				step_number=self.state.n_steps,
+				step_start_time=self.step_start_time,
+				step_end_time=step_end_time,
+				step_interval=step_interval,
+			)
+
+			# Use _make_history_item like main branch
+			await self._make_history_item(
+				self.state.last_model_output,
+				browser_state_summary,
+				self.state.last_result,
+				metadata,
+				state_message=self._message_manager.last_state_message_text,
+			)
+
+		# Log step completion summary
+		summary_message = self._log_step_completion_summary(self.step_start_time, self.state.last_result)
+		if summary_message:
+			await self._demo_mode_log(summary_message, 'info', {'step': self.state.n_steps})
+
+		# Save file system state after step completion
+		self.save_file_system_state()
+
+		# Emit both step created and executed events
+		if browser_state_summary and self.state.last_model_output:
+			# Extract key step data for the event
+			actions_data = []
+			if self.state.last_model_output.action:
+				for action in self.state.last_model_output.action:
+					action_dict = action.model_dump() if hasattr(action, 'model_dump') else {}
+					actions_data.append(action_dict)
+
+			# Emit CreateAgentStepEvent
+			step_event = CreateAgentStepEvent.from_agent_step(
+				self,
+				self.state.last_model_output,
+				self.state.last_result,
+				actions_data,
+				browser_state_summary,
+			)
+			self.eventbus.dispatch(step_event)
+
+		# Increment step counter after step is fully completed
+		self.state.n_steps += 1
 
 	def _update_plan_from_model_output(self, model_output: AgentOutput) -> None:
 		"""Update the plan state from model output fields (current_plan_item, plan_update)."""
@@ -1449,14 +1497,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			)
 			self._message_manager._add_context_message(UserMessage(content=nudge))
 
-	def _update_loop_detector_actions(self, step_result: StepExecutionResult) -> None:
+	def _update_loop_detector_actions(self) -> None:
 		"""Record the actions from the latest step into the loop detector."""
 		if not self.settings.loop_detection_enabled:
 			return
-		if step_result.model_output is None:
+		if self.state.last_model_output is None:
 			return
+		# Actions to exclude: wait always hashes identically (instant false positive),
+		# done is terminal, go_back is navigation recovery
 		_LOOP_EXEMPT_ACTIONS = {'wait', 'done', 'go_back'}
-		for action in step_result.model_output.action:
+		for action in self.state.last_model_output.action:
 			action_data = action.model_dump(exclude_unset=True)
 			action_name = next(iter(action_data.keys()), 'unknown')
 			if action_name in _LOOP_EXEMPT_ACTIONS:
@@ -1676,6 +1726,50 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				target,
 				self.settings.save_conversation_path_encoding,
 			)
+
+	async def _make_history_item(
+		self,
+		model_output: AgentOutput | None,
+		browser_state_summary: BrowserStateSummary,
+		result: list[ActionResult],
+		metadata: StepMetadata | None = None,
+		state_message: str | None = None,
+	) -> None:
+		"""Create and store history item"""
+
+		if model_output:
+			interacted_elements = AgentHistory.get_interacted_element(model_output, browser_state_summary.dom_state.selector_map)
+		else:
+			interacted_elements = [None]
+
+		# Store screenshot and get path
+		screenshot_path = None
+		if browser_state_summary.screenshot:
+			self.logger.debug(
+				f'📸 Storing screenshot for step {self.state.n_steps}, screenshot length: {len(browser_state_summary.screenshot)}'
+			)
+			screenshot_path = await self.screenshot_service.store_screenshot(browser_state_summary.screenshot, self.state.n_steps)
+			self.logger.debug(f'📸 Screenshot stored at: {screenshot_path}')
+		else:
+			self.logger.debug(f'📸 No screenshot in browser_state_summary for step {self.state.n_steps}')
+
+		state_history = BrowserStateHistory(
+			url=browser_state_summary.url,
+			title=browser_state_summary.title,
+			tabs=browser_state_summary.tabs,
+			interacted_element=interacted_elements,
+			screenshot_path=screenshot_path,
+		)
+
+		history_item = AgentHistory(
+			model_output=model_output,
+			result=result,
+			state=state_history,
+			metadata=metadata,
+			state_message=state_message,
+		)
+
+		self.history.add_item(history_item)
 
 	def _remove_think_tags(self, text: str) -> str:
 		THINK_TAGS = re.compile(r'<think>.*?</think>', re.DOTALL)
@@ -2033,6 +2127,31 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if state.next_goal:
 			await self._demo_mode_log(f'Next goal: {state.next_goal}', 'info', step_meta)
 
+	def _log_step_completion_summary(self, step_start_time: float, result: list[ActionResult]) -> str | None:
+		"""Log step completion summary with action count, timing, and success/failure stats"""
+		if not result:
+			return None
+
+		step_duration = time.time() - step_start_time
+		action_count = len(result)
+
+		# Count success and failures
+		success_count = sum(1 for r in result if not r.error)
+		failure_count = action_count - success_count
+
+		# Format success/failure indicators
+		success_indicator = f'✅ {success_count}' if success_count > 0 else ''
+		failure_indicator = f'❌ {failure_count}' if failure_count > 0 else ''
+		status_parts = [part for part in [success_indicator, failure_indicator] if part]
+		status_str = ' | '.join(status_parts) if status_parts else '✅ 0'
+
+		message = (
+			f'📍 Step {self.state.n_steps}: Ran {action_count} action{"" if action_count == 1 else "s"} '
+			f'in {step_duration:.2f}s: {status_str}'
+		)
+		self.logger.debug(message)
+		return message
+
 	def _log_final_outcome_messages(self) -> None:
 		"""Log helpful messages to user based on agent run outcome"""
 		# Check if agent failed
@@ -2130,7 +2249,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		        Tuple[bool, bool]: (is_done, is_valid)
 		"""
 		if step_info is not None and step_info.step_number == 0:
+			# First step
 			self._log_first_step_startup()
+			# Normally there was no try catch here but the callback can raise an InterruptedError which we skip
 			try:
 				await self._execute_initial_actions()
 			except InterruptedError:
@@ -2138,11 +2259,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			except Exception as e:
 				raise e
 
-		step_result = await self.step(step_info)
+		await self.step(step_info)
 
-		if step_result.is_done:
+		if self.history.is_done():
 			await self.log_completion()
 
+			# Run full judge before done callback if enabled
 			if self.settings.use_judge:
 				await self._judge_and_log()
 
@@ -2327,43 +2449,31 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		self.logger.debug(f'🚶 Starting step {step + 1}/{max_steps}...')
 
-		step_result: StepExecutionResult | None = None
 		try:
-			step_result = await asyncio.wait_for(
+			await asyncio.wait_for(
 				self.step(step_info),
 				timeout=self.settings.step_timeout,
 			)
 			self.logger.debug(f'✅ Completed step {step + 1}/{max_steps}')
 		except TimeoutError:
+			# Handle step timeout gracefully
 			error_msg = f'Step {step + 1} timed out after {self.settings.step_timeout} seconds'
 			self.logger.error(f'⏰ {error_msg}')
 			await self._demo_mode_log(error_msg, 'error', {'step': step + 1})
-
-			# Build a synthetic StepExecutionContext + StepExecutionResult so
-			# timeout is persisted through the same commit path as all other
-			# step outcomes. ``step()``'s own ctx is lost to the timeout, so
-			# we reconstruct a minimal one here.
-			timeout_ctx = StepExecutionContext(
-				step_number=self.state.n_steps,
-				step_start_time=time.time(),
-				step_info=step_info,
-				last_model_output=self.state.last_model_output,
-				last_action_results=self.state.last_result,
-			)
-			timeout_result = StepExecutionResult(
-				action_results=[ActionResult(error=error_msg)],
-				error=error_msg,
-			)
-			await self._step_recorder.commit(timeout_ctx, timeout_result)
-			step_result = timeout_result
+			self.state.consecutive_failures += 1
+			self.state.last_result = [ActionResult(error=error_msg)]
+			# Ensure step counter advances on timeout — _finalize() may have
+			# been skipped or returned early due to the cancellation.
+			if self.state.n_steps == step + 1:
+				self.state.n_steps += 1
 
 		if on_step_end is not None:
 			await on_step_end(self)
 
-		is_step_done = step_result.is_done if step_result is not None else self.history.is_done()
-		if is_step_done:
+		if self.history.is_done():
 			await self.log_completion()
 
+			# Run full judge before done callback if enabled
 			if self.settings.use_judge:
 				await self._judge_and_log()
 

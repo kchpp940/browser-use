@@ -25,7 +25,7 @@ from browser_use.browser.cloud.cloud import CloudBrowserAuthError, CloudBrowserC
 
 # CDP logging is now handled by setup_logging() in logging_config.py
 # It automatically sets CDP logs to the same level as browser_use logs
-from browser_use.browser.cloud.views import CloudBrowserParams, CreateBrowserRequest, ProxyCountryCode
+from browser_use.browser.cloud.views import CloudBrowserParams, ProxyCountryCode
 
 # Sentinel to distinguish "not passed" from "explicitly None" for proxy params.
 # When a user passes proxy_country_code=None, they mean "disable the proxy".
@@ -33,10 +33,7 @@ from browser_use.browser.cloud.views import CloudBrowserParams, CreateBrowserReq
 _UNSET: Any = object()
 from browser_use.browser.events import (
 	AgentFocusChangedEvent,
-	BrowserConnectedEvent,
 	BrowserErrorEvent,
-	BrowserLaunchEvent,
-	BrowserLaunchResult,
 	BrowserReconnectedEvent,
 	BrowserReconnectingEvent,
 	BrowserStartEvent,
@@ -310,9 +307,8 @@ class BrowserSession(BaseModel):
 		max_iframes: int | None = None,
 		max_iframe_depth: int | None = None,
 	):
-		# Following the same pattern as AgentSettings in service.py
-		# Only pass non-None values to avoid validation errors
-		# Also filter _UNSET sentinel values (used for proxy params)
+		from browser_use.browser.startup import BrowserSessionStartupPlan
+
 		profile_kwargs = {
 			k: v
 			for k, v in locals().items()
@@ -332,58 +328,21 @@ class BrowserSession(BaseModel):
 			and v is not _UNSET
 		}
 
-		# Handle backward compatibility: prefer cloud_* params over old names.
-		# _UNSET means "not passed" while None means "explicitly disable proxy".
-		final_profile_id = cloud_profile_id if cloud_profile_id is not None else profile_id
-		final_proxy_country_code = (
-			cloud_proxy_country_code
-			if cloud_proxy_country_code is not _UNSET
-			else proxy_country_code
-			if proxy_country_code is not _UNSET
-			else _UNSET
+		resolved_browser_profile = BrowserSessionStartupPlan.resolve_browser_profile(
+			browser_profile=browser_profile,
+			is_local=is_local,
+			cdp_url=cdp_url,
+			cloud_profile_id=cloud_profile_id,
+			cloud_proxy_country_code=cloud_proxy_country_code,
+			cloud_timeout=cloud_timeout,
+			profile_id=profile_id,
+			proxy_country_code=proxy_country_code,
+			timeout=timeout,
+			cloud_browser_params=cloud_browser_params,
+			profile_kwargs=profile_kwargs,
+			_unset_sentinel=_UNSET,
 		)
-		final_timeout = cloud_timeout if cloud_timeout is not None else timeout
 
-		# If any cloud params are provided, create cloud_browser_params.
-		# Use "is not _UNSET" for proxy so that explicit None (disable proxy) is respected.
-		if final_profile_id is not None or final_proxy_country_code is not _UNSET or final_timeout is not None:
-			cloud_kwargs: dict[str, Any] = {}
-			if final_profile_id is not None:
-				cloud_kwargs['cloud_profile_id'] = final_profile_id
-			if final_proxy_country_code is not _UNSET:
-				cloud_kwargs['cloud_proxy_country_code'] = final_proxy_country_code
-			if final_timeout is not None:
-				cloud_kwargs['cloud_timeout'] = final_timeout
-			cloud_params = CreateBrowserRequest(**cloud_kwargs)
-			profile_kwargs['cloud_browser_params'] = cloud_params
-			profile_kwargs['use_cloud'] = True
-
-		# Handle backward compatibility: map cloud_browser to use_cloud
-		if 'cloud_browser' in profile_kwargs:
-			profile_kwargs['use_cloud'] = profile_kwargs.pop('cloud_browser')
-
-		# If cloud_browser_params is set, force use_cloud=True
-		if cloud_browser_params is not None:
-			profile_kwargs['use_cloud'] = True
-
-		# if is_local is False but executable_path is provided, set is_local to True
-		if is_local is False and executable_path is not None:
-			profile_kwargs['is_local'] = True
-		# Only set is_local=True when cdp_url is missing if we're not using cloud browser
-		# (cloud browser will provide cdp_url later)
-		use_cloud = profile_kwargs.get('use_cloud') or profile_kwargs.get('cloud_browser')
-		if not cdp_url and not use_cloud:
-			profile_kwargs['is_local'] = True
-
-		# Create browser profile from direct parameters or use provided one
-		if browser_profile is not None:
-			# Merge any direct kwargs into the provided browser_profile (direct kwargs take precedence)
-			merged_kwargs = {**browser_profile.model_dump(exclude_unset=True), **profile_kwargs}
-			resolved_browser_profile = BrowserProfile(**merged_kwargs)
-		else:
-			resolved_browser_profile = BrowserProfile(**profile_kwargs)
-
-		# Initialize the Pydantic model
 		super().__init__(
 			id=id or str(uuid7str()),
 			browser_profile=resolved_browser_profile,
@@ -637,22 +596,9 @@ class BrowserSession(BaseModel):
 		if self.is_local:
 			self.browser_profile.cdp_url = None
 
-		self._crash_watchdog = None
-		self._downloads_watchdog = None
-		self._aboutblank_watchdog = None
-		self._security_watchdog = None
-		self._storage_state_watchdog = None
-		self._local_browser_watchdog = None
-		self._default_action_watchdog = None
-		self._dom_watchdog = None
-		self._screenshot_watchdog = None
-		self._permissions_watchdog = None
-		self._recording_watchdog = None
-		self._captcha_watchdog = None
-		self._watchdogs_attached = False
-		if self._demo_mode:
-			self._demo_mode.reset()
-			self._demo_mode = None
+		from browser_use.browser.startup import BrowserSessionStartupPlan
+
+		BrowserSessionStartupPlan.detach_watchdogs(self)
 
 		self._intentional_stop = False
 		self.logger.info('✅ Browser session reset complete')
@@ -755,100 +701,12 @@ class BrowserSession(BaseModel):
 		- If already connected, it skips reconnection
 		- If you need to reset state, call stop() or kill() first
 		"""
+		from browser_use.browser.startup import BrowserSessionStartupPlan
 
-		# Initialize and attach all watchdogs FIRST so LocalBrowserWatchdog can handle BrowserLaunchEvent
-		await self.attach_all_watchdogs()
+		startup_plan = BrowserSessionStartupPlan(self)
 
 		try:
-			# If no CDP URL, launch local browser or cloud browser
-			if not self.cdp_url:
-				if self.browser_profile.use_cloud or self.browser_profile.cloud_browser_params is not None:
-					# Use cloud browser service
-					try:
-						# Use cloud_browser_params if provided, otherwise create empty request
-						cloud_params = self.browser_profile.cloud_browser_params or CreateBrowserRequest()
-						cloud_browser_response = await self._cloud_browser_client.create_browser(cloud_params)
-						self.browser_profile.cdp_url = cloud_browser_response.cdpUrl
-						self.browser_profile.is_local = False
-						self.logger.info('🌤️ Successfully connected to cloud browser service')
-					except CloudBrowserAuthError:
-						raise
-					except CloudBrowserError as e:
-						raise CloudBrowserError(f'Failed to create cloud browser: {e}')
-				elif self.is_local:
-					# Launch local browser using event-driven approach
-					launch_event = self.event_bus.dispatch(BrowserLaunchEvent())
-					await launch_event
-
-					# Get the CDP URL from LocalBrowserWatchdog handler result
-					launch_result: BrowserLaunchResult = cast(
-						BrowserLaunchResult, await launch_event.event_result(raise_if_none=True, raise_if_any=True)
-					)
-					self.browser_profile.cdp_url = launch_result.cdp_url
-				else:
-					raise ValueError('Got BrowserSession(is_local=False) but no cdp_url was provided to connect to!')
-
-			assert self.cdp_url and '://' in self.cdp_url
-
-			# Use lock to prevent concurrent connection attempts (race condition protection)
-			async with self._connection_lock:
-				# Only connect if not already connected
-				if self._cdp_client_root is None:
-					# Setup browser via CDP (for both local and remote cases)
-					# Global timeout prevents connect() from hanging indefinitely on
-					# slow/broken WebSocket connections (common on Lambda → remote browser)
-					try:
-						await asyncio.wait_for(self.connect(cdp_url=self.cdp_url), timeout=15.0)
-					except TimeoutError:
-						# Timeout cancels connect() via CancelledError, which bypasses
-						# connect()'s `except Exception` cleanup (CancelledError is BaseException).
-						# Clean up the partially-initialized client so future start attempts
-						# don't skip reconnection due to _cdp_client_root being non-None.
-						cdp_client = cast(CDPClient | None, self._cdp_client_root)
-						if cdp_client is not None:
-							try:
-								await cdp_client.stop()
-							except Exception:
-								pass
-							self._cdp_client_root = None
-						manager = self.session_manager
-						if manager is not None:
-							try:
-								await manager.clear()
-							except Exception:
-								pass
-							self.session_manager = None
-						self.agent_focus_target_id = None
-						raise RuntimeError(
-							f'connect() timed out after 15s — CDP connection to {self.cdp_url} is too slow or unresponsive'
-						)
-					assert self.cdp_client is not None
-
-					# Notify that browser is connected (single place)
-					# Ensure BrowserConnected handlers (storage_state restore) complete before
-					# start() returns so cookies/storage are applied before navigation.
-					await self.event_bus.dispatch(BrowserConnectedEvent(cdp_url=self.cdp_url))
-
-					if self.browser_profile.demo_mode:
-						try:
-							demo = self.demo_mode
-							if demo:
-								await demo.ensure_ready()
-						except Exception as exc:
-							self.logger.warning(f'[DemoMode] Failed to inject demo overlay: {exc}')
-				else:
-					self.logger.debug('Already connected to CDP, skipping reconnection')
-					if self.browser_profile.demo_mode:
-						try:
-							demo = self.demo_mode
-							if demo:
-								await demo.ensure_ready()
-						except Exception as exc:
-							self.logger.warning(f'[DemoMode] Failed to inject demo overlay: {exc}')
-
-			# Return the CDP URL for other components
-			return {'cdp_url': self.cdp_url}
-
+			return await startup_plan.execute()
 		except Exception as e:
 			self.event_bus.dispatch(
 				BrowserErrorEvent(
@@ -1579,154 +1437,10 @@ class BrowserSession(BaseModel):
 
 	async def attach_all_watchdogs(self) -> None:
 		"""Initialize and attach all watchdogs with explicit handler registration."""
-		# Prevent duplicate watchdog attachment
-		if self._watchdogs_attached:
-			self.logger.debug('Watchdogs already attached, skipping duplicate attachment')
-			return
+		from browser_use.browser.startup import BrowserSessionStartupPlan
 
-		from browser_use.browser.watchdogs.aboutblank_watchdog import AboutBlankWatchdog
-		from browser_use.browser.watchdogs.captcha_watchdog import CaptchaWatchdog
-
-		# from browser_use.browser.crash_watchdog import CrashWatchdog
-		from browser_use.browser.watchdogs.default_action_watchdog import DefaultActionWatchdog
-		from browser_use.browser.watchdogs.dom_watchdog import DOMWatchdog
-		from browser_use.browser.watchdogs.downloads_watchdog import DownloadsWatchdog
-		from browser_use.browser.watchdogs.har_recording_watchdog import HarRecordingWatchdog
-		from browser_use.browser.watchdogs.local_browser_watchdog import LocalBrowserWatchdog
-		from browser_use.browser.watchdogs.permissions_watchdog import PermissionsWatchdog
-		from browser_use.browser.watchdogs.popups_watchdog import PopupsWatchdog
-		from browser_use.browser.watchdogs.recording_watchdog import RecordingWatchdog
-		from browser_use.browser.watchdogs.screenshot_watchdog import ScreenshotWatchdog
-		from browser_use.browser.watchdogs.security_watchdog import SecurityWatchdog
-		from browser_use.browser.watchdogs.storage_state_watchdog import StorageStateWatchdog
-
-		# Initialize CrashWatchdog
-		# CrashWatchdog.model_rebuild()
-		# self._crash_watchdog = CrashWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(BrowserConnectedEvent, self._crash_watchdog.on_BrowserConnectedEvent)
-		# self.event_bus.on(BrowserStoppedEvent, self._crash_watchdog.on_BrowserStoppedEvent)
-		# self._crash_watchdog.attach_to_session()
-
-		# Initialize DownloadsWatchdog
-		DownloadsWatchdog.model_rebuild()
-		self._downloads_watchdog = DownloadsWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(BrowserLaunchEvent, self._downloads_watchdog.on_BrowserLaunchEvent)
-		# self.event_bus.on(TabCreatedEvent, self._downloads_watchdog.on_TabCreatedEvent)
-		# self.event_bus.on(TabClosedEvent, self._downloads_watchdog.on_TabClosedEvent)
-		# self.event_bus.on(BrowserStoppedEvent, self._downloads_watchdog.on_BrowserStoppedEvent)
-		# self.event_bus.on(NavigationCompleteEvent, self._downloads_watchdog.on_NavigationCompleteEvent)
-		self._downloads_watchdog.attach_to_session()
-		if self.browser_profile.auto_download_pdfs:
-			self.logger.debug('📄 PDF auto-download enabled for this session')
-
-		# Initialize StorageStateWatchdog conditionally
-		# Enable when user provides either storage_state or user_data_dir (indicating they want persistence)
-		should_enable_storage_state = (
-			self.browser_profile.storage_state is not None or self.browser_profile.user_data_dir is not None
-		)
-
-		if should_enable_storage_state:
-			StorageStateWatchdog.model_rebuild()
-			self._storage_state_watchdog = StorageStateWatchdog(
-				event_bus=self.event_bus,
-				browser_session=self,
-				# More conservative defaults when auto-enabled
-				auto_save_interval=60.0,  # 1 minute instead of 30 seconds
-				save_on_change=False,  # Only save on shutdown by default
-			)
-			self._storage_state_watchdog.attach_to_session()
-			self.logger.debug(
-				f'🍪 StorageStateWatchdog enabled (storage_state: {bool(self.browser_profile.storage_state)}, user_data_dir: {bool(self.browser_profile.user_data_dir)})'
-			)
-		else:
-			self.logger.debug('🍪 StorageStateWatchdog disabled (no storage_state or user_data_dir configured)')
-
-		# Initialize LocalBrowserWatchdog
-		LocalBrowserWatchdog.model_rebuild()
-		self._local_browser_watchdog = LocalBrowserWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(BrowserLaunchEvent, self._local_browser_watchdog.on_BrowserLaunchEvent)
-		# self.event_bus.on(BrowserKillEvent, self._local_browser_watchdog.on_BrowserKillEvent)
-		# self.event_bus.on(BrowserStopEvent, self._local_browser_watchdog.on_BrowserStopEvent)
-		self._local_browser_watchdog.attach_to_session()
-
-		# Initialize SecurityWatchdog (hooks NavigationWatchdog and implements allowed_domains restriction)
-		SecurityWatchdog.model_rebuild()
-		self._security_watchdog = SecurityWatchdog(event_bus=self.event_bus, browser_session=self)
-		# Core navigation is now handled in BrowserSession directly
-		# SecurityWatchdog only handles security policy enforcement
-		self._security_watchdog.attach_to_session()
-
-		# Initialize AboutBlankWatchdog (handles about:blank pages and DVD loading animation on first load)
-		AboutBlankWatchdog.model_rebuild()
-		self._aboutblank_watchdog = AboutBlankWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(BrowserStopEvent, self._aboutblank_watchdog.on_BrowserStopEvent)
-		# self.event_bus.on(BrowserStoppedEvent, self._aboutblank_watchdog.on_BrowserStoppedEvent)
-		# self.event_bus.on(TabCreatedEvent, self._aboutblank_watchdog.on_TabCreatedEvent)
-		# self.event_bus.on(TabClosedEvent, self._aboutblank_watchdog.on_TabClosedEvent)
-		self._aboutblank_watchdog.attach_to_session()
-
-		# Initialize PopupsWatchdog (handles accepting and dismissing JS dialogs, alerts, confirm, onbeforeunload, etc.)
-		PopupsWatchdog.model_rebuild()
-		self._popups_watchdog = PopupsWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(TabCreatedEvent, self._popups_watchdog.on_TabCreatedEvent)
-		# self.event_bus.on(DialogCloseEvent, self._popups_watchdog.on_DialogCloseEvent)
-		self._popups_watchdog.attach_to_session()
-
-		# Initialize PermissionsWatchdog (handles granting and revoking browser permissions like clipboard, microphone, camera, etc.)
-		PermissionsWatchdog.model_rebuild()
-		self._permissions_watchdog = PermissionsWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(BrowserConnectedEvent, self._permissions_watchdog.on_BrowserConnectedEvent)
-		self._permissions_watchdog.attach_to_session()
-
-		# Initialize DefaultActionWatchdog (handles all default actions like click, type, scroll, go back, go forward, refresh, wait, send keys, upload file, scroll to text, etc.)
-		DefaultActionWatchdog.model_rebuild()
-		self._default_action_watchdog = DefaultActionWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(ClickElementEvent, self._default_action_watchdog.on_ClickElementEvent)
-		# self.event_bus.on(TypeTextEvent, self._default_action_watchdog.on_TypeTextEvent)
-		# self.event_bus.on(ScrollEvent, self._default_action_watchdog.on_ScrollEvent)
-		# self.event_bus.on(GoBackEvent, self._default_action_watchdog.on_GoBackEvent)
-		# self.event_bus.on(GoForwardEvent, self._default_action_watchdog.on_GoForwardEvent)
-		# self.event_bus.on(RefreshEvent, self._default_action_watchdog.on_RefreshEvent)
-		# self.event_bus.on(WaitEvent, self._default_action_watchdog.on_WaitEvent)
-		# self.event_bus.on(SendKeysEvent, self._default_action_watchdog.on_SendKeysEvent)
-		# self.event_bus.on(UploadFileEvent, self._default_action_watchdog.on_UploadFileEvent)
-		# self.event_bus.on(ScrollToTextEvent, self._default_action_watchdog.on_ScrollToTextEvent)
-		self._default_action_watchdog.attach_to_session()
-
-		# Initialize ScreenshotWatchdog (handles taking screenshots of the browser)
-		ScreenshotWatchdog.model_rebuild()
-		self._screenshot_watchdog = ScreenshotWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(BrowserStartEvent, self._screenshot_watchdog.on_BrowserStartEvent)
-		# self.event_bus.on(BrowserStoppedEvent, self._screenshot_watchdog.on_BrowserStoppedEvent)
-		# self.event_bus.on(ScreenshotEvent, self._screenshot_watchdog.on_ScreenshotEvent)
-		self._screenshot_watchdog.attach_to_session()
-
-		# Initialize DOMWatchdog (handles building the DOM tree and detecting interactive elements, depends on ScreenshotWatchdog)
-		DOMWatchdog.model_rebuild()
-		self._dom_watchdog = DOMWatchdog(event_bus=self.event_bus, browser_session=self)
-		# self.event_bus.on(TabCreatedEvent, self._dom_watchdog.on_TabCreatedEvent)
-		# self.event_bus.on(BrowserStateRequestEvent, self._dom_watchdog.on_BrowserStateRequestEvent)
-		self._dom_watchdog.attach_to_session()
-
-		# Initialize RecordingWatchdog (handles video recording)
-		RecordingWatchdog.model_rebuild()
-		self._recording_watchdog = RecordingWatchdog(event_bus=self.event_bus, browser_session=self)
-		self._recording_watchdog.attach_to_session()
-
-		# Initialize HarRecordingWatchdog if record_har_path is configured (handles HTTPS HAR capture)
-		if self.browser_profile.record_har_path:
-			HarRecordingWatchdog.model_rebuild()
-			self._har_recording_watchdog = HarRecordingWatchdog(event_bus=self.event_bus, browser_session=self)
-			self._har_recording_watchdog.attach_to_session()
-
-		# Initialize CaptchaWatchdog (listens for captcha solver events from the browser proxy)
-		if self.browser_profile.captcha_solver:
-			CaptchaWatchdog.model_rebuild()
-			self._captcha_watchdog = CaptchaWatchdog(event_bus=self.event_bus, browser_session=self)
-			self._captcha_watchdog.attach_to_session()
-
-		# Mark watchdogs as attached to prevent duplicate attachment
-		self._watchdogs_attached = True
+		startup_plan = BrowserSessionStartupPlan(self)
+		await startup_plan._phase_attach_watchdogs()
 
 	async def connect(self, cdp_url: str | None = None) -> Self:
 		"""Connect to a remote chromium-based browser via CDP using cdp-use.
