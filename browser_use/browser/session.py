@@ -58,6 +58,7 @@ from browser_use.utils import _log_pretty_url, create_task_with_error_handling, 
 if TYPE_CHECKING:
 	from browser_use.actor.page import Page
 	from browser_use.browser.demo_mode import DemoMode
+	from browser_use.browser.startup import BrowserSessionStartupPlan
 	from browser_use.browser.watchdogs.captcha_watchdog import CaptchaWaitResult
 
 DEFAULT_BROWSER_PROFILE = BrowserProfile()
@@ -510,6 +511,7 @@ class BrowserSession(BaseModel):
 	_watchdogs_attached: bool = PrivateAttr(default=False)
 
 	_cloud_browser_client: CloudBrowserClient = PrivateAttr(default_factory=lambda: CloudBrowserClient())
+	_startup_plan: 'BrowserSessionStartupPlan | None' = PrivateAttr(default=None)
 	_demo_mode: 'DemoMode | None' = PrivateAttr(default=None)
 
 	# WebSocket reconnection state
@@ -703,10 +705,10 @@ class BrowserSession(BaseModel):
 		"""
 		from browser_use.browser.startup import BrowserSessionStartupPlan
 
-		startup_plan = BrowserSessionStartupPlan(self)
+		self._startup_plan = BrowserSessionStartupPlan(self)
 
 		try:
-			return await startup_plan.execute()
+			return await self._startup_plan.execute()
 		except Exception as e:
 			self.event_bus.dispatch(
 				BrowserErrorEvent(
@@ -1091,32 +1093,21 @@ class BrowserSession(BaseModel):
 				self.event_bus.dispatch(BrowserStoppedEvent(reason='Kept alive due to keep_alive=True'))
 				return
 
-			# Clean up cloud browser session for both:
-			# 1) native use_cloud sessions (current_session_id set by create_browser)
-			# 2) reconnected cdp_url sessions (derive UUID from host)
-			cloud_session_id = self._cloud_browser_client.current_session_id or self._cloud_session_id_from_cdp_url()
-			if cloud_session_id:
-				try:
-					await self._cloud_browser_client.stop_browser(cloud_session_id)
-					self.logger.info(f'🌤️ Cloud browser session cleaned up: {cloud_session_id}')
-				except Exception as e:
-					self.logger.debug(f'Failed to cleanup cloud browser session {cloud_session_id}: {e}')
-				finally:
-					# Always close the httpx client to free connection pool memory
-					try:
-						await self._cloud_browser_client.close()
-					except Exception:
-						pass
+			# Use startup plan for mode-specific cleanup
+			if self._startup_plan is not None:
+				await self._startup_plan.cleanup_on_stop()
+
+			# Always close the cloud browser httpx client to free connection pool memory
+			try:
+				await self._cloud_browser_client.close()
+			except Exception:
+				pass
 
 			# Clear CDP session cache before stopping
 			self.logger.info(
 				f'📢 on_BrowserStopEvent - Calling reset() (force={event.force}, keep_alive={self.browser_profile.keep_alive})'
 			)
 			await self.reset()
-
-			# Reset state
-			if self.is_local:
-				self.browser_profile.cdp_url = None
 
 			# Notify stop and wait for all handlers to complete
 			# LocalBrowserWatchdog listens for BrowserStopEvent and dispatches BrowserKillEvent
