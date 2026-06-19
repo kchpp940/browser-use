@@ -206,6 +206,9 @@ class BrowserUseServer:
 		self.session_timeout_minutes = session_timeout_minutes
 		self._cleanup_task: Any = None
 
+		# Cached tool capabilities for consistent metadata across list_tools calls
+		self._tool_capabilities: list | None = None
+
 		# Setup handlers
 		self._setup_handlers()
 
@@ -614,6 +617,9 @@ class BrowserUseServer:
 		# Create tools for direct actions
 		self.tools = Tools()
 
+		# Initialize tool metadata from the unified ToolCapability model
+		self._init_tool_metadata()
+
 		# Initialize LLM from config
 		llm_config = get_default_llm(self.config)
 		base_url = llm_config.get('base_url', None)
@@ -633,6 +639,71 @@ class BrowserUseServer:
 		self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())
 
 		logger.debug('Browser session initialized')
+
+	def _init_tool_metadata(self) -> None:
+		"""Initialize tool metadata using the unified ToolCapability model.
+
+		This ensures consistent tool metadata across all entry points:
+		- Agent tools registry
+		- MCP list_tools
+		- Template allowed tools filtering
+
+		For MCP-specific tools, we define their metadata here.
+		For tools shared with the browser-use core, we reuse metadata from the Tools registry.
+		"""
+		from browser_use.tools.registry.views import ToolCapability
+
+		# Get core tool names that map to MCP tools (with browser_ prefix)
+		# These reuse the metadata from the Tools registry for consistency
+		core_tool_mappings = {
+			'browser_navigate': 'navigate',
+			'browser_click': 'click',
+			'browser_scroll': 'scroll',
+			'browser_go_back': 'go_back',
+			'browser_switch_tab': 'switch',
+			'browser_close_tab': 'close',
+			'browser_screenshot': 'screenshot',
+			'browser_extract_content': 'extract',
+		}
+
+		tool_caps = []
+
+		if self.tools is not None:
+			adapter = self.tools.get_tool_registry_adapter()
+
+			for mcp_name, core_name in core_tool_mappings.items():
+				core_cap = adapter.get_tool_capability(core_name)
+				if core_cap is not None:
+					# Create MCP-specific version with prefixed name
+					# We keep the same param schema and description for consistency
+					mcp_cap = ToolCapability(
+						name=mcp_name,
+						description=core_cap.description,
+						category=core_cap.category,
+						param_schema=core_cap.param_schema,
+						domains=core_cap.domains,
+						terminates_sequence=core_cap.terminates_sequence,
+						requires_browser=core_cap.requires_browser,
+						requires_llm=core_cap.requires_llm,
+						result_is_structured=core_cap.result_is_structured,
+					)
+					tool_caps.append(mcp_cap)
+
+		# TODO: Add MCP-specific tool capabilities here
+		# (browser_get_state, browser_get_html, browser_list_tabs, etc.)
+		# These are defined directly in MCP but should also use ToolCapability
+
+		self._tool_capabilities = tool_caps
+
+	def _format_result_from_action_result(self, action_result: Any) -> list:
+		"""Format an ActionResult using the unified ToolResult format for MCP responses.
+
+		This ensures consistent result formatting across all entry points.
+		"""
+		from browser_use.tools.registry.views import ToolResult
+
+		tool_result = ToolResult.from_action_result(action_result)
+		return tool_result.to_mcp_content()
 
 	async def _retry_with_browser_use_agent(
 		self,

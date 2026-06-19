@@ -3,7 +3,7 @@ import json
 import logging
 import math
 import os
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 import anyio
 
@@ -438,6 +438,7 @@ class Tools(Generic[Context]):
 			'',
 			param_model=SearchAction,
 			terminates_sequence=True,
+			category='navigation',
 		)
 		async def search(params: SearchAction, browser_session: BrowserSession):
 			import urllib.parse
@@ -482,6 +483,7 @@ class Tools(Generic[Context]):
 			'',
 			param_model=NavigateAction,
 			terminates_sequence=True,
+			category='navigation',
 		)
 		async def navigate(params: NavigateAction, browser_session: BrowserSession):
 			try:
@@ -559,7 +561,7 @@ class Tools(Generic[Context]):
 					# Return error in ActionResult instead of re-raising
 					return ActionResult(error=f'Navigation failed: {str(e)}')
 
-		@self.registry.action('Go back', param_model=NoParamsAction, terminates_sequence=True)
+		@self.registry.action('Go back', param_model=NoParamsAction, terminates_sequence=True, category='navigation')
 		async def go_back(_: NoParamsAction, browser_session: BrowserSession):
 			try:
 				event = browser_session.event_bus.dispatch(GoBackEvent())
@@ -573,7 +575,7 @@ class Tools(Generic[Context]):
 				error_msg = f'Failed to go back: {str(e)}'
 				return ActionResult(error=error_msg)
 
-		@self.registry.action('Wait for x seconds.')
+		@self.registry.action('Wait for x seconds.', category='system')
 		async def wait(seconds: int = 3):
 			# Cap wait time at maximum 30 seconds
 			# Reduce the wait time by 3 seconds to account for the llm call which takes at least 3 seconds
@@ -2068,6 +2070,7 @@ Validated Code (after quote fixing):
 			@self.registry.action(
 				'Click element by index or coordinates. Use coordinates only if the index is not available. Either provide coordinates or index.',
 				param_model=ClickElementAction,
+				category='interaction',
 			)
 			async def click(params: ClickElementAction, browser_session: BrowserSession):
 				# Validate that either index or coordinates are provided
@@ -2085,6 +2088,7 @@ Validated Code (after quote fixing):
 			@self.registry.action(
 				'Click element by index.',
 				param_model=ClickElementActionIndexOnly,
+				category='interaction',
 			)
 			async def click(params: ClickElementActionIndexOnly, browser_session: BrowserSession):
 				return await self._click_by_index(params, browser_session)
@@ -2111,6 +2115,70 @@ Validated Code (after quote fixing):
 		self._coordinate_clicking_enabled = enabled
 		self._register_click_action()
 		logger.debug(f'Coordinate clicking {"enabled" if enabled else "disabled"}')
+
+	def get_tool_registry_adapter(self) -> Any:
+		"""Get a ToolRegistryAdapter for unified tool metadata access.
+
+		This adapter provides consistent tool metadata across all entry points:
+		- Agent tools registry
+		- MCP list_tools
+		- Template allowed tools filtering
+		- Result formatting
+		"""
+		from browser_use.tools.registry.views import ToolRegistryAdapter
+
+		# Ensure default categories are applied before returning adapter
+		self._apply_default_categories()
+		return ToolRegistryAdapter(registry=self.registry.registry)
+
+	def _apply_default_categories(self) -> None:
+		"""Apply default categories to all registered tools.
+
+		This ensures consistent categorization across all entry points
+		(MCP, templates, agent prompts) without duplicating category
+		definitions in each module.
+		"""
+		from typing import Literal
+
+		categories: dict[
+			str,
+			Literal['navigation', 'interaction', 'extraction', 'tab_management', 'file', 'system', 'custom'],
+		] = {
+			# Navigation
+			'search': 'navigation',
+			'navigate': 'navigation',
+			'go_back': 'navigation',
+			# Interaction
+			'click': 'interaction',
+			'input': 'interaction',
+			'upload_file': 'interaction',
+			'scroll': 'interaction',
+			'send_keys': 'interaction',
+			'find_text': 'interaction',
+			'dropdown_options': 'interaction',
+			'select_dropdown': 'interaction',
+			'evaluate': 'interaction',
+			# Extraction
+			'extract': 'extraction',
+			'search_page': 'extraction',
+			'find_elements': 'extraction',
+			'screenshot': 'extraction',
+			'save_as_pdf': 'extraction',
+			# Tab management
+			'switch': 'tab_management',
+			'close': 'tab_management',
+			# File operations
+			'write_file': 'file',
+			'replace_file': 'file',
+			'read_file': 'file',
+			# System
+			'done': 'system',
+			'wait': 'system',
+		}
+
+		for name, action in self.registry.registry.actions.items():
+			if name in categories:
+				action.category = categories[name]
 
 	# Act --------------------------------------------------------------------
 	@observe_debug(ignore_input=True, ignore_output=True, name='act')
