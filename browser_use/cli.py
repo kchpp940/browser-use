@@ -155,7 +155,7 @@ from browser_use.llm.openai.chat import ChatOpenAI
 load_dotenv()
 
 from browser_use import Agent, Controller
-from browser_use.agent.views import AgentSettings
+from browser_use.agent.views import AgentSettings, RuntimeExecutionResult
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
@@ -1046,7 +1046,10 @@ class BrowserUseApp(App):
 
 				# Run the agent task, redirecting output to RichLog through our handler
 				if self.agent:
-					await self.agent.run()
+					result: RuntimeExecutionResult = await self.agent.run_with_result()
+					# Log the structured result at RESULT level for display
+					if os.environ.get('BROWSER_USE_LOGGING_LEVEL', 'result').lower() == 'result':
+						logger.info(result.to_human_readable())
 			except Exception as e:
 				error_msg = str(e)
 				logger.error('\nError running agent: %s', str(e))

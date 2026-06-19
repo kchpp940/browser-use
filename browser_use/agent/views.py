@@ -1011,18 +1011,21 @@ TaskStatus = Literal[
 
 
 class ToolExecutionResult(BaseModel):
-	"""Lightweight structured result for single-step browser tool calls.
+	"""**Deprecated:** Use ``RuntimeExecutionResult`` with ``ResultAssembler.from_single_action()`` instead.
 
-	Used by MCP browser_* tools and skill_cli daemon commands.
-	Unlike RuntimeExecutionResult (which represents a full agent run),
-	this captures one atomic browser action with:
-	  - success/failure status
-	  - human-readable message (what happened)
-	  - structured data dict (machine-parseable details)
-	  - optional error information
+	This model is kept for backwards compatibility but should not be used in new code.
+	All single-step browser operations (MCP tools, skill_cli commands) now use
+	``RuntimeExecutionResult`` with exactly one step, assembled via::
 
-	Callers can use ``to_mcp_contents()`` to get the standard MCP
-	dual-format output (human-readable text + structured JSON).
+	    result = ResultAssembler.from_single_action(
+	        tool_name='navigate',
+	        message='Navigated to: https://example.com',
+	        data={'url': 'https://example.com'},
+	        entry_point='mcp_tool',
+	    )
+
+	.. deprecated::
+	    Use :class:`RuntimeExecutionResult` via :meth:`ResultAssembler.from_single_action`.
 	"""
 
 	tool_name: str = Field(description='Name of the tool that was executed')
@@ -1112,15 +1115,34 @@ class StepExecutionResult(BaseModel):
 class RuntimeExecutionResult(BaseModel, Generic[AgentStructuredOutput]):
 	"""Unified structured execution result.
 
-	This is the single authoritative result object produced by:
-	  - Agent.run()
-	  - single-step execution
-	  - MCP tool calls (retry_with_browser_use_agent, direct browser actions)
-	  - skill_cli run commands
-	  - task template invocations
+	This is the single authoritative result object produced by ALL
+	execution entry points in the browser-use library:
 
-	All entry points should assemble and return this object.
+	1. **Agent API** — :meth:`Agent.run_with_result() <browser_use.agent.service.Agent.run_with_result>`
+	   Full agent task execution via Python API.
+
+	2. **MCP Agent Tool** — ``retry_with_browser_use_agent``
+	   Full agent execution via MCP server.
+
+	3. **MCP Browser Tools** — All direct browser action tools
+	   (``browser_navigate``, ``browser_click``, etc.) assembled via
+	   :meth:`ResultAssembler.from_single_action`.
+
+	4. **CLI / TUI** — The interactive browser-use CLI
+	   (``BrowserUseApp.run_task``) uses :meth:`Agent.run_with_result`.
+
+	5. **skill_cli** — The skill CLI daemon commands
+	   (navigate, click, etc.) assembled via
+	   :meth:`ResultAssembler.from_single_action`.
+
+	6. **Task Templates** — Any task executed through the CLI
+	   template system (``--template`` flag) or programmatic task
+	   execution, all going through :meth:`Agent.run_with_result`.
+
+	All entry points assemble and return this object.
 	CLI may format fields for human consumption, but must NOT lose the structured data.
+	MCP tools return a dual-format response (human-readable text + JSON serialization).
+	Python API consumers get the full typed object.
 	"""
 
 	model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -1281,6 +1303,53 @@ class RuntimeExecutionResult(BaseModel, Generic[AgentStructuredOutput]):
 
 		return '\n'.join(lines)
 
+	@property
+	def tool_name(self) -> str | None:
+		"""Convenience accessor: get tool_name from metadata for single-action results."""
+		return self.metadata.get('tool_name')
+
+	def to_mcp_contents(self) -> list[dict[str, Any]]:
+		"""Convert to MCP content dicts (text + optional structured JSON + screenshot).
+
+		The first element is always the human-readable text message.
+		If there is structured data or an error, a second element with the
+		JSON serialization is appended.
+		"""
+		contents: list[dict[str, Any]] = []
+		human_text = self.final_text or self.to_human_readable()
+		contents.append({'type': 'text', 'text': human_text})
+		always_include_keys = {'entry_point', 'tool_name'}
+		extra_keys = set(self.metadata.keys()) - always_include_keys if self.metadata else set()
+		has_data = bool(extra_keys)
+		if self.error or has_data or not self.success:
+			structured_json = self.model_dump_json(indent=2, exclude={'raw_history'})
+			contents.append({'type': 'text', 'text': f'--- STRUCTURED RESULT (JSON) ---\n{structured_json}'})
+		return contents
+
+	def to_daemon_response(self, req_id: str = '') -> dict[str, Any]:
+		"""Convert to daemon socket response dict.
+
+		Keeps backwards compatibility with the {success, data, error} protocol,
+		but adds a _structured key containing the full RuntimeExecutionResult.
+		"""
+		data: dict[str, Any] = {}
+		for step in self.steps:
+			if step.metadata and 'data' in step.metadata:
+				data.update(step.metadata['data'])
+		data['_structured'] = self.model_dump(exclude={'raw_history'})
+		if self.visited_urls:
+			data.setdefault('url', self.visited_urls[-1])
+		if self.steps and self.steps[0].screenshot_path:
+			data.setdefault('screenshot_path', self.steps[0].screenshot_path)
+		result: dict[str, Any] = {
+			'id': req_id,
+			'success': bool(self.success),
+			'data': data,
+		}
+		if self.error:
+			result['error'] = self.error
+		return result
+
 	def model_dump(self, **kwargs) -> dict[str, Any]:
 		"""Serialize, excluding the raw_history reference (not JSON-serialisable)."""
 		kwargs.setdefault('exclude', {'raw_history'})
@@ -1361,6 +1430,89 @@ class ResultAssembler:
 	def include_steps(self, include: bool = True) -> ResultAssembler:
 		self._include_steps = include
 		return self
+
+	@staticmethod
+	def from_single_action(
+		*,
+		tool_name: str,
+		message: str | None = None,
+		data: dict[str, Any] | None = None,
+		error: str | None = None,
+		url: str | None = None,
+		screenshot_path: str | None = None,
+		screenshot_b64: str | None = None,
+		output_files: list[str] | None = None,
+		duration_seconds: float | None = None,
+		task_id: str | None = None,
+		entry_point: str = 'mcp_tool',
+	) -> RuntimeExecutionResult[BaseModel]:
+		"""Assemble a RuntimeExecutionResult for a single atomic browser action.
+
+		This replaces the separate ToolExecutionResult model by representing
+		single-tool invocations as a RuntimeExecutionResult with exactly one step.
+
+		Args:
+		    tool_name: Name of the tool that was executed (e.g., "navigate", "click")
+		    message: Human-readable description of the outcome
+		    data: Structured key-value data for programmatic consumers
+		    error: Error message if the action failed
+		    url: Current URL after the action (if applicable)
+		    screenshot_path: Path to screenshot if one was captured
+		    screenshot_b64: Base64-encoded screenshot (stored in step metadata)
+		    output_files: Paths to files produced by this action
+		    duration_seconds: How long the action took
+		    task_id: Unique identifier for this task run (auto-generated if None)
+		    entry_point: Where this execution originated ("mcp_tool", "skill_cli", etc.)
+
+		Returns:
+		    RuntimeExecutionResult with a single StepExecutionResult in steps
+		"""
+		import uuid
+
+		success = error is None
+		status: TaskStatus = 'success' if success else 'failed'
+		actual_task_id = task_id or f'single-{tool_name}-{uuid.uuid4().hex[:8]}'
+		task_desc = message or f'{tool_name}: {data}' if data else tool_name
+
+		step_metadata: dict[str, Any] = {'tool_name': tool_name}
+		if data:
+			step_metadata['data'] = data
+		if screenshot_b64:
+			step_metadata['screenshot_b64'] = screenshot_b64
+
+		step = StepExecutionResult(
+			step_number=1,
+			duration_seconds=duration_seconds,
+			status='success' if success else 'failed',
+			action_names=[tool_name],
+			extracted_content=message,
+			error=error,
+			url=url,
+			screenshot_path=screenshot_path,
+			attachments=list(output_files or []),
+			metadata=step_metadata,
+		)
+
+		result_files: list[OutputFile] = [OutputFile(path=f) for f in (output_files or [])]
+
+		return RuntimeExecutionResult[BaseModel](
+			task_id=actual_task_id,
+			task=task_desc,
+			status=status,
+			success=success,
+			final_text=message,
+			output_files=result_files,
+			visited_urls=[url] if url else [],
+			screenshot_paths=[screenshot_path] if screenshot_path else [],
+			steps_completed=1,
+			max_steps=1,
+			total_duration_seconds=round(duration_seconds or 0.0, 3),
+			error=error,
+			step_errors=[error] if error else [],
+			consecutive_failures=0 if success else 1,
+			steps=[step],
+			metadata={'entry_point': entry_point, 'tool_name': tool_name, **(data or {})},
+		)
 
 	@staticmethod
 	def _dedupe_preserve_order(items: list[str | None]) -> list[str]:

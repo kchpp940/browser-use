@@ -91,7 +91,7 @@ logging.disable(logging.CRITICAL)
 
 # Import browser_use modules
 from browser_use import ActionModel, Agent
-from browser_use.agent.views import AgentHistoryList, ResultAssembler, RuntimeExecutionResult, ToolExecutionResult
+from browser_use.agent.views import AgentHistoryList, ResultAssembler, RuntimeExecutionResult
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
@@ -485,28 +485,22 @@ class BrowserUseServer:
 				)
 
 	def _tool_result_to_mcp_contents(
-		self, result: ToolExecutionResult, screenshot_b64: str | None = None
+		self, result: RuntimeExecutionResult, screenshot_b64: str | None = None
 	) -> list[types.TextContent | types.ImageContent]:
-		"""Convert a ToolExecutionResult to MCP content list format.
+		"""Convert a RuntimeExecutionResult to MCP content list format.
 
-		      Pattern:
+		Pattern:
 		1) TextContent with the human-readable message
 		2) TextContent with ``--- STRUCTURED RESULT (JSON) ---`` + model_dump_json (when data/error present)
 		3) ImageContent for screenshot (optional)
 		"""
 		contents: list[types.TextContent | types.ImageContent] = []
 
-		# 1) Human-readable message
-		contents.append(
-			types.TextContent(type='text', text=result.message or ('Success' if result.success else f'Error: {result.error}'))
-		)
+		# Use RuntimeExecutionResult's built-in to_mcp_contents()
+		for item in result.to_mcp_contents():
+			contents.append(types.TextContent(type='text', text=item['text']))
 
-		# 2) Structured JSON payload
-		if result.data or result.error or not result.success:
-			structured_json = result.model_dump_json(indent=2)
-			contents.append(types.TextContent(type='text', text=f'--- STRUCTURED RESULT (JSON) ---\n{structured_json}'))
-
-		# 3) Screenshot
+		# Screenshot
 		if screenshot_b64:
 			contents.append(types.ImageContent(type='image', data=screenshot_b64, mimeType='image/png'))
 
@@ -518,7 +512,7 @@ class BrowserUseServer:
 		"""Execute a browser-use tool.
 
 		    Returns:
-		- ``list[types.TextContent | types.ImageContent]`` for browser control tools (via ToolExecutionResult conversion)
+		- ``list[types.TextContent | types.ImageContent]`` for browser control tools (via RuntimeExecutionResult conversion)
 		- ``str | list[...]`` for retry_with_browser_use_agent (unchanged)
 		- ``str`` for session management tools
 		"""
@@ -549,7 +543,7 @@ class BrowserUseServer:
 			if not self.browser_session:
 				await self._init_browser_session()
 
-			result: ToolExecutionResult
+			result: RuntimeExecutionResult
 			screenshot_b64: str | None = None
 
 			if tool_name == 'browser_navigate':
@@ -832,10 +826,16 @@ class BrowserUseServer:
 			# Clean up
 			await agent.close()
 
-	async def _navigate(self, url: str, new_tab: bool = False) -> ToolExecutionResult:
+	async def _navigate(self, url: str, new_tab: bool = False) -> RuntimeExecutionResult:
 		"""Navigate to a URL."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='navigate')
+			return ResultAssembler.from_single_action(
+				tool_name='navigate',
+				message='No browser session active',
+				error='No browser session active',
+				url=url,
+				entry_point='mcp_tool',
+			)
 
 		# Update session activity
 		self._update_session_activity(self.browser_session.id)
@@ -845,13 +845,23 @@ class BrowserUseServer:
 		if new_tab:
 			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=True))
 			await event
-			return ToolExecutionResult(
-				success=True, message=f'Opened new tab with URL: {url}', tool_name='navigate', data={'url': url, 'new_tab': True}
+			return ResultAssembler.from_single_action(
+				tool_name='navigate',
+				message=f'Opened new tab with URL: {url}',
+				data={'url': url, 'new_tab': True},
+				url=url,
+				entry_point='mcp_tool',
 			)
 		else:
 			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url))
 			await event
-			return ToolExecutionResult(success=True, message=f'Navigated to: {url}', tool_name='navigate', data={'url': url})
+			return ResultAssembler.from_single_action(
+				tool_name='navigate',
+				message=f'Navigated to: {url}',
+				data={'url': url},
+				url=url,
+				entry_point='mcp_tool',
+			)
 
 	async def _click(
 		self,
@@ -859,10 +869,15 @@ class BrowserUseServer:
 		coordinate_x: int | None = None,
 		coordinate_y: int | None = None,
 		new_tab: bool = False,
-	) -> ToolExecutionResult:
+	) -> RuntimeExecutionResult:
 		"""Click an element by index or at viewport coordinates."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='click')
+			return ResultAssembler.from_single_action(
+				tool_name='click',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		# Update session activity
 		self._update_session_activity(self.browser_session.id)
@@ -875,24 +890,31 @@ class BrowserUseServer:
 				ClickCoordinateEvent(coordinate_x=coordinate_x, coordinate_y=coordinate_y)
 			)
 			await event
-			return ToolExecutionResult(
-				success=True,
-				message=f'Clicked at coordinates ({coordinate_x}, {coordinate_y})',
+			return ResultAssembler.from_single_action(
 				tool_name='click',
+				message=f'Clicked at coordinates ({coordinate_x}, {coordinate_y})',
 				data={'coordinate_x': coordinate_x, 'coordinate_y': coordinate_y},
+				entry_point='mcp_tool',
 			)
 
 		# Index-based clicking
 		if index is None:
-			return ToolExecutionResult(
-				success=False, error='Provide either index or both coordinate_x and coordinate_y', tool_name='click'
+			return ResultAssembler.from_single_action(
+				tool_name='click',
+				message='Provide either index or both coordinate_x and coordinate_y',
+				error='Provide either index or both coordinate_x and coordinate_y',
+				entry_point='mcp_tool',
 			)
 
 		# Get the element
 		element = await self.browser_session.get_dom_element_by_index(index)
 		if not element:
-			return ToolExecutionResult(
-				success=False, error=f'Element with index {index} not found', tool_name='click', data={'index': index}
+			return ResultAssembler.from_single_action(
+				tool_name='click',
+				message=f'Element with index {index} not found',
+				error=f'Element with index {index} not found',
+				data={'index': index},
+				entry_point='mcp_tool',
 			)
 
 		if new_tab:
@@ -916,11 +938,12 @@ class BrowserUseServer:
 
 				event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=full_url, new_tab=True))
 				await event
-				return ToolExecutionResult(
-					success=True,
-					message=f'Clicked element {index} and opened in new tab {full_url[:20]}...',
+				return ResultAssembler.from_single_action(
 					tool_name='click',
+					message=f'Clicked element {index} and opened in new tab {full_url[:20]}...',
 					data={'index': index, 'url': full_url, 'new_tab': True},
+					url=full_url,
+					entry_point='mcp_tool',
 				)
 			else:
 				# For non-link elements, just do a normal click
@@ -928,11 +951,11 @@ class BrowserUseServer:
 
 				event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
 				await event
-				return ToolExecutionResult(
-					success=True,
-					message=f'Clicked element {index} (new tab not supported for non-link elements)',
+				return ResultAssembler.from_single_action(
 					tool_name='click',
+					message=f'Clicked element {index} (new tab not supported for non-link elements)',
 					data={'index': index},
+					entry_point='mcp_tool',
 				)
 		else:
 			# Normal click
@@ -940,17 +963,31 @@ class BrowserUseServer:
 
 			event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
 			await event
-			return ToolExecutionResult(success=True, message=f'Clicked element {index}', tool_name='click', data={'index': index})
+			return ResultAssembler.from_single_action(
+				tool_name='click',
+				message=f'Clicked element {index}',
+				data={'index': index},
+				entry_point='mcp_tool',
+			)
 
-	async def _type_text(self, index: int, text: str) -> ToolExecutionResult:
+	async def _type_text(self, index: int, text: str) -> RuntimeExecutionResult:
 		"""Type text into an element."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='type_text')
+			return ResultAssembler.from_single_action(
+				tool_name='type_text',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		element = await self.browser_session.get_dom_element_by_index(index)
 		if not element:
-			return ToolExecutionResult(
-				success=False, error=f'Element with index {index} not found', tool_name='type_text', data={'index': index}
+			return ResultAssembler.from_single_action(
+				tool_name='type_text',
+				message=f'Element with index {index} not found',
+				error=f'Element with index {index} not found',
+				data={'index': index},
+				entry_point='mcp_tool',
 			)
 
 		from browser_use.browser.events import TypeTextEvent
@@ -984,31 +1021,39 @@ class BrowserUseServer:
 
 		if is_potentially_sensitive:
 			if sensitive_key_name:
-				return ToolExecutionResult(
-					success=True,
-					message=f'Typed <{sensitive_key_name}> into element {index}',
+				return ResultAssembler.from_single_action(
 					tool_name='type_text',
+					message=f'Typed <{sensitive_key_name}> into element {index}',
 					data={'index': index, 'sensitive': True},
+					entry_point='mcp_tool',
 				)
 			else:
-				return ToolExecutionResult(
-					success=True,
-					message=f'Typed <sensitive> into element {index}',
+				return ResultAssembler.from_single_action(
 					tool_name='type_text',
+					message=f'Typed <sensitive> into element {index}',
 					data={'index': index, 'sensitive': True},
+					entry_point='mcp_tool',
 				)
 		else:
-			return ToolExecutionResult(
-				success=True,
-				message=f"Typed '{text}' into element {index}",
+			return ResultAssembler.from_single_action(
 				tool_name='type_text',
+				message=f"Typed '{text}' into element {index}",
 				data={'index': index, 'text': text},
+				entry_point='mcp_tool',
 			)
 
-	async def _get_browser_state(self, include_screenshot: bool = False) -> tuple[ToolExecutionResult, str | None]:
-		"""Get current browser state. Returns (ToolExecutionResult, screenshot_b64 | None)."""
+	async def _get_browser_state(self, include_screenshot: bool = False) -> tuple[RuntimeExecutionResult, str | None]:
+		"""Get current browser state. Returns (RuntimeExecutionResult, screenshot_b64 | None)."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='get_state'), None
+			return (
+				ResultAssembler.from_single_action(
+					tool_name='get_state',
+					message='No browser session active',
+					error='No browser session active',
+					entry_point='mcp_tool',
+				),
+				None,
+			)
 
 		state = await self.browser_session.get_browser_state_summary()
 
@@ -1059,25 +1104,35 @@ class BrowserUseServer:
 					'height': state.page_info.viewport_height,
 				}
 
-		tool_result = ToolExecutionResult(
-			success=True,
-			message=f'Browser state for {state.url}',
+		tool_result = ResultAssembler.from_single_action(
 			tool_name='get_state',
+			message=f'Browser state for {state.url}',
 			data=result_data,
 			url=state.url,
+			entry_point='mcp_tool',
 		)
 		return tool_result, screenshot_b64
 
-	async def _get_html(self, selector: str | None = None) -> ToolExecutionResult:
+	async def _get_html(self, selector: str | None = None) -> RuntimeExecutionResult:
 		"""Get raw HTML of the page or a specific element."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='get_html')
+			return ResultAssembler.from_single_action(
+				tool_name='get_html',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		self._update_session_activity(self.browser_session.id)
 
 		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=None, focus=False)
 		if not cdp_session:
-			return ToolExecutionResult(success=False, error='No active CDP session', tool_name='get_html')
+			return ResultAssembler.from_single_action(
+				tool_name='get_html',
+				message='No active CDP session',
+				error='No active CDP session',
+				entry_point='mcp_tool',
+			)
 
 		if selector:
 			js = (
@@ -1093,15 +1148,32 @@ class BrowserUseServer:
 		html = result.get('result', {}).get('value')
 		if html is None:
 			error_msg = f'No element found for selector: {selector}' if selector else 'Could not get page HTML'
-			return ToolExecutionResult(success=False, error=error_msg, tool_name='get_html', data={'selector': selector})
-		return ToolExecutionResult(
-			success=True, message='HTML retrieved', tool_name='get_html', data={'html': html, 'selector': selector}
+			return ResultAssembler.from_single_action(
+				tool_name='get_html',
+				message=error_msg,
+				error=error_msg,
+				data={'selector': selector},
+				entry_point='mcp_tool',
+			)
+		return ResultAssembler.from_single_action(
+			tool_name='get_html',
+			message='HTML retrieved',
+			data={'html': html, 'selector': selector},
+			entry_point='mcp_tool',
 		)
 
-	async def _screenshot(self, full_page: bool = False) -> tuple[ToolExecutionResult, str | None]:
-		"""Take a screenshot. Returns (ToolExecutionResult, screenshot_b64 | None)."""
+	async def _screenshot(self, full_page: bool = False) -> tuple[RuntimeExecutionResult, str | None]:
+		"""Take a screenshot. Returns (RuntimeExecutionResult, screenshot_b64 | None)."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='screenshot'), None
+			return (
+				ResultAssembler.from_single_action(
+					tool_name='screenshot',
+					message='No browser session active',
+					error='No browser session active',
+					entry_point='mcp_tool',
+				),
+				None,
+			)
 
 		import base64
 
@@ -1110,7 +1182,7 @@ class BrowserUseServer:
 		data = await self.browser_session.take_screenshot(full_page=full_page)
 		b64 = base64.b64encode(data).decode()
 
-		# Build metadata for ToolExecutionResult
+		# Build metadata for RuntimeExecutionResult
 		state = await self.browser_session.get_browser_state_summary()
 		result_data: dict[str, Any] = {
 			'size_bytes': len(data),
@@ -1121,30 +1193,49 @@ class BrowserUseServer:
 				'height': state.page_info.viewport_height,
 			}
 
-		tool_result = ToolExecutionResult(
-			success=True,
-			message='Screenshot taken',
+		tool_result = ResultAssembler.from_single_action(
 			tool_name='screenshot',
+			message='Screenshot taken',
 			data=result_data,
 			url=state.url,
+			screenshot_b64=b64,
+			entry_point='mcp_tool',
 		)
 		return tool_result, b64
 
-	async def _extract_content(self, query: str, extract_links: bool = False) -> ToolExecutionResult:
+	async def _extract_content(self, query: str, extract_links: bool = False) -> RuntimeExecutionResult:
 		"""Extract content from current page."""
 		if not self.llm:
-			return ToolExecutionResult(
-				success=False, error='LLM not initialized (set OPENAI_API_KEY)', tool_name='extract_content'
+			return ResultAssembler.from_single_action(
+				tool_name='extract_content',
+				message='LLM not initialized (set OPENAI_API_KEY)',
+				error='LLM not initialized (set OPENAI_API_KEY)',
+				entry_point='mcp_tool',
 			)
 
 		if not self.file_system:
-			return ToolExecutionResult(success=False, error='FileSystem not initialized', tool_name='extract_content')
+			return ResultAssembler.from_single_action(
+				tool_name='extract_content',
+				message='FileSystem not initialized',
+				error='FileSystem not initialized',
+				entry_point='mcp_tool',
+			)
 
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='extract_content')
+			return ResultAssembler.from_single_action(
+				tool_name='extract_content',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		if not self.tools:
-			return ToolExecutionResult(success=False, error='Tools not initialized', tool_name='extract_content')
+			return ResultAssembler.from_single_action(
+				tool_name='extract_content',
+				message='Tools not initialized',
+				error='Tools not initialized',
+				entry_point='mcp_tool',
+			)
 
 		state = await self.browser_session.get_browser_state_summary()
 
@@ -1173,18 +1264,23 @@ class BrowserUseServer:
 		)
 
 		content = action_result.extracted_content or 'No content extracted'
-		return ToolExecutionResult(
-			success=True,
-			message=content,
+		return ResultAssembler.from_single_action(
 			tool_name='extract_content',
+			message=content,
 			data={'query': query, 'extract_links': extract_links, 'content': content},
 			url=state.url,
+			entry_point='mcp_tool',
 		)
 
-	async def _scroll(self, direction: str = 'down') -> ToolExecutionResult:
+	async def _scroll(self, direction: str = 'down') -> RuntimeExecutionResult:
 		"""Scroll the page."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='scroll')
+			return ResultAssembler.from_single_action(
+				tool_name='scroll',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		from browser_use.browser.events import ScrollEvent
 
@@ -1196,22 +1292,34 @@ class BrowserUseServer:
 			)
 		)
 		await event
-		return ToolExecutionResult(
-			success=True, message=f'Scrolled {direction}', tool_name='scroll', data={'direction': direction}
+		return ResultAssembler.from_single_action(
+			tool_name='scroll',
+			message=f'Scrolled {direction}',
+			data={'direction': direction},
+			entry_point='mcp_tool',
 		)
 
-	async def _go_back(self) -> ToolExecutionResult:
+	async def _go_back(self) -> RuntimeExecutionResult:
 		"""Go back in browser history."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='go_back')
+			return ResultAssembler.from_single_action(
+				tool_name='go_back',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		from browser_use.browser.events import GoBackEvent
 
 		event = self.browser_session.event_bus.dispatch(GoBackEvent())
 		await event
-		return ToolExecutionResult(success=True, message='Navigated back', tool_name='go_back')
+		return ResultAssembler.from_single_action(
+			tool_name='go_back',
+			message='Navigated back',
+			entry_point='mcp_tool',
+		)
 
-	async def _close_browser(self) -> ToolExecutionResult:
+	async def _close_browser(self) -> RuntimeExecutionResult:
 		"""Close the browser session."""
 		if self.browser_session:
 			from browser_use.browser.events import BrowserStopEvent
@@ -1220,24 +1328,47 @@ class BrowserUseServer:
 			await event
 			self.browser_session = None
 			self.tools = None
-			return ToolExecutionResult(success=True, message='Browser closed', tool_name='close_browser')
-		return ToolExecutionResult(success=True, message='No browser session to close', tool_name='close_browser')
+			return ResultAssembler.from_single_action(
+				tool_name='close_browser',
+				message='Browser closed',
+				entry_point='mcp_tool',
+			)
+		return ResultAssembler.from_single_action(
+			tool_name='close_browser',
+			message='No browser session to close',
+			entry_point='mcp_tool',
+		)
 
-	async def _list_tabs(self) -> ToolExecutionResult:
+	async def _list_tabs(self) -> RuntimeExecutionResult:
 		"""List all open tabs."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='list_tabs')
+			return ResultAssembler.from_single_action(
+				tool_name='list_tabs',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		tabs_info = await self.browser_session.get_tabs()
 		tabs = []
 		for i, tab in enumerate(tabs_info):
 			tabs.append({'tab_id': tab.target_id[-4:], 'url': tab.url, 'title': tab.title or ''})
-		return ToolExecutionResult(success=True, message=f'{len(tabs)} tab(s) open', tool_name='list_tabs', data={'tabs': tabs})
+		return ResultAssembler.from_single_action(
+			tool_name='list_tabs',
+			message=f'{len(tabs)} tab(s) open',
+			data={'tabs': tabs},
+			entry_point='mcp_tool',
+		)
 
-	async def _switch_tab(self, tab_id: str) -> ToolExecutionResult:
+	async def _switch_tab(self, tab_id: str) -> RuntimeExecutionResult:
 		"""Switch to a different tab."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='switch_tab')
+			return ResultAssembler.from_single_action(
+				tool_name='switch_tab',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		from browser_use.browser.events import SwitchTabEvent
 
@@ -1245,18 +1376,23 @@ class BrowserUseServer:
 		event = self.browser_session.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
 		await event
 		state = await self.browser_session.get_browser_state_summary()
-		return ToolExecutionResult(
-			success=True,
-			message=f'Switched to tab {tab_id}: {state.url}',
+		return ResultAssembler.from_single_action(
 			tool_name='switch_tab',
+			message=f'Switched to tab {tab_id}: {state.url}',
 			data={'tab_id': tab_id, 'url': state.url},
 			url=state.url,
+			entry_point='mcp_tool',
 		)
 
-	async def _close_tab(self, tab_id: str) -> ToolExecutionResult:
+	async def _close_tab(self, tab_id: str) -> RuntimeExecutionResult:
 		"""Close a specific tab."""
 		if not self.browser_session:
-			return ToolExecutionResult(success=False, error='No browser session active', tool_name='close_tab')
+			return ResultAssembler.from_single_action(
+				tool_name='close_tab',
+				message='No browser session active',
+				error='No browser session active',
+				entry_point='mcp_tool',
+			)
 
 		from browser_use.browser.events import CloseTabEvent
 
@@ -1264,12 +1400,12 @@ class BrowserUseServer:
 		event = self.browser_session.event_bus.dispatch(CloseTabEvent(target_id=target_id))
 		await event
 		current_url = await self.browser_session.get_current_page_url()
-		return ToolExecutionResult(
-			success=True,
-			message=f'Closed tab # {tab_id}, now on {current_url}',
+		return ResultAssembler.from_single_action(
 			tool_name='close_tab',
+			message=f'Closed tab # {tab_id}, now on {current_url}',
 			data={'tab_id': tab_id, 'current_url': current_url},
 			url=current_url,
+			entry_point='mcp_tool',
 		)
 
 	def _track_session(self, session: BrowserSession) -> None:

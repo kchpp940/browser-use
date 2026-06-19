@@ -16,6 +16,8 @@ import signal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from browser_use.agent.views import RuntimeExecutionResult
+
 if TYPE_CHECKING:
 	from browser_use.skill_cli.sessions import SessionInfo
 
@@ -319,12 +321,14 @@ class Daemon:
 			else:
 				return {'id': req_id, 'success': False, 'error': f'Unknown action: {action}'}
 
-			# When the handler embeds a ``_structured`` key (ToolExecutionResult),
-			# pass it through unchanged in the data dict for downstream consumers.
-			if isinstance(result, dict) and '_structured' in result:
-				return {'id': req_id, 'success': True, 'data': result}
+			# Convert RuntimeExecutionResult to daemon response dict
+			if isinstance(result, RuntimeExecutionResult):
+				response = result.to_daemon_response(req_id)
+			else:
+				# Fallback for other handlers
+				response = {'id': req_id, 'success': True, 'data': result}
 
-			return {'id': req_id, 'success': True, 'data': result}
+			return response
 
 		except Exception as e:
 			logger.exception(f'Error dispatching {action}: {e}')

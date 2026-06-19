@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from browser_use.agent.views import ToolExecutionResult
+from browser_use.agent.views import ResultAssembler, RuntimeExecutionResult
 from browser_use.skill_cli.sessions import SessionInfo
 
 logger = logging.getLogger(__name__)
@@ -36,19 +36,17 @@ COMMANDS = {
 }
 
 
-def _wrap_result(action: str, result: dict[str, Any]) -> dict[str, Any]:
-	"""Wrap a command result dict with a ToolExecutionResult under ``_structured``."""
+def _wrap_result(action: str, result: dict[str, Any]) -> RuntimeExecutionResult:
+	"""Wrap a command result with RuntimeExecutionResult via ResultAssembler."""
 	error = result.get('error')
-	ter = ToolExecutionResult(
+	return ResultAssembler.from_single_action(
 		tool_name=action,
-		success=error is None,
-		message=str(error) if error else '',
+		message=str(result.get('error')) if error else '',
 		data={k: v for k, v in result.items() if k != 'error'},
-		error=str(error) if error else None,
+		error=str(result.get('error')) if error else None,
 		url=result.get('url'),
+		entry_point='skill_cli',
 	)
-	result['_structured'] = ter.model_dump(exclude={'data'})
-	return result
 
 
 async def _execute_js(session: SessionInfo, js: str) -> Any:
