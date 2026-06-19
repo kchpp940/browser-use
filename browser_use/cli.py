@@ -112,6 +112,9 @@ if '--template' in sys.argv:
 		template_file = INIT_TEMPLATES[template]['file']
 		template_path = templates_dir / template_file
 		content = template_path.read_text(encoding='utf-8')
+		# Upgrade to modern structured result API before writing
+		from browser_use.init_cmd import _upgrade_template_content
+		content = _upgrade_template_content(content, output_path.name)
 
 		# Write file with safety checks
 		if output_path.exists() and not force:
@@ -2244,6 +2247,9 @@ def _run_template_generation(template: str, output: str | None, force: bool):
 		template_file = INIT_TEMPLATES[template]['file']
 		template_path = templates_dir / template_file
 		content = template_path.read_text(encoding='utf-8')
+		# Upgrade to modern structured result API before writing
+		from browser_use.init_cmd import _upgrade_template_content
+		content = _upgrade_template_content(content, output_path.name)
 	except Exception as e:
 		click.echo(f'❌ Error reading template: {e}', err=True)
 		sys.exit(1)
@@ -2373,6 +2379,9 @@ def init(
 		template_file = INIT_TEMPLATES[template]['file']
 		template_path = templates_dir / template_file
 		content = template_path.read_text(encoding='utf-8')
+		# Upgrade to modern structured result API before writing
+		from browser_use.init_cmd import _upgrade_template_content
+		content = _upgrade_template_content(content, output_path.name)
 	except Exception as e:
 		click.echo(f'❌ Error reading template: {e}', err=True)
 		sys.exit(1)
