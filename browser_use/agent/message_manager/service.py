@@ -6,6 +6,7 @@ from typing import Literal
 from browser_use.agent.message_manager.views import (
 	HistoryItem,
 )
+from browser_use.agent.prompt_context import PromptContextBuilder
 from browser_use.agent.prompts import AgentMessagePrompt
 from browser_use.agent.views import (
 	ActionResult,
@@ -142,9 +143,27 @@ class MessageManager:
 		self.sensitive_data = sensitive_data
 		self.last_input_messages = []
 		self.last_state_message_text: str | None = None
+		self.current_prompt: AgentMessagePrompt | None = None
 		# Only initialize messages if state is empty
 		if len(self.state.history.get_messages()) == 0:
 			self._set_message_with_type(self.system_prompt, 'system')
+
+	@property
+	def prompt_builder(self) -> PromptContextBuilder | None:
+		"""Access the PromptContextBuilder from the current (last-created) state prompt."""
+		if self.current_prompt is not None:
+			return self.current_prompt.builder
+		return None
+
+	def enable_prompt_section(self, section_name: str) -> None:
+		"""Enable a prompt section by name."""
+		if self.prompt_builder is not None:
+			self.prompt_builder.enable_section(section_name)
+
+	def disable_prompt_section(self, section_name: str) -> None:
+		"""Disable a prompt section by name."""
+		if self.prompt_builder is not None:
+			self.prompt_builder.disable_section(section_name)
 
 	@property
 	def agent_history_description(self) -> str:
@@ -476,7 +495,7 @@ class MessageManager:
 
 		# Create single state message with all content
 		assert browser_state_summary
-		state_message = AgentMessagePrompt(
+		self.current_prompt = AgentMessagePrompt(
 			browser_state_summary=browser_state_summary,
 			file_system=self.file_system,
 			agent_history_description=self.agent_history_description,
@@ -496,7 +515,8 @@ class MessageManager:
 			llm_screenshot_size=self.llm_screenshot_size,
 			unavailable_skills_info=unavailable_skills_info,
 			plan_description=plan_description,
-		).get_user_message(effective_use_vision)
+		)
+		state_message = self.current_prompt.get_user_message(effective_use_vision)
 
 		# Store state message text for history
 		self.last_state_message_text = state_message.text

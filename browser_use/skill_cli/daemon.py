@@ -16,8 +16,6 @@ import signal
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from browser_use.agent.views import RuntimeExecutionResult
-
 if TYPE_CHECKING:
 	from browser_use.skill_cli.sessions import SessionInfo
 
@@ -321,14 +319,7 @@ class Daemon:
 			else:
 				return {'id': req_id, 'success': False, 'error': f'Unknown action: {action}'}
 
-			# Convert RuntimeExecutionResult to daemon response dict
-			if isinstance(result, RuntimeExecutionResult):
-				response = result.to_daemon_response(req_id)
-			else:
-				# Fallback for other handlers
-				response = {'id': req_id, 'success': True, 'data': result}
-
-			return response
+			return {'id': req_id, 'success': True, 'data': result}
 
 		except Exception as e:
 			logger.exception(f'Error dispatching {action}: {e}')

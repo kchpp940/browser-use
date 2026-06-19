@@ -59,8 +59,6 @@ from browser_use.agent.views import (
 	JudgementResult,
 	MessageCompactionSettings,
 	PlanItem,
-	ResultAssembler,
-	RuntimeExecutionResult,
 	StepMetadata,
 )
 from browser_use.browser.events import _get_timeout
@@ -2497,46 +2495,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		on_step_start: AgentHookFunc | None = None,
 		on_step_end: AgentHookFunc | None = None,
 	) -> AgentHistoryList[AgentStructuredOutput]:
-		"""Execute the task with maximum number of steps.
-
-		Returns AgentHistoryList for backwards compatibility.
-		Use run_with_result() to get a unified RuntimeExecutionResult.
-		"""
-
-		await self.run_with_result(
-			max_steps=max_steps,
-			on_step_start=on_step_start,
-			on_step_end=on_step_end,
-		)
-		return self.history
-
-	@observe(name='agent.run_with_result', ignore_input=True, ignore_output=True)
-	@time_execution_async('--run_with_result')
-	async def run_with_result(
-		self,
-		max_steps: int = 500,
-		on_step_start: AgentHookFunc | None = None,
-		on_step_end: AgentHookFunc | None = None,
-	) -> RuntimeExecutionResult[AgentStructuredOutput]:
-		"""Execute the task and return a unified RuntimeExecutionResult.
-
-		This is the recommended entry point for programmatic callers (MCP, SDKs,
-		task templates, skill_cli). The returned object carries:
-		  - status (success / partial_success / failed / cancelled / max_steps_exceeded)
-		  - final_text and optionally structured_output
-		  - output_files, visited_urls, screenshot_paths
-		  - step_errors, fatal error, consecutive_failures
-		  - token_usage, per-step details
-
-		CLI consumers can call result.to_human_readable() for pretty output.
-		"""
+		"""Execute the task with maximum number of steps"""
 
 		loop = asyncio.get_event_loop()
 		agent_run_error: str | None = None  # Initialize error tracking variable
 		self._force_exit_telemetry_logged = False  # ADDED: Flag for custom telemetry on force exit
 		should_delay_close = False
-		generated_gif_path: str | None = None
-		run_start_time = time.time()
 
 		# Set up the  signal handler with callbacks specific to this agent
 		from browser_use.utils import SignalHandler
@@ -2682,8 +2646,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			if self.history._output_model_schema is None and self.output_model_schema is not None:
 				self.history._output_model_schema = self.output_model_schema
 
-			# NOTE: Do NOT return here. Continue to the finally block and then
-			#       proceed to ResultAssembler so we return RuntimeExecutionResult.
+			return self.history
 
 		except KeyboardInterrupt:
 			# Already handled by our signal handler, but catch any direct KeyboardInterrupt as well
@@ -2692,9 +2655,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 			self.history.usage = await self.token_cost_service.get_usage_summary()
 
+			return self.history
+
 		except Exception as e:
 			self.logger.error(f'Agent run failed with exception: {e}', exc_info=True)
 			agent_run_error = str(e)
+			raise e
 
 		finally:
 			if should_delay_close and self._demo_mode_enabled and agent_run_error is None:
@@ -2736,7 +2702,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 				# Only emit output file event if GIF was actually created
 				if Path(output_path).exists():
-					generated_gif_path = output_path
 					output_event = await CreateAgentOutputFileEvent.from_agent_and_file(self, output_path)
 					self.eventbus.dispatch(output_event)
 
@@ -2748,56 +2713,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			await self.eventbus.stop(clear=True, timeout=_get_timeout('TIMEOUT_AgentEventBusStop', 3.0))
 
 			await self.close()
-
-		# ── Assemble unified RuntimeExecutionResult ──────────────────────────
-		run_end_time = time.time()
-		total_duration = run_end_time - run_start_time
-
-		model_name = getattr(self.llm, 'model', 'unknown') if self.llm else 'unknown'
-
-		assembler = (
-			ResultAssembler(task_id=self.task_id, task=self.task)
-			.from_history(self.history)
-			.with_max_steps(max_steps)
-			.with_total_duration(total_duration)
-			.with_fatal_error(agent_run_error)
-			.with_entry_point('agent')
-			.with_output_model_schema(self.output_model_schema)
-			.with_metadata(
-				model_name=model_name,
-				provider=getattr(self.llm, 'provider', 'unknown') if self.llm else 'unknown',
-			)
-		)
-		if generated_gif_path:
-			assembler.with_metadata(_generated_gif_path=generated_gif_path)
-		self._last_execution_result: RuntimeExecutionResult[AgentStructuredOutput] = assembler.assemble()
-
-		# Print human-readable summary via logger (structured object still returned)
-		try:
-			summary = self._last_execution_result.to_human_readable()
-			for line in summary.splitlines():
-				self.logger.info(line)
-		except Exception as _fmt_err:
-			self.logger.debug(f'Failed to format human-readable summary: {_fmt_err}')
-
-		# Dump RuntimeExecutionResult JSON to traces_dir if configured
-		try:
-			if self.browser_session and self.browser_session.browser_profile.traces_dir:
-				from pathlib import Path as _Path
-
-				traces_dir = _Path(self.browser_session.browser_profile.traces_dir).expanduser().resolve()
-				traces_dir.mkdir(parents=True, exist_ok=True)
-				trace_file = traces_dir / f'execution_result_{self.task_id}.json'
-				trace_file.write_text(self._last_execution_result.model_dump_json(indent=2), encoding='utf-8')
-				self.logger.debug(f'📊 Execution result trace written to {trace_file}')
-		except Exception as _trace_err:
-			self.logger.debug(f'Failed to write execution result trace: {_trace_err}')
-
-		# If an unhandled exception occurred (agent_run_error set in except block
-		# but not KeyboardInterrupt / graceful max-failures / etc.), re-raise so
-		# callers that rely on exception propagation still get it — but only
-		# AFTER assembling and logging the result.
-		return self._last_execution_result
 
 	@observe_debug(ignore_input=True, ignore_output=True)
 	@time_execution_async('--multi_act')

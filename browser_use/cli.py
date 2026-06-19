@@ -112,9 +112,6 @@ if '--template' in sys.argv:
 		template_file = INIT_TEMPLATES[template]['file']
 		template_path = templates_dir / template_file
 		content = template_path.read_text(encoding='utf-8')
-		# Upgrade to modern structured result API before writing
-		from browser_use.init_cmd import _upgrade_template_content
-		content = _upgrade_template_content(content, output_path.name)
 
 		# Write file with safety checks
 		if output_path.exists() and not force:
@@ -147,7 +144,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 from dotenv import load_dotenv
 
@@ -158,7 +155,7 @@ from browser_use.llm.openai.chat import ChatOpenAI
 load_dotenv()
 
 from browser_use import Agent, Controller
-from browser_use.agent.views import AgentSettings, ResultSerializer, RuntimeExecutionResult
+from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
@@ -1049,10 +1046,7 @@ class BrowserUseApp(App):
 
 				# Run the agent task, redirecting output to RichLog through our handler
 				if self.agent:
-					result: RuntimeExecutionResult = await self.agent.run_with_result()
-					# Log the structured result at RESULT level for display
-					if os.environ.get('BROWSER_USE_LOGGING_LEVEL', 'result').lower() == 'result':
-						logger.info(result.to_human_readable())
+					await self.agent.run()
 			except Exception as e:
 				error_msg = str(e)
 				logger.error('\nError running agent: %s', str(e))
@@ -1491,12 +1485,7 @@ class BrowserUseApp(App):
 		tasks_panel.scroll_end(animate=False)
 
 
-async def run_prompt_mode(
-	prompt: str,
-	ctx: click.Context,
-	debug: bool = False,
-	output_mode: Literal['text', 'json', 'json_pretty', 'both'] = 'text',
-):
+async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 	"""Run browser-use in non-interactive mode with a single prompt."""
 	# Import and call setup_logging to ensure proper initialization
 	from browser_use.logging_config import setup_logging
@@ -1556,8 +1545,7 @@ async def run_prompt_mode(
 			**agent_settings.model_dump(),
 		)
 
-		result: RuntimeExecutionResult = await agent.run_with_result()
-		serializer = ResultSerializer(result)
+		await agent.run()
 
 		# Ensure the browser session is fully stopped
 		# The agent's close() method only kills the browser if keep_alive=False,
@@ -1569,16 +1557,6 @@ async def run_prompt_mode(
 			except Exception:
 				# Ignore errors during cleanup
 				pass
-
-		# Produce output based on selected mode — ALWAYS emit structured result
-		# so that shell pipelines (e.g. `uvx browser-use -p "..." --json | jq`) work reliably
-		try:
-			output_text = serializer.output(mode=output_mode)
-			print(output_text)
-		except Exception as _out_err:
-			# Never let serialization errors swallow the actual task result
-			print(f'[Output serialization failed: {_out_err}]')
-			print(f'[Status: {result.status}, Steps: {result.steps_completed}/{result.max_steps}]')
 
 		# Capture telemetry for successful completion
 		telemetry.capture(
@@ -2033,8 +2011,6 @@ async def run_auth_command():
 @click.option('--proxy-username', type=str, help='Proxy auth username')
 @click.option('--proxy-password', type=str, help='Proxy auth password')
 @click.option('-p', '--prompt', type=str, help='Run a single task without the TUI (headless mode)')
-@click.option('--json', 'json_output', is_flag=True, help='Output result as RuntimeExecutionResult JSON (with --prompt)')
-@click.option('--json-pretty', 'json_pretty_output', is_flag=True, help='Output result as indented RuntimeExecutionResult JSON (with --prompt)')
 @click.option('--mcp', is_flag=True, help='Run as MCP server (exposes JSON RPC via stdin/stdout)')
 @click.pass_context
 def main(ctx: click.Context, debug: bool = False, **kwargs):
@@ -2091,15 +2067,8 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 	if kwargs.get('prompt'):
 		# Set environment variable for prompt mode before running
 		os.environ['BROWSER_USE_LOGGING_LEVEL'] = 'result'
-		# Resolve output mode
-		if kwargs.get('json_pretty_output'):
-			mode = 'json_pretty'
-		elif kwargs.get('json_output'):
-			mode = 'json'
-		else:
-			mode = 'text'
 		# Run in non-interactive mode
-		asyncio.run(run_prompt_mode(kwargs['prompt'], ctx, debug, output_mode=mode))
+		asyncio.run(run_prompt_mode(kwargs['prompt'], ctx, debug))
 		return
 
 	# Configure console logging
@@ -2247,9 +2216,6 @@ def _run_template_generation(template: str, output: str | None, force: bool):
 		template_file = INIT_TEMPLATES[template]['file']
 		template_path = templates_dir / template_file
 		content = template_path.read_text(encoding='utf-8')
-		# Upgrade to modern structured result API before writing
-		from browser_use.init_cmd import _upgrade_template_content
-		content = _upgrade_template_content(content, output_path.name)
 	except Exception as e:
 		click.echo(f'❌ Error reading template: {e}', err=True)
 		sys.exit(1)
@@ -2379,9 +2345,6 @@ def init(
 		template_file = INIT_TEMPLATES[template]['file']
 		template_path = templates_dir / template_file
 		content = template_path.read_text(encoding='utf-8')
-		# Upgrade to modern structured result API before writing
-		from browser_use.init_cmd import _upgrade_template_content
-		content = _upgrade_template_content(content, output_path.name)
 	except Exception as e:
 		click.echo(f'❌ Error reading template: {e}', err=True)
 		sys.exit(1)

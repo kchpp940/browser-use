@@ -6,7 +6,6 @@ browser-use templates without requiring heavy TUI dependencies.
 """
 
 import json
-import re
 import shutil
 import sys
 from pathlib import Path
@@ -166,176 +165,6 @@ def _format_choice(name: str, metadata: dict[str, Any], width: int, is_default: 
 	else:
 		# Narrow: show name only
 		return name
-
-
-def _upgrade_template_content(content: str, file_name: str = 'main.py') -> str:
-	"""Upgrade template content to use run_with_result() + ResultSerializer.
-
-	This function ensures that any template downloaded from GitHub, even
-	older ones that use agent.run() or agent.run_sync(), will be upgraded
-	to the modern structured result API before being written to disk.
-
-	Upgrade rules:
-	1. If content already contains 'run_with_result', return as-is (already modern)
-	2. Add 'ResultSerializer' to the browser_use import line
-	3. For scripts using agent.run_sync() at top level, wrap in async main()
-	4. Replace agent.run() / agent.run_sync() with run_with_result() + ResultSerializer
-	5. Ensure ResultSerializer import is present
-	"""
-	# Already modern — skip
-	if 'run_with_result' in content:
-		return content
-
-	lines = content.split('\n')
-	out_lines: list[str] = []
-	in_async_main = False
-	has_async_main = False
-	has_agent_run_sync = False
-	seen_run_call = False
-
-	# First pass: detect patterns
-	for line in lines:
-		if 'async def main()' in line:
-			has_async_main = True
-		if 'agent.run_sync()' in line or '.run_sync()' in line:
-			has_agent_run_sync = True
-
-	# Build ResultSerializer import line
-	def _fix_import_line(line: str) -> str:
-		"""Add ResultSerializer to the browser_use import if not present."""
-		if 'from browser_use import' not in line:
-			return line
-		if 'ResultSerializer' in line:
-			return line
-		# Has a multi-line import — inject before the closing )
-		if line.rstrip().endswith('('):
-			return line
-		# Single line: from browser_use import X, Y
-		# Split and add ResultSerializer
-		match = re.match(r'^(from browser_use import\s+)(.*?)(\s*#.*)?$', line)
-		if match:
-			prefix, imports, comment = match.groups()
-			imports = imports.strip()
-			if imports.endswith(','):
-				new_imports = f'{imports} ResultSerializer'
-			else:
-				new_imports = f'{imports}, ResultSerializer'
-			comment = comment or ''
-			return f'{prefix}{new_imports}{comment}'
-		return line
-
-	def _replace_run_call(line: str) -> str:
-		"""Replace agent.run() or agent.run_sync() with run_with_result() + ResultSerializer output."""
-		# Top-level sync run_sync(): replace with asyncio.run(main()) and create async main
-		run_pattern = re.compile(r'^(\s*)([\w\.]+)\.(run|run_sync)\(\s*\)\s*$')
-		match = run_pattern.match(line.rstrip())
-		if match:
-			indent, agent_var, _run_type = match.groups()
-			# Return the modern pattern: run_with_result() + ResultSerializer
-			return (
-				f'{indent}result = await {agent_var}.run_with_result()\n'
-				f'{indent}serializer = ResultSerializer(result)\n'
-				f'{indent}print(serializer.to_text())'
-			)
-		# run() with kwargs (e.g., agent.run(max_steps=100))
-		run_kwargs_pattern = re.compile(r'^(\s*)([\w\.]+)\.(run|run_sync)\((.*)\)\s*$')
-		match = run_kwargs_pattern.match(line.rstrip())
-		if match:
-			indent, agent_var, _run_type, kwargs = match.groups()
-			return (
-				f'{indent}result = await {agent_var}.run_with_result({kwargs})\n'
-				f'{indent}serializer = ResultSerializer(result)\n'
-				f'{indent}print(serializer.to_text())'
-			)
-		# await agent.run() pattern
-		await_pattern = re.compile(r'^(\s*)await\s+([\w\.]+)\.(run|run_sync)\(\s*\)\s*$')
-		match = await_pattern.match(line.rstrip())
-		if match:
-			indent, agent_var, _run_type = match.groups()
-			return (
-				f'{indent}result = await {agent_var}.run_with_result()\n'
-				f'{indent}serializer = ResultSerializer(result)\n'
-				f'{indent}print(serializer.to_text())'
-			)
-		# await agent.run(...) with kwargs
-		await_kwargs_pattern = re.compile(r'^(\s*)await\s+([\w\.]+)\.(run|run_sync)\((.*)\)\s*$')
-		match = await_kwargs_pattern.match(line.rstrip())
-		if match:
-			indent, agent_var, _run_type, kwargs = match.groups()
-			return (
-				f'{indent}result = await {agent_var}.run_with_result({kwargs})\n'
-				f'{indent}serializer = ResultSerializer(result)\n'
-				f'{indent}print(serializer.to_text())'
-			)
-		return line
-
-	i = 0
-	added_asyncio_import = False
-	added_asyncio_run = False
-	has_asyncio_import = 'import asyncio' in content or 'from asyncio import' in content
-	result_lines: list[str] = []
-
-	while i < len(lines):
-		line = lines[i]
-
-		# 1. Fix imports: add ResultSerializer, add asyncio import if needed
-		fixed_line = _fix_import_line(line)
-		if 'from browser_use import' in line and 'ResultSerializer' in fixed_line and 'ResultSerializer' not in line:
-			line = fixed_line
-
-		# Add asyncio import if script uses run_sync() and doesn't have one
-		if not added_asyncio_import and has_agent_run_sync and not has_asyncio_import:
-			if line.strip().startswith('from dotenv import load_dotenv') or line.strip().startswith('import dotenv'):
-				result_lines.append(line)
-				result_lines.append('import asyncio')
-				i += 1
-				added_asyncio_import = True
-				continue
-
-		# 2. For scripts with agent.run_sync() but no async main, wrap in async main
-		if has_agent_run_sync and not has_async_main and not in_async_main:
-			run_match = re.match(r'^(\s*)([\w\.]+)\.(run|run_sync)\(\s*\)\s*$', line.rstrip())
-			run_kwargs_match = re.match(r'^(\s*)([\w\.]+)\.(run|run_sync)\((.*)\)\s*$', line.rstrip())
-			if run_match or run_kwargs_match:
-				# Create async main wrapper before this call
-				result_lines.append('')
-				result_lines.append('async def main():')
-				in_async_main = True
-				# Replace the run call inside async main
-				replaced = _replace_run_call(f'    {line.lstrip()}')
-				for rl in replaced.split('\n'):
-					result_lines.append(rl)
-				added_asyncio_run = True
-				i += 1
-				continue
-
-		# 3. Replace run() calls with run_with_result() + ResultSerializer
-		if not seen_run_call and ('agent.run' in line or '.run_sync()' in line or 'await agent.run' in line):
-			replaced = _replace_run_call(line)
-			if replaced != line:
-				seen_run_call = True
-				for rl in replaced.split('\n'):
-					result_lines.append(rl)
-				i += 1
-				continue
-
-		result_lines.append(line)
-		i += 1
-
-	# 4. Add asyncio.run(main()) at end if we wrapped in async main
-	if added_asyncio_run:
-		# Append before any final comments/empty lines at EOF
-		# Remove trailing empty lines first
-		while result_lines and result_lines[-1].strip() == '':
-			result_lines.pop()
-		# Check if __main__ block exists
-		has_main_block = any("if __name__ == '__main__'" in line or 'if __name__ == "__main__"' in line for line in result_lines)
-		if not has_main_block:
-			result_lines.append('')
-			result_lines.append("if __name__ == '__main__':")
-			result_lines.append('    asyncio.run(main())')
-
-	return '\n'.join(result_lines)
 
 
 def _write_init_file(output_path: Path, content: str, force: bool = False) -> bool:
@@ -518,8 +347,6 @@ def main(
 	try:
 		template_file = INIT_TEMPLATES[template]['file']
 		content = _get_template_content(template_file)
-		# Upgrade to modern structured result API before writing
-		content = _upgrade_template_content(content, output_path.name)
 	except Exception as e:
 		console.print(f'[red]✗[/red] Error reading template: {e}')
 		sys.exit(1)
@@ -555,9 +382,6 @@ def main(
 							console.print(f'[yellow]⚠[/yellow]  Could not fetch [cyan]{dest_name}[/cyan] from GitHub')
 					else:
 						file_content = _get_template_content(source_path)
-						# Upgrade .py files to modern structured result API
-						if dest_name.endswith('.py'):
-							file_content = _upgrade_template_content(file_content, dest_name)
 						if _write_init_file(dest_path, file_content, force):
 							console.print(f'[green]✓[/green] Created [cyan]{dest_name}[/cyan]')
 							# Make executable if needed
