@@ -378,6 +378,10 @@ class StepExecutionContext(BaseModel):
 
 	Collects everything the step phases need so they don't reach
 	back into ``Agent.state`` or ``Agent.settings`` ad-hoc.
+
+	This is the single input object flowing through
+	``_prepare_context`` → ``_get_next_action`` → message-manager
+	calls → ``_finalize`` → ``_commit_step_result``.
 	"""
 
 	model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -386,6 +390,16 @@ class StepExecutionContext(BaseModel):
 	step_start_time: float
 	step_info: AgentStepInfo | None = None
 	browser_state_summary: BrowserStateSummary | None = None
+
+	# Populated by _prepare_context after browser state is ready
+	page_filtered_actions: str | None = None
+
+	# Snapshotted at the start of the step from the previous step's
+	# result. Message manager reads these to build the history
+	# description — kept here instead of on Agent.state so the
+	# step's read boundary is explicit.
+	last_model_output: AgentOutput | None = None
+	last_action_results: list[ActionResult] | None = None
 
 
 class StepExecutionResult(BaseModel):
