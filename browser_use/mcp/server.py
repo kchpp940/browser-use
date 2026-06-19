@@ -91,7 +91,7 @@ logging.disable(logging.CRITICAL)
 
 # Import browser_use modules
 from browser_use import ActionModel, Agent
-from browser_use.agent.views import AgentHistoryList, ResultAssembler, RuntimeExecutionResult
+from browser_use.agent.views import AgentHistoryList, ResultAssembler, RuntimeExecutionResult, ToolExecutionResult
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
@@ -484,10 +484,44 @@ class BrowserUseServer:
 					)
 				)
 
+	def _tool_result_to_mcp_contents(
+		self, result: ToolExecutionResult, screenshot_b64: str | None = None
+	) -> list[types.TextContent | types.ImageContent]:
+		"""Convert a ToolExecutionResult to MCP content list format.
+
+		      Pattern:
+		1) TextContent with the human-readable message
+		2) TextContent with ``--- STRUCTURED RESULT (JSON) ---`` + model_dump_json (when data/error present)
+		3) ImageContent for screenshot (optional)
+		"""
+		contents: list[types.TextContent | types.ImageContent] = []
+
+		# 1) Human-readable message
+		contents.append(
+			types.TextContent(type='text', text=result.message or ('Success' if result.success else f'Error: {result.error}'))
+		)
+
+		# 2) Structured JSON payload
+		if result.data or result.error or not result.success:
+			structured_json = result.model_dump_json(indent=2)
+			contents.append(types.TextContent(type='text', text=f'--- STRUCTURED RESULT (JSON) ---\n{structured_json}'))
+
+		# 3) Screenshot
+		if screenshot_b64:
+			contents.append(types.ImageContent(type='image', data=screenshot_b64, mimeType='image/png'))
+
+		return contents
+
 	async def _execute_tool(
 		self, tool_name: str, arguments: dict[str, Any]
 	) -> str | list[types.TextContent | types.ImageContent]:
-		"""Execute a browser-use tool. Returns str for most tools, or a content list for tools with image output."""
+		"""Execute a browser-use tool.
+
+		    Returns:
+		- ``list[types.TextContent | types.ImageContent]`` for browser control tools (via ToolExecutionResult conversion)
+		- ``str | list[...]`` for retry_with_browser_use_agent (unchanged)
+		- ``str`` for session management tools
+		"""
 
 		# Agent-based tools
 		if tool_name == 'retry_with_browser_use_agent':
@@ -515,11 +549,14 @@ class BrowserUseServer:
 			if not self.browser_session:
 				await self._init_browser_session()
 
+			result: ToolExecutionResult
+			screenshot_b64: str | None = None
+
 			if tool_name == 'browser_navigate':
-				return await self._navigate(arguments['url'], arguments.get('new_tab', False))
+				result = await self._navigate(arguments['url'], arguments.get('new_tab', False))
 
 			elif tool_name == 'browser_click':
-				return await self._click(
+				result = await self._click(
 					index=arguments.get('index'),
 					coordinate_x=arguments.get('coordinate_x'),
 					coordinate_y=arguments.get('coordinate_y'),
@@ -527,45 +564,42 @@ class BrowserUseServer:
 				)
 
 			elif tool_name == 'browser_type':
-				return await self._type_text(arguments['index'], arguments['text'])
+				result = await self._type_text(arguments['index'], arguments['text'])
 
 			elif tool_name == 'browser_get_state':
-				state_json, screenshot_b64 = await self._get_browser_state(arguments.get('include_screenshot', False))
-				content: list[types.TextContent | types.ImageContent] = [types.TextContent(type='text', text=state_json)]
-				if screenshot_b64:
-					content.append(types.ImageContent(type='image', data=screenshot_b64, mimeType='image/png'))
-				return content
+				result, screenshot_b64 = await self._get_browser_state(arguments.get('include_screenshot', False))
 
 			elif tool_name == 'browser_get_html':
-				return await self._get_html(arguments.get('selector'))
+				result = await self._get_html(arguments.get('selector'))
 
 			elif tool_name == 'browser_screenshot':
-				meta_json, screenshot_b64 = await self._screenshot(arguments.get('full_page', False))
-				content: list[types.TextContent | types.ImageContent] = [types.TextContent(type='text', text=meta_json)]
-				if screenshot_b64:
-					content.append(types.ImageContent(type='image', data=screenshot_b64, mimeType='image/png'))
-				return content
+				result, screenshot_b64 = await self._screenshot(arguments.get('full_page', False))
 
 			elif tool_name == 'browser_extract_content':
-				return await self._extract_content(arguments['query'], arguments.get('extract_links', False))
+				result = await self._extract_content(arguments['query'], arguments.get('extract_links', False))
 
 			elif tool_name == 'browser_scroll':
-				return await self._scroll(arguments.get('direction', 'down'))
+				result = await self._scroll(arguments.get('direction', 'down'))
 
 			elif tool_name == 'browser_go_back':
-				return await self._go_back()
+				result = await self._go_back()
 
 			elif tool_name == 'browser_close':
-				return await self._close_browser()
+				result = await self._close_browser()
 
 			elif tool_name == 'browser_list_tabs':
-				return await self._list_tabs()
+				result = await self._list_tabs()
 
 			elif tool_name == 'browser_switch_tab':
-				return await self._switch_tab(arguments['tab_id'])
+				result = await self._switch_tab(arguments['tab_id'])
 
 			elif tool_name == 'browser_close_tab':
-				return await self._close_tab(arguments['tab_id'])
+				result = await self._close_tab(arguments['tab_id'])
+
+			else:
+				return f'Unknown tool: {tool_name}'
+
+			return self._tool_result_to_mcp_contents(result, screenshot_b64)
 
 		return f'Unknown tool: {tool_name}'
 
@@ -798,10 +832,10 @@ class BrowserUseServer:
 			# Clean up
 			await agent.close()
 
-	async def _navigate(self, url: str, new_tab: bool = False) -> str:
+	async def _navigate(self, url: str, new_tab: bool = False) -> ToolExecutionResult:
 		"""Navigate to a URL."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='navigate')
 
 		# Update session activity
 		self._update_session_activity(self.browser_session.id)
@@ -811,11 +845,13 @@ class BrowserUseServer:
 		if new_tab:
 			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=True))
 			await event
-			return f'Opened new tab with URL: {url}'
+			return ToolExecutionResult(
+				success=True, message=f'Opened new tab with URL: {url}', tool_name='navigate', data={'url': url, 'new_tab': True}
+			)
 		else:
 			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url))
 			await event
-			return f'Navigated to: {url}'
+			return ToolExecutionResult(success=True, message=f'Navigated to: {url}', tool_name='navigate', data={'url': url})
 
 	async def _click(
 		self,
@@ -823,10 +859,10 @@ class BrowserUseServer:
 		coordinate_x: int | None = None,
 		coordinate_y: int | None = None,
 		new_tab: bool = False,
-	) -> str:
+	) -> ToolExecutionResult:
 		"""Click an element by index or at viewport coordinates."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='click')
 
 		# Update session activity
 		self._update_session_activity(self.browser_session.id)
@@ -839,16 +875,25 @@ class BrowserUseServer:
 				ClickCoordinateEvent(coordinate_x=coordinate_x, coordinate_y=coordinate_y)
 			)
 			await event
-			return f'Clicked at coordinates ({coordinate_x}, {coordinate_y})'
+			return ToolExecutionResult(
+				success=True,
+				message=f'Clicked at coordinates ({coordinate_x}, {coordinate_y})',
+				tool_name='click',
+				data={'coordinate_x': coordinate_x, 'coordinate_y': coordinate_y},
+			)
 
 		# Index-based clicking
 		if index is None:
-			return 'Error: Provide either index or both coordinate_x and coordinate_y'
+			return ToolExecutionResult(
+				success=False, error='Provide either index or both coordinate_x and coordinate_y', tool_name='click'
+			)
 
 		# Get the element
 		element = await self.browser_session.get_dom_element_by_index(index)
 		if not element:
-			return f'Element with index {index} not found'
+			return ToolExecutionResult(
+				success=False, error=f'Element with index {index} not found', tool_name='click', data={'index': index}
+			)
 
 		if new_tab:
 			# For links, extract href and open in new tab
@@ -871,30 +916,42 @@ class BrowserUseServer:
 
 				event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=full_url, new_tab=True))
 				await event
-				return f'Clicked element {index} and opened in new tab {full_url[:20]}...'
+				return ToolExecutionResult(
+					success=True,
+					message=f'Clicked element {index} and opened in new tab {full_url[:20]}...',
+					tool_name='click',
+					data={'index': index, 'url': full_url, 'new_tab': True},
+				)
 			else:
 				# For non-link elements, just do a normal click
 				from browser_use.browser.events import ClickElementEvent
 
 				event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
 				await event
-				return f'Clicked element {index} (new tab not supported for non-link elements)'
+				return ToolExecutionResult(
+					success=True,
+					message=f'Clicked element {index} (new tab not supported for non-link elements)',
+					tool_name='click',
+					data={'index': index},
+				)
 		else:
 			# Normal click
 			from browser_use.browser.events import ClickElementEvent
 
 			event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
 			await event
-			return f'Clicked element {index}'
+			return ToolExecutionResult(success=True, message=f'Clicked element {index}', tool_name='click', data={'index': index})
 
-	async def _type_text(self, index: int, text: str) -> str:
+	async def _type_text(self, index: int, text: str) -> ToolExecutionResult:
 		"""Type text into an element."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='type_text')
 
 		element = await self.browser_session.get_dom_element_by_index(index)
 		if not element:
-			return f'Element with index {index} not found'
+			return ToolExecutionResult(
+				success=False, error=f'Element with index {index} not found', tool_name='type_text', data={'index': index}
+			)
 
 		from browser_use.browser.events import TypeTextEvent
 
@@ -927,20 +984,35 @@ class BrowserUseServer:
 
 		if is_potentially_sensitive:
 			if sensitive_key_name:
-				return f'Typed <{sensitive_key_name}> into element {index}'
+				return ToolExecutionResult(
+					success=True,
+					message=f'Typed <{sensitive_key_name}> into element {index}',
+					tool_name='type_text',
+					data={'index': index, 'sensitive': True},
+				)
 			else:
-				return f'Typed <sensitive> into element {index}'
+				return ToolExecutionResult(
+					success=True,
+					message=f'Typed <sensitive> into element {index}',
+					tool_name='type_text',
+					data={'index': index, 'sensitive': True},
+				)
 		else:
-			return f"Typed '{text}' into element {index}"
+			return ToolExecutionResult(
+				success=True,
+				message=f"Typed '{text}' into element {index}",
+				tool_name='type_text',
+				data={'index': index, 'text': text},
+			)
 
-	async def _get_browser_state(self, include_screenshot: bool = False) -> tuple[str, str | None]:
-		"""Get current browser state. Returns (state_json, screenshot_b64 | None)."""
+	async def _get_browser_state(self, include_screenshot: bool = False) -> tuple[ToolExecutionResult, str | None]:
+		"""Get current browser state. Returns (ToolExecutionResult, screenshot_b64 | None)."""
 		if not self.browser_session:
-			return 'Error: No browser session active', None
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='get_state'), None
 
 		state = await self.browser_session.get_browser_state_summary()
 
-		result: dict[str, Any] = {
+		result_data: dict[str, Any] = {
 			'url': state.url,
 			'title': state.title,
 			'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
@@ -950,15 +1022,15 @@ class BrowserUseServer:
 		# Add viewport info so the LLM knows the coordinate space
 		if state.page_info:
 			pi = state.page_info
-			result['viewport'] = {
+			result_data['viewport'] = {
 				'width': pi.viewport_width,
 				'height': pi.viewport_height,
 			}
-			result['page'] = {
+			result_data['page'] = {
 				'width': pi.page_width,
 				'height': pi.page_height,
 			}
-			result['scroll'] = {
+			result_data['scroll'] = {
 				'x': pi.scroll_x,
 				'y': pi.scroll_y,
 			}
@@ -974,31 +1046,38 @@ class BrowserUseServer:
 				elem_info['placeholder'] = element.attributes['placeholder']
 			if element.attributes.get('href'):
 				elem_info['href'] = element.attributes['href']
-			result['interactive_elements'].append(elem_info)
+			result_data['interactive_elements'].append(elem_info)
 
 		# Return screenshot separately as ImageContent instead of embedding base64 in JSON
 		screenshot_b64 = None
 		if include_screenshot and state.screenshot:
 			screenshot_b64 = state.screenshot
-			# Include viewport dimensions in JSON so LLM can map pixels to coordinates
+			# Include viewport dimensions in data so LLM can map pixels to coordinates
 			if state.page_info:
-				result['screenshot_dimensions'] = {
+				result_data['screenshot_dimensions'] = {
 					'width': state.page_info.viewport_width,
 					'height': state.page_info.viewport_height,
 				}
 
-		return json.dumps(result, indent=2), screenshot_b64
+		tool_result = ToolExecutionResult(
+			success=True,
+			message=f'Browser state for {state.url}',
+			tool_name='get_state',
+			data=result_data,
+			url=state.url,
+		)
+		return tool_result, screenshot_b64
 
-	async def _get_html(self, selector: str | None = None) -> str:
+	async def _get_html(self, selector: str | None = None) -> ToolExecutionResult:
 		"""Get raw HTML of the page or a specific element."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='get_html')
 
 		self._update_session_activity(self.browser_session.id)
 
 		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=None, focus=False)
 		if not cdp_session:
-			return 'Error: No active CDP session'
+			return ToolExecutionResult(success=False, error='No active CDP session', tool_name='get_html')
 
 		if selector:
 			js = (
@@ -1013,13 +1092,16 @@ class BrowserUseServer:
 		)
 		html = result.get('result', {}).get('value')
 		if html is None:
-			return f'No element found for selector: {selector}' if selector else 'Error: Could not get page HTML'
-		return html
+			error_msg = f'No element found for selector: {selector}' if selector else 'Could not get page HTML'
+			return ToolExecutionResult(success=False, error=error_msg, tool_name='get_html', data={'selector': selector})
+		return ToolExecutionResult(
+			success=True, message='HTML retrieved', tool_name='get_html', data={'html': html, 'selector': selector}
+		)
 
-	async def _screenshot(self, full_page: bool = False) -> tuple[str, str | None]:
-		"""Take a screenshot. Returns (metadata_json, screenshot_b64 | None)."""
+	async def _screenshot(self, full_page: bool = False) -> tuple[ToolExecutionResult, str | None]:
+		"""Take a screenshot. Returns (ToolExecutionResult, screenshot_b64 | None)."""
 		if not self.browser_session:
-			return 'Error: No browser session active', None
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='screenshot'), None
 
 		import base64
 
@@ -1028,31 +1110,41 @@ class BrowserUseServer:
 		data = await self.browser_session.take_screenshot(full_page=full_page)
 		b64 = base64.b64encode(data).decode()
 
-		# Return screenshot separately as ImageContent instead of embedding base64 in JSON
+		# Build metadata for ToolExecutionResult
 		state = await self.browser_session.get_browser_state_summary()
-		result: dict[str, Any] = {
+		result_data: dict[str, Any] = {
 			'size_bytes': len(data),
 		}
 		if state.page_info:
-			result['viewport'] = {
+			result_data['viewport'] = {
 				'width': state.page_info.viewport_width,
 				'height': state.page_info.viewport_height,
 			}
-		return json.dumps(result), b64
 
-	async def _extract_content(self, query: str, extract_links: bool = False) -> str:
+		tool_result = ToolExecutionResult(
+			success=True,
+			message='Screenshot taken',
+			tool_name='screenshot',
+			data=result_data,
+			url=state.url,
+		)
+		return tool_result, b64
+
+	async def _extract_content(self, query: str, extract_links: bool = False) -> ToolExecutionResult:
 		"""Extract content from current page."""
 		if not self.llm:
-			return 'Error: LLM not initialized (set OPENAI_API_KEY)'
+			return ToolExecutionResult(
+				success=False, error='LLM not initialized (set OPENAI_API_KEY)', tool_name='extract_content'
+			)
 
 		if not self.file_system:
-			return 'Error: FileSystem not initialized'
+			return ToolExecutionResult(success=False, error='FileSystem not initialized', tool_name='extract_content')
 
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='extract_content')
 
 		if not self.tools:
-			return 'Error: Tools not initialized'
+			return ToolExecutionResult(success=False, error='Tools not initialized', tool_name='extract_content')
 
 		state = await self.browser_session.get_browser_state_summary()
 
@@ -1080,12 +1172,19 @@ class BrowserUseServer:
 			file_system=self.file_system,
 		)
 
-		return action_result.extracted_content or 'No content extracted'
+		content = action_result.extracted_content or 'No content extracted'
+		return ToolExecutionResult(
+			success=True,
+			message=content,
+			tool_name='extract_content',
+			data={'query': query, 'extract_links': extract_links, 'content': content},
+			url=state.url,
+		)
 
-	async def _scroll(self, direction: str = 'down') -> str:
+	async def _scroll(self, direction: str = 'down') -> ToolExecutionResult:
 		"""Scroll the page."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='scroll')
 
 		from browser_use.browser.events import ScrollEvent
 
@@ -1097,20 +1196,22 @@ class BrowserUseServer:
 			)
 		)
 		await event
-		return f'Scrolled {direction}'
+		return ToolExecutionResult(
+			success=True, message=f'Scrolled {direction}', tool_name='scroll', data={'direction': direction}
+		)
 
-	async def _go_back(self) -> str:
+	async def _go_back(self) -> ToolExecutionResult:
 		"""Go back in browser history."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='go_back')
 
 		from browser_use.browser.events import GoBackEvent
 
 		event = self.browser_session.event_bus.dispatch(GoBackEvent())
 		await event
-		return 'Navigated back'
+		return ToolExecutionResult(success=True, message='Navigated back', tool_name='go_back')
 
-	async def _close_browser(self) -> str:
+	async def _close_browser(self) -> ToolExecutionResult:
 		"""Close the browser session."""
 		if self.browser_session:
 			from browser_use.browser.events import BrowserStopEvent
@@ -1119,24 +1220,24 @@ class BrowserUseServer:
 			await event
 			self.browser_session = None
 			self.tools = None
-			return 'Browser closed'
-		return 'No browser session to close'
+			return ToolExecutionResult(success=True, message='Browser closed', tool_name='close_browser')
+		return ToolExecutionResult(success=True, message='No browser session to close', tool_name='close_browser')
 
-	async def _list_tabs(self) -> str:
+	async def _list_tabs(self) -> ToolExecutionResult:
 		"""List all open tabs."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='list_tabs')
 
 		tabs_info = await self.browser_session.get_tabs()
 		tabs = []
 		for i, tab in enumerate(tabs_info):
 			tabs.append({'tab_id': tab.target_id[-4:], 'url': tab.url, 'title': tab.title or ''})
-		return json.dumps(tabs, indent=2)
+		return ToolExecutionResult(success=True, message=f'{len(tabs)} tab(s) open', tool_name='list_tabs', data={'tabs': tabs})
 
-	async def _switch_tab(self, tab_id: str) -> str:
+	async def _switch_tab(self, tab_id: str) -> ToolExecutionResult:
 		"""Switch to a different tab."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='switch_tab')
 
 		from browser_use.browser.events import SwitchTabEvent
 
@@ -1144,12 +1245,18 @@ class BrowserUseServer:
 		event = self.browser_session.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
 		await event
 		state = await self.browser_session.get_browser_state_summary()
-		return f'Switched to tab {tab_id}: {state.url}'
+		return ToolExecutionResult(
+			success=True,
+			message=f'Switched to tab {tab_id}: {state.url}',
+			tool_name='switch_tab',
+			data={'tab_id': tab_id, 'url': state.url},
+			url=state.url,
+		)
 
-	async def _close_tab(self, tab_id: str) -> str:
+	async def _close_tab(self, tab_id: str) -> ToolExecutionResult:
 		"""Close a specific tab."""
 		if not self.browser_session:
-			return 'Error: No browser session active'
+			return ToolExecutionResult(success=False, error='No browser session active', tool_name='close_tab')
 
 		from browser_use.browser.events import CloseTabEvent
 
@@ -1157,7 +1264,13 @@ class BrowserUseServer:
 		event = self.browser_session.event_bus.dispatch(CloseTabEvent(target_id=target_id))
 		await event
 		current_url = await self.browser_session.get_current_page_url()
-		return f'Closed tab # {tab_id}, now on {current_url}'
+		return ToolExecutionResult(
+			success=True,
+			message=f'Closed tab # {tab_id}, now on {current_url}',
+			tool_name='close_tab',
+			data={'tab_id': tab_id, 'current_url': current_url},
+			url=current_url,
+		)
 
 	def _track_session(self, session: BrowserSession) -> None:
 		"""Track a browser session for management."""

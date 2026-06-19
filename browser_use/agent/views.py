@@ -1010,6 +1010,69 @@ TaskStatus = Literal[
 ]
 
 
+class ToolExecutionResult(BaseModel):
+	"""Lightweight structured result for single-step browser tool calls.
+
+	Used by MCP browser_* tools and skill_cli daemon commands.
+	Unlike RuntimeExecutionResult (which represents a full agent run),
+	this captures one atomic browser action with:
+	  - success/failure status
+	  - human-readable message (what happened)
+	  - structured data dict (machine-parseable details)
+	  - optional error information
+
+	Callers can use ``to_mcp_contents()`` to get the standard MCP
+	dual-format output (human-readable text + structured JSON).
+	"""
+
+	tool_name: str = Field(description='Name of the tool that was executed')
+	success: bool = Field(default=True, description='Whether the action succeeded')
+	message: str = Field(default='', description='Human-readable description of the outcome')
+	data: dict[str, Any] = Field(default_factory=dict, description='Structured key-value data for programmatic consumers')
+	error: str | None = Field(default=None, description='Error message if the action failed')
+	url: str | None = Field(default=None, description='Current URL after the action (if applicable)')
+	screenshot_path: str | None = Field(default=None, description='Path to screenshot if one was captured')
+	output_files: list[str] = Field(default_factory=list, description='Paths to files produced by this action')
+	duration_seconds: float | None = Field(default=None, description='How long the action took')
+
+	def to_mcp_contents(self) -> list[dict[str, Any]]:
+		"""Convert to MCP content dicts (text + optional structured JSON).
+
+		Returns a list of dicts with ``type`` and ``text`` keys.
+		The MCP server wrapper converts these to ``TextContent`` objects.
+		Format:
+		  1) Human-readable message
+		  2) ``--- STRUCTURED RESULT (JSON) ---`` header + full JSON  (only when data/error present)
+		"""
+		contents: list[dict[str, Any]] = []
+		contents.append({'type': 'text', 'text': self.message or ('Success' if self.success else f'Error: {self.error}')})
+
+		if self.data or self.error or not self.success:
+			structured_json = self.model_dump_json(indent=2)
+			contents.append(
+				{
+					'type': 'text',
+					'text': f'--- STRUCTURED RESULT (JSON) ---\n{structured_json}',
+				}
+			)
+		return contents
+
+	def to_daemon_response(self, req_id: str = '') -> dict:
+		"""Convert to daemon socket response dict.
+
+		Preserves backwards compatibility with existing ``{success, data, error}`` format
+		while embedding the full ToolExecutionResult as ``_structured`` in data.
+		"""
+		result_data: dict[str, Any] = dict(self.data)
+		result_data['_structured'] = self.model_dump(exclude={'data'})
+		return {
+			'id': req_id,
+			'success': self.success,
+			'data': result_data,
+			**({'error': self.error} if self.error else {}),
+		}
+
+
 class OutputFile(BaseModel):
 	"""Information about a file produced during execution."""
 

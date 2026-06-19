@@ -55,6 +55,7 @@ if TYPE_CHECKING:
 		ResultAssembler,
 		RuntimeExecutionResult,
 		StepExecutionResult,
+		ToolExecutionResult,
 	)
 	from browser_use.browser import BrowserProfile, BrowserSession
 	from browser_use.browser import BrowserSession as Browser
@@ -89,6 +90,7 @@ _LAZY_IMPORTS = {
 	'ResultAssembler': ('browser_use.agent.views', 'ResultAssembler'),
 	'StepExecutionResult': ('browser_use.agent.views', 'StepExecutionResult'),
 	'OutputFile': ('browser_use.agent.views', 'OutputFile'),
+	'ToolExecutionResult': ('browser_use.agent.views', 'ToolExecutionResult'),
 	'BrowserSession': ('browser_use.browser', 'BrowserSession'),
 	'Browser': ('browser_use.browser', 'BrowserSession'),  # Alias for BrowserSession
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
@@ -154,6 +156,7 @@ __all__ = [
 	'ResultAssembler',
 	'StepExecutionResult',
 	'OutputFile',
+	'ToolExecutionResult',
 	# Chat models
 	'ChatOpenAI',
 	'ChatGoogle',

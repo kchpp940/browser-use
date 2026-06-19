@@ -319,6 +319,11 @@ class Daemon:
 			else:
 				return {'id': req_id, 'success': False, 'error': f'Unknown action: {action}'}
 
+			# When the handler embeds a ``_structured`` key (ToolExecutionResult),
+			# pass it through unchanged in the data dict for downstream consumers.
+			if isinstance(result, dict) and '_structured' in result:
+				return {'id': req_id, 'success': True, 'data': result}
+
 			return {'id': req_id, 'success': True, 'data': result}
 
 		except Exception as e:

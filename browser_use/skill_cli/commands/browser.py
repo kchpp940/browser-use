@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from browser_use.agent.views import ToolExecutionResult
 from browser_use.skill_cli.sessions import SessionInfo
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,21 @@ COMMANDS = {
 	'get',
 	'record',
 }
+
+
+def _wrap_result(action: str, result: dict[str, Any]) -> dict[str, Any]:
+	"""Wrap a command result dict with a ToolExecutionResult under ``_structured``."""
+	error = result.get('error')
+	ter = ToolExecutionResult(
+		tool_name=action,
+		success=error is None,
+		message=str(error) if error else '',
+		data={k: v for k, v in result.items() if k != 'error'},
+		error=str(error) if error else None,
+		url=result.get('url'),
+	)
+	result['_structured'] = ter.model_dump(exclude={'data'})
+	return result
 
 
 async def _execute_js(session: SessionInfo, js: str) -> Any:
@@ -84,7 +100,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 	bs = session.browser_session
 	actions = session.actions
 	if actions is None:
-		return {'error': 'ActionHandler not initialized'}
+		return _wrap_result(action, {'error': 'ActionHandler not initialized'})
 
 	if action == 'open':
 		url = params['url']
@@ -96,54 +112,54 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			from urllib.parse import quote
 
 			result['live_url'] = f'https://live.browser-use.com/?wss={quote(bs.cdp_url, safe="")}'
-		return result
+		return _wrap_result(action, result)
 
 	elif action == 'click':
 		args = params.get('args', [])
 		if len(args) == 2:
 			x, y = args
 			await actions.click_coordinate(x, y)
-			return {'clicked_coordinate': {'x': x, 'y': y}}
+			return _wrap_result(action, {'clicked_coordinate': {'x': x, 'y': y}})
 		elif len(args) == 1:
 			index = args[0]
 			node = await bs.get_element_by_index(index)
 			if node is None:
-				return {'error': f'Element index {index} not found - page may have changed'}
+				return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 			await actions.click_element(node)
-			return {'clicked': index}
+			return _wrap_result(action, {'clicked': index})
 		else:
-			return {'error': 'Usage: click <index> or click <x> <y>'}
+			return _wrap_result(action, {'error': 'Usage: click <index> or click <x> <y>'})
 
 	elif action == 'type':
 		text = params['text']
 		cdp_session = await bs.get_or_create_cdp_session(target_id=None, focus=False)
 		if not cdp_session:
-			return {'error': 'No active browser session'}
+			return _wrap_result(action, {'error': 'No active browser session'})
 		await cdp_session.cdp_client.send.Input.insertText(
 			params={'text': text},
 			session_id=cdp_session.session_id,
 		)
-		return {'typed': text}
+		return _wrap_result(action, {'typed': text})
 
 	elif action == 'input':
 		index = params['index']
 		text = params['text']
 		node = await bs.get_element_by_index(index)
 		if node is None:
-			return {'error': f'Element index {index} not found - page may have changed'}
+			return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 		await actions.click_element(node)
 		await actions.type_text(node, text)
-		return {'input': text, 'element': index}
+		return _wrap_result(action, {'input': text, 'element': index})
 
 	elif action == 'scroll':
 		direction = params.get('direction', 'down')
 		amount = params.get('amount', 500)
 		await actions.scroll(direction, amount)
-		return {'scrolled': direction, 'amount': amount}
+		return _wrap_result(action, {'scrolled': direction, 'amount': amount})
 
 	elif action == 'back':
 		await actions.go_back()
-		return {'back': True}
+		return _wrap_result(action, {'back': True})
 
 	elif action == 'screenshot':
 		data = await bs.take_screenshot(full_page=params.get('full', False))
@@ -151,10 +167,9 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		if params.get('path'):
 			path = Path(params['path'])
 			path.write_bytes(data)
-			return {'saved': str(path), 'size': len(data)}
+			return _wrap_result(action, {'saved': str(path), 'size': len(data)})
 
-		# Return base64 encoded
-		return {'screenshot': base64.b64encode(data).decode(), 'size': len(data)}
+		return _wrap_result(action, {'screenshot': base64.b64encode(data).decode(), 'size': len(data)})
 
 	elif action == 'state':
 		state = await actions.get_state()
@@ -176,7 +191,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				state_text += f'  {msg}\n'
 			bs._closed_popup_messages.clear()
 
-		return {'_raw_text': state_text}
+		return _wrap_result(action, {'_raw_text': state_text})
 
 	elif action == 'tab':
 		tab_command = params.get('tab_command')
@@ -186,21 +201,21 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			lines = ['TAB  URL']
 			for i, t in enumerate(page_targets):
 				lines.append(f'{i:<4} {t.url}')
-			return {'_raw_text': '\n'.join(lines)}
+			return _wrap_result(action, {'_raw_text': '\n'.join(lines)})
 
 		elif tab_command == 'new':
 			url = params.get('url', 'about:blank')
 			target_id = await bs._cdp_create_new_page(url, background=True)
 			bs.agent_focus_target_id = target_id
-			return {'created': target_id[:8], 'url': url}
+			return _wrap_result(action, {'created': target_id[:8], 'url': url})
 
 		elif tab_command == 'switch':
 			tab_index = params['tab']
 			page_targets = bs.session_manager.get_all_page_targets() if bs.session_manager else []
 			if tab_index < 0 or tab_index >= len(page_targets):
-				return {'error': f'Invalid tab index {tab_index}. Available: 0-{len(page_targets) - 1}'}
+				return _wrap_result(action, {'error': f'Invalid tab index {tab_index}. Available: 0-{len(page_targets) - 1}'})
 			bs.agent_focus_target_id = page_targets[tab_index].target_id
-			return {'switched': tab_index}
+			return _wrap_result(action, {'switched': tab_index})
 
 		elif tab_command == 'close':
 			tab_indices = params.get('tabs', [])
@@ -218,9 +233,9 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				if not target_id:
 					target_id = bs.session_manager.get_focused_target().target_id if bs.session_manager else None
 				if not target_id:
-					return {'error': 'No focused tab to close'}
+					return _wrap_result(action, {'error': 'No focused tab to close'})
 				await _close_target(target_id)
-				return {'closed': [0]}
+				return _wrap_result(action, {'closed': [0]})
 
 			closed = []
 			errors = []
@@ -236,23 +251,23 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			result: dict[str, Any] = {'closed': closed}
 			if errors:
 				result['errors'] = errors
-			return result
+			return _wrap_result(action, result)
 
-		return {'error': 'Invalid tab command. Use: list, new, switch, close'}
+		return _wrap_result(action, {'error': 'Invalid tab command. Use: list, new, switch, close'})
 
 	elif action == 'keys':
 		keys = params['keys']
 		await actions.send_keys(keys)
-		return {'sent': keys}
+		return _wrap_result(action, {'sent': keys})
 
 	elif action == 'select':
 		index = params['index']
 		value = params['value']
 		node = await bs.get_element_by_index(index)
 		if node is None:
-			return {'error': f'Element index {index} not found - page may have changed'}
+			return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 		await actions.select_dropdown(node, value)
-		return {'selected': value, 'element': index}
+		return _wrap_result(action, {'selected': value, 'element': index})
 
 	elif action == 'upload':
 		index = params['index']
@@ -260,15 +275,15 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 
 		p = Path(file_path)
 		if not p.exists():
-			return {'error': f'File not found: {file_path}'}
+			return _wrap_result(action, {'error': f'File not found: {file_path}'})
 		if not p.is_file():
-			return {'error': f'Not a file: {file_path}'}
+			return _wrap_result(action, {'error': f'Not a file: {file_path}'})
 		if p.stat().st_size == 0:
-			return {'error': f'File is empty (0 bytes): {file_path}'}
+			return _wrap_result(action, {'error': f'File is empty (0 bytes): {file_path}'})
 
 		node = await bs.get_element_by_index(index)
 		if node is None:
-			return {'error': f'Element index {index} not found - page may have changed'}
+			return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 
 		file_input_node = bs.find_file_input_near_element(node)
 
@@ -279,32 +294,29 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				hint = f' File input(s) found at index: {", ".join(map(str, file_input_indices))}'
 			else:
 				hint = ' No file input found on the page.'
-			return {'error': f'Element {index} is not a file input.{hint}'}
+			return _wrap_result(action, {'error': f'Element {index} is not a file input.{hint}'})
 
 		await actions.upload_file(file_input_node, file_path)
-		return {'uploaded': file_path, 'element': index}
+		return _wrap_result(action, {'uploaded': file_path, 'element': index})
 
 	elif action == 'eval':
 		js = params['js']
-		# Execute JavaScript via CDP
 		result = await _execute_js(session, js)
-		return {'result': result}
+		return _wrap_result(action, {'result': result})
 
 	elif action == 'extract':
 		query = params['query']
-		# This requires LLM integration
-		# For now, return a placeholder
-		return {'query': query, 'error': 'extract is not yet implemented'}
+		return _wrap_result(action, {'query': query, 'error': 'extract is not yet implemented'})
 
 	elif action == 'hover':
 		index = params['index']
 		node = await bs.get_element_by_index(index)
 		if node is None:
-			return {'error': f'Element index {index} not found - page may have changed'}
+			return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 
 		coords = await _get_element_center(session, node)
 		if not coords:
-			return {'error': 'Could not get element coordinates for hover'}
+			return _wrap_result(action, {'error': 'Could not get element coordinates for hover'})
 
 		center_x, center_y = coords
 		cdp_session = await bs.cdp_client_for_node(node)
@@ -312,17 +324,17 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			params={'type': 'mouseMoved', 'x': center_x, 'y': center_y},
 			session_id=cdp_session.session_id,
 		)
-		return {'hovered': index}
+		return _wrap_result(action, {'hovered': index})
 
 	elif action == 'dblclick':
 		index = params['index']
 		node = await bs.get_element_by_index(index)
 		if node is None:
-			return {'error': f'Element index {index} not found - page may have changed'}
+			return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 
 		coords = await _get_element_center(session, node)
 		if not coords:
-			return {'error': 'Could not get element coordinates for double-click'}
+			return _wrap_result(action, {'error': 'Could not get element coordinates for double-click'})
 
 		center_x, center_y = coords
 		cdp_session = await bs.cdp_client_for_node(node)
@@ -358,17 +370,17 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			},
 			session_id=session_id,
 		)
-		return {'double_clicked': index}
+		return _wrap_result(action, {'double_clicked': index})
 
 	elif action == 'rightclick':
 		index = params['index']
 		node = await bs.get_element_by_index(index)
 		if node is None:
-			return {'error': f'Element index {index} not found - page may have changed'}
+			return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 
 		coords = await _get_element_center(session, node)
 		if not coords:
-			return {'error': 'Could not get element coordinates for right-click'}
+			return _wrap_result(action, {'error': 'Could not get element coordinates for right-click'})
 
 		center_x, center_y = coords
 		cdp_session = await bs.cdp_client_for_node(node)
@@ -404,7 +416,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			},
 			session_id=session_id,
 		)
-		return {'right_clicked': index}
+		return _wrap_result(action, {'right_clicked': index})
 
 	elif action == 'cookies':
 		cookies_command = params.get('cookies_command')
@@ -443,7 +455,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 					or str(c.get('domain', '')).lstrip('.').endswith(domain)
 				]
 
-			return {'cookies': cookie_list}
+			return _wrap_result(action, {'cookies': cookie_list})
 
 		elif cookies_command == 'set':
 			from cdp_use.cdp.network import Cookie
@@ -472,10 +484,10 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			try:
 				cookie_obj = Cookie(**cookie_dict)
 				await bs._cdp_set_cookies([cookie_obj])
-				return {'set': params['name'], 'success': True}
+				return _wrap_result(action, {'set': params['name'], 'success': True})
 			except Exception as e:
 				logger.error(f'Failed to set cookie: {e}')
-				return {'set': params['name'], 'success': False, 'error': str(e)}
+				return _wrap_result(action, {'set': params['name'], 'success': False, 'error': str(e)})
 
 		elif cookies_command == 'clear':
 			url = params.get('url')
@@ -504,7 +516,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				# Clear all cookies
 				await bs._cdp_clear_cookies()
 
-			return {'cleared': True, 'url': url}
+			return _wrap_result(action, {'cleared': True, 'url': url})
 
 		elif cookies_command == 'export':
 			import json
@@ -544,21 +556,21 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 
 			file_path = Path(params['file'])
 			file_path.write_text(json.dumps(cookie_list, indent=2, ensure_ascii=False), encoding='utf-8')
-			return {'exported': len(cookie_list), 'file': str(file_path)}
+			return _wrap_result(action, {'exported': len(cookie_list), 'file': str(file_path)})
 
 		elif cookies_command == 'import':
 			import json
 
 			file_path = Path(params['file'])
 			if not file_path.exists():
-				return {'error': f'File not found: {file_path}'}
+				return _wrap_result(action, {'error': f'File not found: {file_path}'})
 
 			cookies = json.loads(file_path.read_text())
 
 			# Get CDP session for bulk cookie setting
 			cdp_session = await bs.get_or_create_cdp_session(target_id=None, focus=False)
 			if not cdp_session:
-				return {'error': 'No active browser session'}
+				return _wrap_result(action, {'error': 'No active browser session'})
 
 			# Build cookie list for bulk set
 			cookie_list = []
@@ -583,11 +595,11 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 					params={'cookies': cookie_list},  # type: ignore[arg-type]
 					session_id=cdp_session.session_id,
 				)
-				return {'imported': len(cookie_list), 'file': str(file_path)}
+				return _wrap_result(action, {'imported': len(cookie_list), 'file': str(file_path)})
 			except Exception as e:
-				return {'error': f'Failed to import cookies: {e}'}
+				return _wrap_result(action, {'error': f'Failed to import cookies: {e}'})
 
-		return {'error': 'Invalid cookies command. Use: get, set, clear, export, import'}
+		return _wrap_result(action, {'error': 'Invalid cookies command. Use: get, set, clear, export, import'})
 
 	elif action == 'wait':
 		import json as json_module
@@ -640,12 +652,12 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 
 				result = await _execute_js(session, js)
 				if result:
-					return {'selector': selector, 'found': True}
+					return _wrap_result(action, {'selector': selector, 'found': True})
 
 				await asyncio.sleep(poll_interval)
 				elapsed += poll_interval
 
-			return {'selector': selector, 'found': False}
+			return _wrap_result(action, {'selector': selector, 'found': False})
 
 		elif wait_command == 'text':
 			import json as json_module
@@ -664,14 +676,14 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				"""
 				result = await _execute_js(session, js)
 				if result:
-					return {'text': text, 'found': True}
+					return _wrap_result(action, {'text': text, 'found': True})
 
 				await asyncio.sleep(poll_interval)
 				elapsed += poll_interval
 
-			return {'text': text, 'found': False}
+			return _wrap_result(action, {'text': text, 'found': False})
 
-		return {'error': 'Invalid wait command. Use: selector, text'}
+		return _wrap_result(action, {'error': 'Invalid wait command. Use: selector, text'})
 
 	elif action == 'get':
 		import json as json_module
@@ -680,7 +692,7 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 
 		if get_command == 'title':
 			title = await _execute_js(session, 'document.title')
-			return {'title': title or ''}
+			return _wrap_result(action, {'title': title or ''})
 
 		elif get_command == 'html':
 			selector = params.get('selector')
@@ -689,22 +701,21 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 			else:
 				js = 'document.documentElement.outerHTML'
 			html = await _execute_js(session, js)
-			return {'html': html or ''}
+			return _wrap_result(action, {'html': html or ''})
 
 		elif get_command == 'text':
 			index = params['index']
 			node = await bs.get_element_by_index(index)
 			if node is None:
-				return {'error': f'Element index {index} not found - page may have changed'}
-			# Use the node's text from our model
+				return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 			text = node.get_all_children_text(max_depth=10) if node else ''
-			return {'index': index, 'text': text}
+			return _wrap_result(action, {'index': index, 'text': text})
 
 		elif get_command == 'value':
 			index = params['index']
 			node = await bs.get_element_by_index(index)
 			if node is None:
-				return {'error': f'Element index {index} not found - page may have changed'}
+				return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 
 			try:
 				cdp_session = await bs.cdp_client_for_node(node)
@@ -724,27 +735,26 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 						session_id=cdp_session.session_id,
 					)
 					value = value_result.get('result', {}).get('value')
-					return {'index': index, 'value': value or ''}
+					return _wrap_result(action, {'index': index, 'value': value or ''})
 				else:
-					return {'index': index, 'value': ''}
+					return _wrap_result(action, {'index': index, 'value': ''})
 			except Exception as e:
 				logger.error(f'Failed to get element value: {e}')
-				return {'index': index, 'value': ''}
+				return _wrap_result(action, {'index': index, 'value': ''})
 
 		elif get_command == 'attributes':
 			index = params['index']
 			node = await bs.get_element_by_index(index)
 			if node is None:
-				return {'error': f'Element index {index} not found - page may have changed'}
-			# Use the attributes from the node model
+				return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 			attrs = node.attributes or {}
-			return {'index': index, 'attributes': dict(attrs)}
+			return _wrap_result(action, {'index': index, 'attributes': dict(attrs)})
 
 		elif get_command == 'bbox':
 			index = params['index']
 			node = await bs.get_element_by_index(index)
 			if node is None:
-				return {'error': f'Element index {index} not found - page may have changed'}
+				return _wrap_result(action, {'error': f'Element index {index} not found - page may have changed'})
 
 			try:
 				cdp_session = await bs.cdp_client_for_node(node)
@@ -757,19 +767,18 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 				content = model.get('content', [])  # type: ignore[union-attr]
 
 				if len(content) >= 8:
-					# content is [x1, y1, x2, y2, x3, y3, x4, y4] - corners of the quad
 					x = min(content[0], content[2], content[4], content[6])
 					y = min(content[1], content[3], content[5], content[7])
 					width = max(content[0], content[2], content[4], content[6]) - x
 					height = max(content[1], content[3], content[5], content[7]) - y
-					return {'index': index, 'bbox': {'x': x, 'y': y, 'width': width, 'height': height}}
+					return _wrap_result(action, {'index': index, 'bbox': {'x': x, 'y': y, 'width': width, 'height': height}})
 				else:
-					return {'index': index, 'bbox': {}}
+					return _wrap_result(action, {'index': index, 'bbox': {}})
 			except Exception as e:
 				logger.error(f'Failed to get element bbox: {e}')
-				return {'index': index, 'bbox': {}}
+				return _wrap_result(action, {'index': index, 'bbox': {}})
 
-		return {'error': 'Invalid get command. Use: title, html, text, value, attributes, bbox'}
+		return _wrap_result(action, {'error': 'Invalid get command. Use: title, html, text, value, attributes, bbox'})
 
 	elif action == 'record':
 		# CLIBrowserSession skips watchdogs by default — attach RecordingWatchdog lazily on first use.
@@ -787,42 +796,45 @@ async def handle(action: str, session: SessionInfo, params: dict[str, Any]) -> A
 		if record_command == 'start':
 			path = params.get('path')
 			if not path:
-				return {'error': 'Usage: record start <output-path>'}
+				return _wrap_result(action, {'error': 'Usage: record start <output-path>'})
 			if watchdog.is_recording:
-				return {'error': 'Recording already in progress. Call `record stop` first.'}
+				return _wrap_result(action, {'error': 'Recording already in progress. Call `record stop` first.'})
 
 			output_path = Path(path).expanduser()
 			try:
 				output_path.parent.mkdir(parents=True, exist_ok=True)
 			except OSError as e:
-				return {'error': f'Cannot create output directory {output_path.parent}: {e}'}
+				return _wrap_result(action, {'error': f'Cannot create output directory {output_path.parent}: {e}'})
 
 			framerate = params.get('framerate')
 			try:
 				saved = await watchdog.start_recording(output_path, framerate=framerate)
 			except RuntimeError as e:
-				return {'error': str(e)}
-			return {'recording': True, 'path': str(saved)}
+				return _wrap_result(action, {'error': str(e)})
+			return _wrap_result(action, {'recording': True, 'path': str(saved)})
 
 		elif record_command == 'stop':
 			if not watchdog.is_recording:
-				return {'error': 'No recording in progress'}
+				return _wrap_result(action, {'error': 'No recording in progress'})
 			saved = await watchdog.stop_recording()
 			if saved is None:
-				return {'error': 'No recording in progress'}
-			return {'_raw_text': str(saved)}
+				return _wrap_result(action, {'error': 'No recording in progress'})
+			return _wrap_result(action, {'_raw_text': str(saved)})
 
 		elif record_command == 'status':
 			recorder = watchdog._recorder
 			if recorder is None:
-				return {'recording': False}
-			return {
-				'recording': True,
-				'path': str(recorder.output_path),
-				'framerate': recorder.framerate,
-				'size': {'width': recorder.size['width'], 'height': recorder.size['height']},
-			}
+				return _wrap_result(action, {'recording': False})
+			return _wrap_result(
+				action,
+				{
+					'recording': True,
+					'path': str(recorder.output_path),
+					'framerate': recorder.framerate,
+					'size': {'width': recorder.size['width'], 'height': recorder.size['height']},
+				},
+			)
 
-		return {'error': 'Invalid record command. Use: start <path>, stop, status'}
+		return _wrap_result(action, {'error': 'Invalid record command. Use: start <path>, stop, status'})
 
 	raise ValueError(f'Unknown browser action: {action}')

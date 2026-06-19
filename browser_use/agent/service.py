@@ -2780,6 +2780,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		except Exception as _fmt_err:
 			self.logger.debug(f'Failed to format human-readable summary: {_fmt_err}')
 
+		# Dump RuntimeExecutionResult JSON to traces_dir if configured
+		try:
+			if self.browser_session and self.browser_session.browser_profile.traces_dir:
+				from pathlib import Path as _Path
+
+				traces_dir = _Path(self.browser_session.browser_profile.traces_dir).expanduser().resolve()
+				traces_dir.mkdir(parents=True, exist_ok=True)
+				trace_file = traces_dir / f'execution_result_{self.task_id}.json'
+				trace_file.write_text(self._last_execution_result.model_dump_json(indent=2), encoding='utf-8')
+				self.logger.debug(f'📊 Execution result trace written to {trace_file}')
+		except Exception as _trace_err:
+			self.logger.debug(f'Failed to write execution result trace: {_trace_err}')
+
 		# If an unhandled exception occurred (agent_run_error set in except block
 		# but not KeyboardInterrupt / graceful max-failures / etc.), re-raise so
 		# callers that rely on exception propagation still get it — but only
