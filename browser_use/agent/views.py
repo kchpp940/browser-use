@@ -14,7 +14,7 @@ from typing_extensions import TypeVar
 from uuid_extensions import uuid7str
 
 from browser_use.agent.message_manager.views import MessageManagerState
-from browser_use.browser.views import BrowserStateHistory
+from browser_use.browser.views import BrowserStateHistory, BrowserStateSummary
 from browser_use.dom.views import DEFAULT_INCLUDE_ATTRIBUTES, DOMInteractedElement, DOMSelectorMap
 
 # from browser_use.dom.history_tree_processor.service import (
@@ -371,6 +371,58 @@ class StepMetadata(BaseModel):
 	def duration_seconds(self) -> float:
 		"""Calculate step duration in seconds"""
 		return self.step_end_time - self.step_start_time
+
+
+class StepExecutionContext(BaseModel):
+	"""Input context created at the start of each step.
+
+	Collects everything the step phases need so they don't reach
+	back into ``Agent.state`` or ``Agent.settings`` ad-hoc.
+	"""
+
+	model_config = ConfigDict(arbitrary_types_allowed=True)
+
+	step_number: int
+	step_start_time: float
+	step_info: AgentStepInfo | None = None
+	browser_state_summary: BrowserStateSummary | None = None
+
+
+class StepExecutionResult(BaseModel):
+	"""Accumulated output of a single step execution.
+
+	Each phase (``_get_next_action``, ``_execute_actions``,
+	``_handle_step_error``) writes into this object instead of
+	scattering ``self.state.last_*`` assignments across the service.
+	"""
+
+	model_config = ConfigDict(arbitrary_types_allowed=True)
+
+	model_output: AgentOutput | None = None
+	action_results: list[ActionResult] = Field(default_factory=list)
+	error: str | None = None
+
+	@property
+	def is_done(self) -> bool:
+		if self.action_results and self.action_results[-1].is_done is True:
+			return True
+		return False
+
+	@property
+	def is_success(self) -> bool | None:
+		if not self.is_done or not self.action_results:
+			return None
+		return self.action_results[-1].success
+
+	@property
+	def has_action_error(self) -> bool:
+		if len(self.action_results) == 1 and self.action_results[-1].error is not None:
+			return True
+		return False
+
+	@property
+	def is_empty(self) -> bool:
+		return not self.action_results and self.error is None
 
 
 class PlanItem(BaseModel):
