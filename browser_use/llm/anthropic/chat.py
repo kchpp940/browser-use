@@ -28,9 +28,14 @@ except ImportError as _e:
 	APIConnectionError = Any  # type: ignore
 	APIStatusError = Any  # type: ignore
 	AsyncAnthropic = Any  # type: ignore
-	NotGiven = Any  # type: ignore
+	class _Sentinel:
+		pass
+	_NOT_GIVEN = _Sentinel()
+	def _sentinel_factory():
+		return _NOT_GIVEN
+	NotGiven = _sentinel_factory
+	omit = _sentinel_factory
 	RateLimitError = Any  # type: ignore
-	omit = Any  # type: ignore
 	CacheControlEphemeralParam = Any  # type: ignore
 	Message = Any  # type: ignore
 	ToolParam = Any  # type: ignore

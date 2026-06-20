@@ -112,13 +112,25 @@ CORE_IMPORT_BLOCK_LIST: list[tuple[str, str, set[str]]] = [
     ("skills.views", "browser_use.skills.views", {"browser_use_sdk"}),
 ]
 
-# Provider submodules that are NOT part of core import chain (individually checkable)
+# Provider chat modules: direct `from browser_use.llm.X.chat import ChatX` must also
+# survive missing SDK (only raise friendly error when the class is *instantiated*).
+# Full list of every provider (except browser_use which uses httpx only, plus mistral
+# which uses plain httpx without a provider SDK).
 PROVIDER_CHAT_BLOCK: list[tuple[str, str, set[str]]] = [
     ("llm.openai.chat", "browser_use.llm.openai.chat", {"openai"}),
+    ("llm.azure.chat", "browser_use.llm.azure.chat", {"openai"}),
+    ("llm.cerebras.chat", "browser_use.llm.cerebras.chat", {"openai"}),
+    ("llm.deepseek.chat", "browser_use.llm.deepseek.chat", {"openai"}),
+    ("llm.openrouter.chat", "browser_use.llm.openrouter.chat", {"openai"}),
+    ("llm.vercel.chat", "browser_use.llm.vercel.chat", {"openai"}),
     ("llm.anthropic.chat", "browser_use.llm.anthropic.chat", {"anthropic"}),
     ("llm.google.chat", "browser_use.llm.google.chat", {"google", "google.genai"}),
     ("llm.groq.chat", "browser_use.llm.groq.chat", {"groq"}),
     ("llm.ollama.chat", "browser_use.llm.ollama.chat", {"ollama"}),
+    ("llm.oci_raw.chat", "browser_use.llm.oci_raw.chat", {"oci"}),
+    ("llm.aws.chat_bedrock", "browser_use.llm.aws.chat_bedrock", {"boto3"}),
+    ("llm.aws.chat_anthropic", "browser_use.llm.aws.chat_anthropic", {"anthropic", "boto3"}),
+    ("llm.litellm.chat", "browser_use.llm.litellm.chat", {"litellm"}),
 ]
 
 
@@ -170,34 +182,32 @@ def test_runtime_top_level_safety() -> list[str]:
     import builtins
 
     errors = []
-    all_cases = CORE_IMPORT_BLOCK_LIST  # Provider chat modules are NOT core-chain required
+    # CORE_IMPORT_BLOCK_LIST: core Agent initialization chain
+    # PROVIDER_CHAT_BLOCK: explicit provider chat submodule imports
+    all_cases = CORE_IMPORT_BLOCK_LIST + PROVIDER_CHAT_BLOCK
 
-    # Provider chats are individually checked as informational only
-    info_cases = PROVIDER_CHAT_BLOCK
+    # Reusable blocker factory
+    def _make_blocker(_orig_import, _bset):
+        def _blocker(name, *args, **kwargs):
+            base = name.split('.')[0].lower()
+            full = name.lower()
+            for b in _bset:
+                bl = b.lower()
+                if (base == bl.split('.')[0]
+                    or full == bl
+                    or full.startswith(bl + '.')):
+                    raise ImportError(
+                        f"[SIMULATED] Import of '{name}' blocked for "
+                        f"boundary test (matches '{b}')"
+                    )
+            return _orig_import(name, *args, **kwargs)
+        return _blocker
 
     for desc, module_path, blocked in all_cases:
         _orig_import = builtins.__import__
-
-        def _make_blocker(_bset):
-            def _blocker(name, *args, **kwargs):
-                base = name.split('.')[0].lower()
-                full = name.lower()
-                for b in _bset:
-                    bl = b.lower()
-                    if (base == bl.split('.')[0]
-                        or full == bl
-                        or full.startswith(bl + '.')):
-                        raise ImportError(
-                            f"[SIMULATED] Import of '{name}' blocked for "
-                            f"boundary test (matches '{b}')"
-                        )
-                return _orig_import(name, *args, **kwargs)
-            return _blocker
-
-        builtins.__import__ = _make_blocker(blocked)
+        builtins.__import__ = _make_blocker(_orig_import, blocked)
         try:
             importlib.invalidate_caches()
-            # Clear cached modules that match
             for mod in list(sys.modules.keys()):
                 if (mod.startswith(module_path)
                     or mod == module_path
@@ -211,44 +221,6 @@ def test_runtime_top_level_safety() -> list[str]:
         except Exception as e:
             errors.append(f"{desc}: {type(e).__name__}: {e}")
             print(f"  ✗ {desc}: {type(e).__name__}: {e}")
-        finally:
-            builtins.__import__ = _orig_import
-
-    # Informational: provider chat submodules (not on core chain — explicit import only)
-    print("\n  (Informational) Provider chat modules (NOT core chain, explicit import only):")
-    for desc, module_path, blocked in info_cases:
-        _orig_import = builtins.__import__
-
-        def _make_blocker2(_bset):
-            def _blocker(name, *args, **kwargs):
-                base = name.split('.')[0].lower()
-                full = name.lower()
-                for b in _bset:
-                    bl = b.lower()
-                    if (base == bl.split('.')[0]
-                        or full == bl
-                        or full.startswith(bl + '.')):
-                        raise ImportError(
-                            f"[SIMULATED] Import of '{name}' blocked for "
-                            f"boundary test (matches '{b}')"
-                        )
-                return _orig_import(name, *args, **kwargs)
-            return _blocker
-
-        builtins.__import__ = _make_blocker2(blocked)
-        try:
-            importlib.invalidate_caches()
-            for mod in list(sys.modules.keys()):
-                if (mod.startswith(module_path)
-                    or mod == module_path):
-                    del sys.modules[mod]
-            importlib.import_module(module_path)
-            print(f"    ✓ {desc} (blocked {sorted(blocked)}) — safe")
-        except ImportError as e:
-            print(f"    ⚠ {desc}: direct submodule import crashes — "
-                  f"but not on core Agent chain (use `from browser_use import Xxx` for friendly hint)")
-        except Exception as e:
-            print(f"    ⚠ {desc}: {type(e).__name__} — not on core chain")
         finally:
             builtins.__import__ = _orig_import
     return errors

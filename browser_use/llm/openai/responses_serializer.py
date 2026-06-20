@@ -1,13 +1,21 @@
+from __future__ import annotations
+
 """Serializer for converting messages to OpenAI Responses API input format."""
 
-from typing import overload
+from typing import Any, overload
 
-from openai.types.responses.easy_input_message_param import EasyInputMessageParam
-from openai.types.responses.response_input_image_param import ResponseInputImageParam
-from openai.types.responses.response_input_message_content_list_param import (
-	ResponseInputMessageContentListParam,
-)
-from openai.types.responses.response_input_text_param import ResponseInputTextParam
+try:
+	from openai.types.responses.easy_input_message_param import EasyInputMessageParam
+	from openai.types.responses.response_input_image_param import ResponseInputImageParam
+	from openai.types.responses.response_input_message_content_list_param import (
+		ResponseInputMessageContentListParam,
+	)
+	from openai.types.responses.response_input_text_param import ResponseInputTextParam
+except ImportError:
+	EasyInputMessageParam = Any  # type: ignore
+	ResponseInputImageParam = Any  # type: ignore
+	ResponseInputMessageContentListParam = Any  # type: ignore
+	ResponseInputTextParam = Any  # type: ignore
 
 from browser_use.llm.messages import (
 	AssistantMessage,

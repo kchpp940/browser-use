@@ -28,7 +28,12 @@ except ImportError as _e:
 	APIResponseValidationError = Any  # type: ignore
 	APIStatusError = Any  # type: ignore
 	AsyncGroq = Any  # type: ignore
-	NotGiven = Any  # type: ignore
+	class _Sentinel:
+		pass
+	_NOT_GIVEN = _Sentinel()
+	def _sentinel_factory():
+		return _NOT_GIVEN
+	NotGiven = _sentinel_factory
 	RateLimitError = Any  # type: ignore
 	Timeout = Any  # type: ignore
 	ChatCompletion = Any  # type: ignore

@@ -1,4 +1,11 @@
-from openai.types.chat import ChatCompletionMessageParam
+from __future__ import annotations
+
+from typing import Any
+
+try:
+	from openai.types.chat import ChatCompletionMessageParam
+except ImportError:
+	ChatCompletionMessageParam = Any  # type: ignore
 
 from browser_use.llm.messages import BaseMessage
 from browser_use.llm.openai.serializer import OpenAIMessageSerializer

@@ -1,6 +1,14 @@
-import base64
+from __future__ import annotations
 
-from google.genai.types import Content, ContentListUnion, Part
+import base64
+from typing import Any
+
+try:
+	from google.genai.types import Content, ContentListUnion, Part
+except ImportError:
+	Content = Any  # type: ignore
+	ContentListUnion = Any  # type: ignore
+	Part = Any  # type: ignore
 
 from browser_use.llm.messages import (
 	AssistantMessage,
