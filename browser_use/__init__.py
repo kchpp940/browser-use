@@ -65,6 +65,9 @@ if TYPE_CHECKING:
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
 	from browser_use.llm.vercel.chat import ChatVercel
+	from browser_use.mcp.client import MCPClient
+	from browser_use.mcp.controller import MCPToolWrapper
+	from browser_use.mcp.server import BrowserUseServer
 	from browser_use.sandbox import sandbox
 	from browser_use.skills.service import SkillService
 	from browser_use.tools.service import Controller, Tools
@@ -107,6 +110,10 @@ _LAZY_IMPORTS = {
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
 	# Skills service (requires browser-use-sdk / cloud extra)
 	'SkillService': ('browser_use.skills.service', 'SkillService'),
+	# MCP tools integration
+	'MCPClient': ('browser_use.mcp', 'MCPClient'),
+	'MCPToolWrapper': ('browser_use.mcp', 'MCPToolWrapper'),
+	'BrowserUseServer': ('browser_use.mcp', 'BrowserUseServer'),
 }
 
 
@@ -130,6 +137,10 @@ _EXTRA_HINTS: dict[str, tuple[str, str]] = {
 	# Sandbox / Cloud
 	'sandbox': ('cloud', 'Sandbox & Cloud'),
 	'SkillService': ('cloud', 'Skills API & Cloud Browser'),
+	# MCP (Model Context Protocol)
+	'MCPClient': ('mcp', 'MCP Client'),
+	'MCPToolWrapper': ('mcp', 'MCP Tool Wrapper'),
+	'BrowserUseServer': ('mcp', 'Browser Use MCP Server'),
 }
 
 
@@ -195,4 +206,8 @@ __all__ = [
 	'sandbox',
 	# Skills service
 	'SkillService',
+	# MCP integration
+	'MCPClient',
+	'MCPToolWrapper',
+	'BrowserUseServer',
 ]
