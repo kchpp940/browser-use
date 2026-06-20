@@ -21,6 +21,7 @@ Example usage:
 
     # Now use with Agent as normal - MCP tools are available as actions
 """
+from __future__ import annotations
 
 import asyncio
 import logging

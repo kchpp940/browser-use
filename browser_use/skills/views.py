@@ -1,9 +1,31 @@
 """Skills views - wraps SDK types with helper methods"""
+from __future__ import annotations
 
 from typing import Any
 
-from browser_use_sdk import ParameterSchema, SkillResponse
+try:
+	from browser_use_sdk import ParameterSchema, SkillResponse
+
+	SKILLS_SDK_AVAILABLE = True
+except ImportError as _e:
+	SKILLS_SDK_AVAILABLE = False
+	ParameterSchema = Any  # type: ignore
+	SkillResponse = Any  # type: ignore
+	_SKILLS_SDK_MISSING = _e
 from pydantic import BaseModel, ConfigDict, Field
+
+
+def _require_skills_sdk():
+	"""Raise a friendly ImportError if browser-use-sdk is not installed."""
+	if not SKILLS_SDK_AVAILABLE:
+		msg = (
+			'The Skills API requires the `browser-use-sdk` package. '
+			'Install required dependencies with: `pip install "browser-use[cloud]"` '
+			'or `uv pip install "browser-use[cloud]"`.'
+		)
+		if '_SKILLS_SDK_MISSING' in globals():
+			msg += f'\nOriginal error: {_SKILLS_SDK_MISSING}'
+		raise ImportError(msg)
 
 
 class MissingCookieException(Exception):

@@ -3,6 +3,7 @@
 This module provides integration between MCP tools and browser-use's action registry system.
 MCP tools are dynamically discovered and registered as browser-use actions.
 """
+from __future__ import annotations
 
 import asyncio
 import logging
