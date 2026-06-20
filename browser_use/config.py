@@ -523,3 +523,82 @@ def get_default_profile(config: dict[str, Any]) -> dict[str, Any]:
 def get_default_llm(config: dict[str, Any]) -> dict[str, Any]:
 	"""Get default LLM config from config dict."""
 	return config.get('llm', {})
+
+
+# ============================================================================
+# New unified runtime configuration system
+# ============================================================================
+#
+# The following functions provide access to the new RuntimeConfig / ConfigResolver
+# system while maintaining backward compatibility with existing code.
+#
+# Priority order (highest to lowest):
+#   1. Explicit parameters
+#   2. CLI arguments
+#   3. Environment variables
+#   4. Configuration file (config.json)
+#   5. Model defaults
+#
+# ============================================================================
+
+
+def get_runtime_config() -> Any:
+	"""Get the unified runtime configuration.
+
+	Returns:
+	    RuntimeConfig instance with all configuration merged from all sources.
+
+	Example:
+	    >>> from browser_use.config import get_runtime_config
+	    >>> config = get_runtime_config()
+	    >>> print(config.logging.level)
+	    >>> print(config.browser.headless)
+	"""
+	from browser_use.runtime_config import get_runtime_config as _get_runtime_config
+
+	return _get_runtime_config()
+
+
+def get_config_resolver() -> Any:
+	"""Get the default ConfigResolver instance.
+
+	Use this to add custom configuration sources before resolving.
+
+	Returns:
+	    ConfigResolver instance with env and file sources already added.
+
+	Example:
+	    >>> from browser_use.config import get_config_resolver
+	    >>> resolver = get_config_resolver()
+	    >>> resolver.add_explicit({'browser': {'headless': True}})
+	    >>> config = resolver.resolve()
+	"""
+	from browser_use.runtime_config import get_default_resolver
+
+	return get_default_resolver()
+
+
+def create_runtime_config(**kwargs) -> Any:
+	"""Create a RuntimeConfig with explicit overrides.
+
+	Convenience function that creates a resolver, adds explicit overrides,
+	and returns the resolved config.
+
+	Args:
+	    **kwargs: Configuration overrides (can be nested or flat format)
+
+	Returns:
+	    Resolved RuntimeConfig instance
+
+	Example:
+	    >>> config = create_runtime_config(browser_headless=True, logging_level='debug')
+	"""
+	from browser_use.runtime_config import ConfigResolver
+
+	resolver = ConfigResolver()
+	if kwargs:
+		# Check if kwargs are nested or flat
+		known_groups = {'logging', 'telemetry', 'cloud', 'llm', 'browser', 'agent', 'security', 'filesystem'}
+		is_nested = any(k in known_groups for k in kwargs)
+		resolver.add_explicit(kwargs, flat=not is_nested)
+	return resolver.resolve()

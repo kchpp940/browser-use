@@ -27,6 +27,11 @@ from browser_use.runtime_config.models import (
 	TelemetryConfig,
 )
 from browser_use.runtime_config.resolver import ConfigResolver, ConfigSource
+from browser_use.runtime_config.utils import (
+	browser_config_to_profile_dict,
+	create_browser_profile_from_config,
+	update_browser_profile_from_config,
+)
 
 __all__ = [
 	'RuntimeConfig',
@@ -40,4 +45,7 @@ __all__ = [
 	'FilesystemConfig',
 	'CloudConfig',
 	'TelemetryConfig',
+	'browser_config_to_profile_dict',
+	'create_browser_profile_from_config',
+	'update_browser_profile_from_config',
 ]

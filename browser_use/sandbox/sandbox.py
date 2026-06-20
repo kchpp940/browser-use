@@ -24,6 +24,7 @@ from browser_use.sandbox.views import (
 	SSEEvent,
 	SSEEventType,
 )
+from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 
 if TYPE_CHECKING:
 	from browser_use.browser import BrowserSession
@@ -221,6 +222,7 @@ def sandbox(
 	log_level: str = 'INFO',
 	quiet: bool = False,
 	headers: dict[str, str] | None = None,
+	runtime_config: RuntimeConfig | ConfigResolver | None = None,
 	on_browser_created: Callable[[BrowserCreatedData], None]
 	| Callable[[BrowserCreatedData], Coroutine[Any, Any, None]]
 	| None = None,
@@ -237,7 +239,7 @@ def sandbox(
 	All other parameters (explicit or from closure) will be captured and sent via cloudpickle.
 
 	Args:
-	    BROWSER_USE_API_KEY: API key (defaults to BROWSER_USE_API_KEY env var)
+	    BROWSER_USE_API_KEY: API key (defaults to BROWSER_USE_API_KEY env var or runtime_config)
 	    cloud_profile_id: The ID of the profile to use for the browser session
 	    cloud_proxy_country_code: Country code for proxy location (e.g., 'us', 'uk', 'fr')
 	    cloud_timeout: The timeout for the browser session in minutes (max 240 = 4 hours)
@@ -245,6 +247,7 @@ def sandbox(
 	    log_level: Logging level (INFO, DEBUG, WARNING, ERROR)
 	    quiet: Suppress console output
 	    headers: Additional HTTP headers to send with the request
+	    runtime_config: RuntimeConfig or ConfigResolver for unified configuration
 	    on_browser_created: Callback when browser is created
 	    on_instance_ready: Callback when instance is ready
 	    on_log: Callback for log events

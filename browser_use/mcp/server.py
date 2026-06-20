@@ -96,6 +96,7 @@ from browser_use.config import get_default_llm, get_default_profile, load_browse
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.tools.service import Tools
+from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
@@ -187,12 +188,28 @@ def get_parent_process_cmdline() -> str | None:
 class BrowserUseServer:
 	"""MCP Server for browser-use capabilities."""
 
-	def __init__(self, session_timeout_minutes: int = 10):
+	def __init__(
+		self,
+		session_timeout_minutes: int = 10,
+		runtime_config: RuntimeConfig | ConfigResolver | None = None,
+	):
 		# Ensure all logging goes to stderr (in case new loggers were created)
 		_ensure_all_loggers_use_stderr()
 
 		self.server = Server('browser-use')
+
+		# Resolve runtime configuration
+		if runtime_config is None:
+			resolver = ConfigResolver()
+			self.runtime_config: RuntimeConfig = resolver.resolve()
+		elif isinstance(runtime_config, ConfigResolver):
+			self.runtime_config = runtime_config.resolve()
+		else:
+			self.runtime_config = runtime_config
+
+		# Legacy config dict for backward compatibility
 		self.config = load_browser_use_config()
+
 		self.agent: Agent | None = None
 		self.browser_session: BrowserSession | None = None
 		self.tools: Tools | None = None

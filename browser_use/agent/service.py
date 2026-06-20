@@ -213,6 +213,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		enable_signal_handler: bool = True,
 		**kwargs,
 	):
+		# Resolve runtime configuration
+		if runtime_config is None:
+			resolver = ConfigResolver()
+			self.runtime_config: RuntimeConfig = resolver.resolve()
+		elif isinstance(runtime_config, ConfigResolver):
+			self.runtime_config = runtime_config.resolve()
+		else:
+			self.runtime_config = runtime_config
+
 		# Validate llm_screenshot_size
 		if llm_screenshot_size is not None:
 			if not isinstance(llm_screenshot_size, tuple) or len(llm_screenshot_size) != 2:
