@@ -3,39 +3,75 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Generic, TypeVar
 
 if TYPE_CHECKING:
 	from browser_use.agent.service import Agent, AgentHookFunc
 	from browser_use.agent.views import AgentHistoryList, AgentStepInfo
+	from browser_use.browser import BrowserSession
 
 logger = logging.getLogger(__name__)
 
+T = TypeVar('T')
+
+
+@dataclass
+class TaskResult(Generic[T]):
+	"""Normalized result from any task managed by RuntimeSessionController."""
+
+	success: bool
+	result: T | None = None
+	error: str | None = None
+	error_type: str | None = None
+	duration_seconds: float = 0.0
+	timed_out: bool = False
+	cancelled: bool = False
+
+
+@dataclass
+class LifecycleCallbacks(Generic[T]):
+	"""Optional callbacks for _run_with_lifecycle."""
+
+	on_start: Callable[[], Awaitable[None]] | None = None
+	on_success: Callable[[T], Awaitable[None]] | None = None
+	on_error: Callable[[Exception], Awaitable[None]] | None = None
+	on_cleanup: Callable[[], Awaitable[None]] | None = None
+
 
 class RuntimeSessionController:
-	"""Unified runtime lifecycle controller for Agent tasks.
+	"""Unified runtime lifecycle controller for all browser-use entry points.
 
-	Centralizes all lifecycle management that was previously duplicated across
+	Centralizes lifecycle management that was previously duplicated across
 	Python API, legacy CLI, skill_cli daemon, MCP server, and sandbox/cloud
-	entry points. Manages:
+	entry points.
 
-	- Task startup (signal handlers, session/task events, browser session)
-	- Step execution loop with unified timeout and cancellation
-	- Exception normalization (KeyboardInterrupt, TimeoutError, connection errors)
-	- File system state persistence
-	- Event bus lifecycle
-	- Browser/session cleanup
-	- Telemetry capture
-	- GIF generation
-	- Final result submission
+	Supports two execution modes:
+	  1. Agent tasks — full multi-step autonomous agent with step events, signal
+	     handlers, GIF generation, token cost tracking, etc.
+	  2. BrowserSession tasks — short-lived direct browser commands (navigate,
+	     click, type, etc.) wrapped with unified timeout, cancellation, and
+	     exception normalization.
+
+	Also provides unified session close/cleanup.
 
 	All entry points should go through this controller instead of maintaining
 	their own try/except/finally, timeout, and cleanup logic.
 	"""
 
-	def __init__(self, agent: Agent):
+	def __init__(
+		self,
+		agent: Agent | None = None,
+		browser_session: BrowserSession | None = None,
+	):
+		if agent is None and browser_session is None:
+			raise ValueError('RuntimeSessionController requires either agent or browser_session')
+
 		self.agent = agent
+		self.browser_session = browser_session or (agent.browser_session if agent else None)
+
+		# Agent-task-specific state
 		self._agent_run_error: str | None = None
 		self._force_exit_telemetry_logged = False
 		self._should_delay_close = False
@@ -43,6 +79,124 @@ class RuntimeSessionController:
 		self._max_steps: int = 500
 		self._on_step_start: AgentHookFunc | None = None
 		self._on_step_end: AgentHookFunc | None = None
+
+	# ------------------------------------------------------------------
+	# Generic lifecycle wrapper — used by all task types
+	# ------------------------------------------------------------------
+
+	async def _run_with_lifecycle(
+		self,
+		coro: Coroutine[Any, Any, T],
+		*,
+		timeout: float | None = None,
+		task_name: str = 'task',
+		callbacks: LifecycleCallbacks[T] | None = None,
+	) -> TaskResult[T]:
+		"""Wrap any coroutine with unified timeout, cancellation, exception, and cleanup.
+
+		This is the foundational primitive used by all public run_* methods.
+		Every entry point that needs to execute async work with a bounded lifetime
+		should route through here instead of writing its own try/except/finally.
+
+		Args:
+		    coro: The coroutine to execute.
+		    timeout: Optional timeout in seconds. None means no timeout.
+		    task_name: Human-readable name used in log messages.
+		    callbacks: Optional lifecycle hooks (on_start, on_success, on_error, on_cleanup).
+
+		Returns:
+		    TaskResult with normalized success/error/timeout state.
+		"""
+		start = time.monotonic()
+		cb = callbacks or LifecycleCallbacks[T]()
+
+		try:
+			if cb.on_start is not None:
+				await cb.on_start()
+
+			if timeout is not None:
+				result = await asyncio.wait_for(coro, timeout=timeout)
+			else:
+				result = await coro
+
+			if cb.on_success is not None:
+				await cb.on_success(result)
+
+			return TaskResult(
+				success=True,
+				result=result,
+				duration_seconds=time.monotonic() - start,
+			)
+
+		except asyncio.TimeoutError as e:
+			logger.error(f'⏰ {task_name} timed out after {timeout}s')
+			if cb.on_error is not None:
+				try:
+					await cb.on_error(e)
+				except Exception:
+					logger.exception('on_error callback raised during timeout handling')
+			return TaskResult(
+				success=False,
+				error=str(e),
+				error_type='TimeoutError',
+				duration_seconds=time.monotonic() - start,
+				timed_out=True,
+			)
+
+		except asyncio.CancelledError as e:
+			logger.warning(f'🛑 {task_name} was cancelled')
+			if cb.on_error is not None:
+				try:
+					await cb.on_error(e)
+				except Exception:
+					logger.exception('on_error callback raised during cancellation handling')
+			return TaskResult(
+				success=False,
+				error=str(e),
+				error_type='CancelledError',
+				duration_seconds=time.monotonic() - start,
+				cancelled=True,
+			)
+
+		except KeyboardInterrupt as e:
+			logger.warning(f'⌨️  {task_name} interrupted by user (KeyboardInterrupt)')
+			if cb.on_error is not None:
+				try:
+					await cb.on_error(e)
+				except Exception:
+					logger.exception('on_error callback raised during KeyboardInterrupt handling')
+			return TaskResult(
+				success=False,
+				error=str(e) or 'KeyboardInterrupt',
+				error_type='KeyboardInterrupt',
+				duration_seconds=time.monotonic() - start,
+				cancelled=True,
+			)
+
+		except Exception as e:
+			logger.error(f'❌ {task_name} failed: {e}', exc_info=True)
+			if cb.on_error is not None:
+				try:
+					await cb.on_error(e)
+				except Exception:
+					logger.exception('on_error callback raised during exception handling')
+			return TaskResult(
+				success=False,
+				error=str(e),
+				error_type=type(e).__name__,
+				duration_seconds=time.monotonic() - start,
+			)
+
+		finally:
+			if cb.on_cleanup is not None:
+				try:
+					await cb.on_cleanup()
+				except Exception:
+					logger.exception('on_cleanup callback raised')
+
+	# ------------------------------------------------------------------
+	# Agent task execution — full autonomous agent lifecycle
+	# ------------------------------------------------------------------
 
 	async def run(
 		self,
@@ -55,6 +209,25 @@ class RuntimeSessionController:
 		This is the single authoritative entry point for running an Agent.
 		All other entry points (CLI, MCP, daemon, sandbox) should delegate to this.
 		"""
+		if self.agent is None:
+			raise RuntimeError('run() requires an Agent — pass agent= to the constructor')
+
+		return await self.run_agent_task(max_steps=max_steps, on_step_start=on_step_start, on_step_end=on_step_end)
+
+	async def run_agent_task(
+		self,
+		max_steps: int = 500,
+		on_step_start: AgentHookFunc | None = None,
+		on_step_end: AgentHookFunc | None = None,
+	) -> AgentHistoryList:
+		"""Run a full Agent task with unified lifecycle management.
+
+		Equivalent to the old Agent.run() but centralized here so every entry
+		point gets consistent signal handling, timeout, cleanup, and telemetry.
+		"""
+		if self.agent is None:
+			raise RuntimeError('run_agent_task() requires an Agent — pass agent= to the constructor')
+
 		self._max_steps = max_steps
 		self._on_step_start = on_step_start
 		self._on_step_end = on_step_end
@@ -64,17 +237,49 @@ class RuntimeSessionController:
 
 		self._setup_signal_handlers(max_steps)
 
-		try:
+		async def _execute() -> AgentHistoryList:
 			return await self._execute_lifecycle(max_steps, on_step_start, on_step_end)
-		except KeyboardInterrupt:
-			return await self._handle_keyboard_interrupt()
-		except Exception as e:
-			return await self._handle_generic_exception(e)
-		finally:
+
+		async def _handle_success(history: AgentHistoryList) -> None:
+			pass
+
+		async def _handle_error(e: Exception) -> None:
+			if isinstance(e, KeyboardInterrupt):
+				pass
+
+		async def _cleanup() -> None:
 			await self._cleanup(max_steps)
+
+		callbacks = LifecycleCallbacks[AgentHistoryList](
+			on_success=_handle_success,
+			on_error=_handle_error,
+			on_cleanup=_cleanup,
+		)
+
+		result = await self._run_with_lifecycle(
+			_execute(),
+			timeout=None,
+			task_name=f'Agent task "{self.agent.task[:40]}..."',
+			callbacks=callbacks,
+		)
+
+		if result.result is not None:
+			return result.result
+
+		if result.cancelled and not result.timed_out:
+			return await self._handle_keyboard_interrupt()
+
+		assert result.error is not None
+		if result.error_type == 'KeyboardInterrupt':
+			return await self._handle_keyboard_interrupt()
+
+		raise RuntimeError(result.error)
 
 	def _setup_signal_handlers(self, max_steps: int) -> None:
 		"""Register signal handlers for pause/resume and force-exit telemetry."""
+		if self.agent is None:
+			return
+
 		loop = asyncio.get_event_loop()
 
 		from browser_use.utils import SignalHandler
@@ -102,6 +307,7 @@ class RuntimeSessionController:
 		on_step_end: AgentHookFunc | None,
 	) -> AgentHistoryList:
 		"""Execute the main agent lifecycle: init -> step loop -> finalize."""
+		assert self.agent is not None
 		await self._startup_phase()
 		await self._initial_actions_phase()
 		await self._main_step_loop(max_steps, on_step_start, on_step_end)
@@ -109,6 +315,7 @@ class RuntimeSessionController:
 
 	async def _startup_phase(self) -> None:
 		"""Phase 1: Log startup, dispatch events, start browser, register skills."""
+		assert self.agent is not None
 		from browser_use.agent.cloud_events import CreateAgentSessionEvent, CreateAgentTaskEvent
 
 		await self.agent._log_agent_run()
@@ -145,6 +352,7 @@ class RuntimeSessionController:
 
 	async def _initial_actions_phase(self) -> None:
 		"""Phase 2: Execute initial actions (URL navigation etc.) with step timeout."""
+		assert self.agent is not None
 		from browser_use.agent.views import ActionResult
 
 		try:
@@ -170,6 +378,7 @@ class RuntimeSessionController:
 		on_step_end: AgentHookFunc | None,
 	) -> None:
 		"""Phase 3: Main step execution loop with pause/stop checks."""
+		assert self.agent is not None
 		from browser_use.agent.views import AgentStepInfo
 
 		self.agent.logger.debug(
@@ -220,6 +429,8 @@ class RuntimeSessionController:
 
 		Returns True if the agent reports task completion, False otherwise.
 		"""
+		assert self.agent is not None
+
 		if on_step_start is not None:
 			await on_step_start(self.agent)
 
@@ -268,6 +479,7 @@ class RuntimeSessionController:
 
 	def _handle_max_steps_exceeded(self, max_steps: int) -> None:
 		"""Handle the case where agent exhausts all steps without completing."""
+		assert self.agent is not None
 		from browser_use.agent.views import ActionResult, AgentHistory, BrowserStateHistory
 
 		self._agent_run_error = 'Failed to complete task in maximum steps'
@@ -291,6 +503,7 @@ class RuntimeSessionController:
 
 	async def _finalize_success(self, max_steps: int) -> AgentHistoryList:
 		"""Phase 4: After successful execution - attach usage, output schema."""
+		assert self.agent is not None
 		self.agent.history.usage = await self.agent.token_cost_service.get_usage_summary()
 
 		if self.agent.history._output_model_schema is None and self.agent.output_model_schema is not None:
@@ -300,16 +513,11 @@ class RuntimeSessionController:
 
 	async def _handle_keyboard_interrupt(self) -> AgentHistoryList:
 		"""Handle KeyboardInterrupt - normalize and return current history."""
+		assert self.agent is not None
 		self.agent.logger.debug('Got KeyboardInterrupt during execution, returning current history')
 		self._agent_run_error = 'KeyboardInterrupt'
 		self.agent.history.usage = await self.agent.token_cost_service.get_usage_summary()
 		return self.agent.history
-
-	async def _handle_generic_exception(self, e: Exception) -> AgentHistoryList:
-		"""Handle all other exceptions - log and re-raise."""
-		self.agent.logger.error(f'Agent run failed with exception: {e}', exc_info=True)
-		self._agent_run_error = str(e)
-		raise e
 
 	async def _cleanup(self, max_steps: int) -> None:
 		"""Phase 5: Unified cleanup - always runs in finally block.
@@ -325,6 +533,9 @@ class RuntimeSessionController:
 		- Event bus stop
 		- Agent resource close
 		"""
+		if self.agent is None:
+			return
+
 		from browser_use.agent.cloud_events import CreateAgentOutputFileEvent, UpdateAgentTaskEvent
 		from browser_use.browser.events import _get_timeout
 
@@ -367,3 +578,106 @@ class RuntimeSessionController:
 		await self.agent.eventbus.stop(clear=True, timeout=_get_timeout('TIMEOUT_AgentEventBusStop', 3.0))
 
 		await self.agent.close()
+
+	# ------------------------------------------------------------------
+	# BrowserSession task execution — single direct browser commands
+	# ------------------------------------------------------------------
+
+	async def run_browser_session_task(
+		self,
+		coro: Coroutine[Any, Any, T],
+		*,
+		timeout: float = 30.0,
+		task_name: str = 'browser_command',
+	) -> TaskResult[T]:
+		"""Execute a single direct-browser command with unified lifecycle.
+
+		Use this for skill_cli daemon commands, MCP direct browser tools,
+		and any other short-lived browser operations that need timeout,
+		cancellation, and exception normalization but don't involve an Agent.
+
+		Example:
+		    result = await controller.run_browser_session_task(
+		        actions.navigate(url),
+		        timeout=15.0,
+		        task_name=f'navigate {url}',
+		    )
+		    if result.success:
+		        return result.result
+		    return {'error': result.error}
+		"""
+		if self.browser_session is None:
+			return TaskResult(
+				success=False,
+				error='No browser_session available — pass browser_session= to the constructor',
+				error_type='NoBrowserSession',
+			)
+
+		async def _on_error(e: Exception) -> None:
+			logger.warning(f'Browser session task "{task_name}" failed: {e}')
+
+		callbacks = LifecycleCallbacks[T](on_error=_on_error)
+
+		return await self._run_with_lifecycle(
+			coro,
+			timeout=timeout,
+			task_name=task_name,
+			callbacks=callbacks,
+		)
+
+	# ------------------------------------------------------------------
+	# Unified session close/cleanup
+	# ------------------------------------------------------------------
+
+	async def close_session(
+		self,
+		*,
+		timeout: float = 10.0,
+		force: bool = False,
+		browser_session: BrowserSession | None = None,
+		cloud: bool = False,
+		cdp_url: bool = False,
+	) -> TaskResult[None]:
+		"""Unified BrowserSession close with timeout and exception normalization.
+
+		Replaces the per-entry-point patterns of:
+		    try:
+		        await asyncio.wait_for(bs.kill(), timeout=10.0)
+		    except TimeoutError:
+		        logger.warning(...)
+		    except Exception as e:
+		        logger.warning(...)
+
+		Args:
+		    timeout: Maximum seconds to wait for close.
+		    force: If True, use kill() regardless of connection type.
+		    browser_session: Override the session set in the constructor.
+		    cloud: If True and not force, use stop() instead of kill().
+		    cdp_url: If True and not force, use stop() instead of kill().
+
+		Returns:
+		    TaskResult indicating whether close succeeded.
+		"""
+		session = browser_session or self.browser_session
+		if session is None:
+			return TaskResult(success=True, result=None)
+
+		async def _do_close() -> None:
+			use_stop = (cloud or cdp_url) and not force
+			if use_stop:
+				await session.stop()
+			else:
+				await session.kill()
+
+		async def _on_cleanup() -> None:
+			if self.browser_session is session:
+				self.browser_session = None
+
+		callbacks = LifecycleCallbacks[None](on_cleanup=_on_cleanup)
+
+		return await self._run_with_lifecycle(
+			_do_close(),
+			timeout=timeout,
+			task_name='close_browser_session',
+			callbacks=callbacks,
+		)
