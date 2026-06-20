@@ -261,8 +261,8 @@ class RuntimeLogger:
 
 	# ── Context management (delegate to _RuntimeContext) ───────────────
 
-	def set_context(self, **kwargs: Any) -> Any:
-		"""Sync: set linking fields and return a reset token.
+	def set_context(self, **kwargs: Any) -> dict[str, Any]:
+		"""Sync: set linking fields and return a reset token dict.
 
 		Usage::
 
@@ -272,7 +272,7 @@ class RuntimeLogger:
 		    finally:
 		        rl.reset_context(token)
 		"""
-		return self._ctx.set_context(**kwargs)
+		return self._ctx.set_context_raw(**kwargs)
 
 	def reset_context(self, token: Any) -> None:
 		"""Reset context to a previous state (returned by set_context)."""
