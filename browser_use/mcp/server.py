@@ -35,9 +35,9 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Coroutine
+from typing import Any
 
-from browser_use.llm import ChatAWSBedrock
+# ChatAWSBedrock and ChatOpenAI are imported lazily via browser_use.llm when needed
 
 # Configure logging for MCP mode - redirect to stderr but preserve critical diagnostics
 logging.basicConfig(
@@ -90,13 +90,16 @@ _configure_mcp_server_logging()
 logging.disable(logging.CRITICAL)
 
 # Import browser_use modules
-from browser_use import ActionModel, Agent, RuntimeSessionController
+from typing import TYPE_CHECKING
+
+from browser_use import ActionModel, Agent
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
-from browser_use.controller.runtime_session import LifecycleCallbacks, TaskResult
 from browser_use.filesystem.file_system import FileSystem
-from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.tools.service import Tools
+
+if TYPE_CHECKING:
+	from browser_use.llm.openai.chat import ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +149,12 @@ try:
 	mcp_logger.setLevel(logging.ERROR)
 	mcp_logger.propagate = False
 except ImportError:
-	MCP_AVAILABLE = False
-	logger.error('MCP SDK not installed. Install with: pip install mcp')
+	print(
+		'ERROR: MCP (Model Context Protocol) support is not available.\n'
+		'Install the required dependencies with: `pip install "browser-use[mcp]"` '
+		'or `uv pip install "browser-use[mcp]"`.',
+		file=sys.stderr,
+	)
 	sys.exit(1)
 
 from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
@@ -616,6 +623,8 @@ class BrowserUseServer:
 		self.tools = Tools()
 
 		# Initialize LLM from config
+		from browser_use.llm.openai.chat import ChatOpenAI
+
 		llm_config = get_default_llm(self.config)
 		base_url = llm_config.get('base_url', None)
 		kwargs = {}
@@ -654,6 +663,8 @@ class BrowserUseServer:
 
 		# Get Bedrock-specific config
 		if model_provider and model_provider.lower() == 'bedrock':
+			from browser_use.llm import ChatAWSBedrock
+
 			llm_model = llm_config.get('model') or os.getenv('MODEL') or 'us.anthropic.claude-sonnet-4-20250514-v1:0'
 			aws_region = llm_config.get('region') or os.getenv('REGION')
 			if not aws_region:
@@ -665,6 +676,8 @@ class BrowserUseServer:
 				aws_sso_auth=aws_sso_auth,
 			)
 		else:
+			from browser_use.llm.openai.chat import ChatOpenAI
+
 			api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
 			if not api_key:
 				return 'Error: OPENAI_API_KEY not set in config or environment'
@@ -696,7 +709,7 @@ class BrowserUseServer:
 		# Create browser profile using config
 		profile = BrowserProfile(**profile_config)
 
-		# Create agent
+		# Create and run agent
 		agent = Agent(
 			task=task,
 			llm=llm,
@@ -704,26 +717,9 @@ class BrowserUseServer:
 			use_vision=use_vision,
 		)
 
-		# Use RuntimeSessionController explicitly for unified lifecycle management
-		controller = RuntimeSessionController(agent=agent)
+		try:
+			history = await agent.run(max_steps=max_steps)
 
-		async def _on_start() -> None:
-			logger.debug(f'Agent task starting via controller: {task[:50]}...')
-
-		async def _on_error(e: Exception) -> None:
-			logger.error(f'Agent task failed via controller: {e}')
-
-		callbacks = LifecycleCallbacks(on_start=_on_start, on_error=_on_error)
-
-		result: TaskResult = await controller.run_with_lifecycle(
-			controller.run_agent_task(max_steps=max_steps),
-			timeout=None,
-			task_name=f'MCP agent task "{task[:40]}..."',
-			callbacks=callbacks,
-		)
-
-		if result.success and result.result is not None:
-			history = result.result
 			# Format results
 			results = []
 			results.append(f'Task completed in {len(history.history)} steps')
@@ -749,36 +745,31 @@ class BrowserUseServer:
 
 			return '\n'.join(results)
 
-		if result.cancelled:
-			return f'Agent task was cancelled'
-
-		if result.timed_out:
-			return f'Agent task timed out'
-
-		return f'Agent task failed: {result.error or "Unknown error"}'
+		except Exception as e:
+			logger.error(f'Agent task failed: {e}', exc_info=True)
+			return f'Agent task failed: {str(e)}'
+		finally:
+			# Clean up
+			await agent.close()
 
 	async def _navigate(self, url: str, new_tab: bool = False) -> str:
 		"""Navigate to a URL."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
+		# Update session activity
+		self._update_session_activity(self.browser_session.id)
+
 		from browser_use.browser.events import NavigateToUrlEvent
 
-		async def _do_navigate() -> str:
-			if new_tab:
-				event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=True))
-				await event
-				return f'Opened new tab with URL: {url}'
-			else:
-				event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url))
-				await event
-				return f'Navigated to: {url}'
-
-		return await self._run_browser_command(
-			_do_navigate(),
-			task_name=f'navigate {url[:50]}',
-			timeout=30.0,
-		)
+		if new_tab:
+			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=True))
+			await event
+			return f'Opened new tab with URL: {url}'
+		else:
+			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url))
+			await event
+			return f'Navigated to: {url}'
 
 	async def _click(
 		self,
@@ -791,251 +782,217 @@ class BrowserUseServer:
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		async def _do_click() -> str:
-			# Coordinate-based clicking
-			if coordinate_x is not None and coordinate_y is not None:
-				from browser_use.browser.events import ClickCoordinateEvent
+		# Update session activity
+		self._update_session_activity(self.browser_session.id)
 
-				event = self.browser_session.event_bus.dispatch(
-					ClickCoordinateEvent(coordinate_x=coordinate_x, coordinate_y=coordinate_y)
-				)
-				await event
-				return f'Clicked at coordinates ({coordinate_x}, {coordinate_y})'
+		# Coordinate-based clicking
+		if coordinate_x is not None and coordinate_y is not None:
+			from browser_use.browser.events import ClickCoordinateEvent
 
-			# Index-based clicking
-			if index is None:
-				return 'Error: Provide either index or both coordinate_x and coordinate_y'
+			event = self.browser_session.event_bus.dispatch(
+				ClickCoordinateEvent(coordinate_x=coordinate_x, coordinate_y=coordinate_y)
+			)
+			await event
+			return f'Clicked at coordinates ({coordinate_x}, {coordinate_y})'
 
-			# Get the element
-			element = await self.browser_session.get_dom_element_by_index(index)
-			if not element:
-				return f'Element with index {index} not found'
+		# Index-based clicking
+		if index is None:
+			return 'Error: Provide either index or both coordinate_x and coordinate_y'
 
-			if new_tab:
-				# For links, extract href and open in new tab
-				href = element.attributes.get('href')
-				if href:
-					# Convert relative href to absolute URL
-					state = await self.browser_session.get_browser_state_summary()
-					current_url = state.url
-					if href.startswith('/'):
-						# Relative URL - construct full URL
-						from urllib.parse import urlparse
+		# Get the element
+		element = await self.browser_session.get_dom_element_by_index(index)
+		if not element:
+			return f'Element with index {index} not found'
 
-						parsed = urlparse(current_url)
-						full_url = f'{parsed.scheme}://{parsed.netloc}{href}'
-					else:
-						full_url = href
+		if new_tab:
+			# For links, extract href and open in new tab
+			href = element.attributes.get('href')
+			if href:
+				# Convert relative href to absolute URL
+				state = await self.browser_session.get_browser_state_summary()
+				current_url = state.url
+				if href.startswith('/'):
+					# Relative URL - construct full URL
+					from urllib.parse import urlparse
 
-					# Open link in new tab
-					from browser_use.browser.events import NavigateToUrlEvent
-
-					event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=full_url, new_tab=True))
-					await event
-					return f'Clicked element {index} and opened in new tab {full_url[:20]}...'
+					parsed = urlparse(current_url)
+					full_url = f'{parsed.scheme}://{parsed.netloc}{href}'
 				else:
-					# For non-link elements, just do a normal click
-					from browser_use.browser.events import ClickElementEvent
+					full_url = href
 
-					event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
-					await event
-					return f'Clicked element {index} (new tab not supported for non-link elements)'
+				# Open link in new tab
+				from browser_use.browser.events import NavigateToUrlEvent
+
+				event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=full_url, new_tab=True))
+				await event
+				return f'Clicked element {index} and opened in new tab {full_url[:20]}...'
 			else:
-				# Normal click
+				# For non-link elements, just do a normal click
 				from browser_use.browser.events import ClickElementEvent
 
 				event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
 				await event
-				return f'Clicked element {index}'
+				return f'Clicked element {index} (new tab not supported for non-link elements)'
+		else:
+			# Normal click
+			from browser_use.browser.events import ClickElementEvent
 
-		return await self._run_browser_command(
-			_do_click(),
-			task_name='click',
-			timeout=20.0,
-		)
+			event = self.browser_session.event_bus.dispatch(ClickElementEvent(node=element))
+			await event
+			return f'Clicked element {index}'
 
 	async def _type_text(self, index: int, text: str) -> str:
 		"""Type text into an element."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		async def _do_type() -> str:
-			element = await self.browser_session.get_dom_element_by_index(index)
-			if not element:
-				return f'Element with index {index} not found'
+		element = await self.browser_session.get_dom_element_by_index(index)
+		if not element:
+			return f'Element with index {index} not found'
 
-			from browser_use.browser.events import TypeTextEvent
+		from browser_use.browser.events import TypeTextEvent
 
-			# Conservative heuristic to detect potentially sensitive data
-			# Only flag very obvious patterns to minimize false positives
-			is_potentially_sensitive = len(text) >= 6 and (
-				# Email pattern: contains @ and a domain-like suffix
-				('@' in text and '.' in text.split('@')[-1] if '@' in text else False)
-				# Mixed alphanumeric with reasonable complexity (likely API keys/tokens)
-				or (
-					len(text) >= 16
-					and any(char.isdigit() for char in text)
-					and any(char.isalpha() for char in text)
-					and any(char in '.-_' for char in text)
-				)
+		# Conservative heuristic to detect potentially sensitive data
+		# Only flag very obvious patterns to minimize false positives
+		is_potentially_sensitive = len(text) >= 6 and (
+			# Email pattern: contains @ and a domain-like suffix
+			('@' in text and '.' in text.split('@')[-1] if '@' in text else False)
+			# Mixed alphanumeric with reasonable complexity (likely API keys/tokens)
+			or (
+				len(text) >= 16
+				and any(char.isdigit() for char in text)
+				and any(char.isalpha() for char in text)
+				and any(char in '.-_' for char in text)
 			)
-
-			# Use generic key names to avoid information leakage about detection patterns
-			sensitive_key_name = None
-			if is_potentially_sensitive:
-				if '@' in text and '.' in text.split('@')[-1]:
-					sensitive_key_name = 'email'
-				else:
-					sensitive_key_name = 'credential'
-
-			event = self.browser_session.event_bus.dispatch(
-				TypeTextEvent(node=element, text=text, is_sensitive=is_potentially_sensitive, sensitive_key_name=sensitive_key_name)
-			)
-			await event
-
-			if is_potentially_sensitive:
-				if sensitive_key_name:
-					return f'Typed <{sensitive_key_name}> into element {index}'
-				else:
-					return f'Typed <sensitive> into element {index}'
-			else:
-				return f"Typed '{text}' into element {index}"
-
-		return await self._run_browser_command(
-			_do_type(),
-			task_name='type_text',
-			timeout=20.0,
 		)
+
+		# Use generic key names to avoid information leakage about detection patterns
+		sensitive_key_name = None
+		if is_potentially_sensitive:
+			if '@' in text and '.' in text.split('@')[-1]:
+				sensitive_key_name = 'email'
+			else:
+				sensitive_key_name = 'credential'
+
+		event = self.browser_session.event_bus.dispatch(
+			TypeTextEvent(node=element, text=text, is_sensitive=is_potentially_sensitive, sensitive_key_name=sensitive_key_name)
+		)
+		await event
+
+		if is_potentially_sensitive:
+			if sensitive_key_name:
+				return f'Typed <{sensitive_key_name}> into element {index}'
+			else:
+				return f'Typed <sensitive> into element {index}'
+		else:
+			return f"Typed '{text}' into element {index}"
 
 	async def _get_browser_state(self, include_screenshot: bool = False) -> tuple[str, str | None]:
 		"""Get current browser state. Returns (state_json, screenshot_b64 | None)."""
 		if not self.browser_session:
 			return 'Error: No browser session active', None
 
-		async def _do_get_state() -> tuple[str, str | None]:
-			state = await self.browser_session.get_browser_state_summary()
+		state = await self.browser_session.get_browser_state_summary()
 
-			result: dict[str, Any] = {
-				'url': state.url,
-				'title': state.title,
-				'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
-				'interactive_elements': [],
+		result: dict[str, Any] = {
+			'url': state.url,
+			'title': state.title,
+			'tabs': [{'url': tab.url, 'title': tab.title} for tab in state.tabs],
+			'interactive_elements': [],
+		}
+
+		# Add viewport info so the LLM knows the coordinate space
+		if state.page_info:
+			pi = state.page_info
+			result['viewport'] = {
+				'width': pi.viewport_width,
+				'height': pi.viewport_height,
+			}
+			result['page'] = {
+				'width': pi.page_width,
+				'height': pi.page_height,
+			}
+			result['scroll'] = {
+				'x': pi.scroll_x,
+				'y': pi.scroll_y,
 			}
 
-			# Add viewport info so the LLM knows the coordinate space
+		# Add interactive elements with their indices
+		for index, element in state.dom_state.selector_map.items():
+			elem_info: dict[str, Any] = {
+				'index': index,
+				'tag': element.tag_name,
+				'text': element.get_all_children_text(max_depth=2)[:100],
+			}
+			if element.attributes.get('placeholder'):
+				elem_info['placeholder'] = element.attributes['placeholder']
+			if element.attributes.get('href'):
+				elem_info['href'] = element.attributes['href']
+			result['interactive_elements'].append(elem_info)
+
+		# Return screenshot separately as ImageContent instead of embedding base64 in JSON
+		screenshot_b64 = None
+		if include_screenshot and state.screenshot:
+			screenshot_b64 = state.screenshot
+			# Include viewport dimensions in JSON so LLM can map pixels to coordinates
 			if state.page_info:
-				pi = state.page_info
-				result['viewport'] = {
-					'width': pi.viewport_width,
-					'height': pi.viewport_height,
-				}
-				result['page'] = {
-					'width': pi.page_width,
-					'height': pi.page_height,
-				}
-				result['scroll'] = {
-					'x': pi.scroll_x,
-					'y': pi.scroll_y,
+				result['screenshot_dimensions'] = {
+					'width': state.page_info.viewport_width,
+					'height': state.page_info.viewport_height,
 				}
 
-			# Add interactive elements with their indices
-			for index, element in state.dom_state.selector_map.items():
-				elem_info: dict[str, Any] = {
-					'index': index,
-					'tag': element.tag_name,
-					'text': element.get_all_children_text(max_depth=2)[:100],
-				}
-				if element.attributes.get('placeholder'):
-					elem_info['placeholder'] = element.attributes['placeholder']
-				if element.attributes.get('href'):
-					elem_info['href'] = element.attributes['href']
-				result['interactive_elements'].append(elem_info)
-
-			# Return screenshot separately as ImageContent instead of embedding base64 in JSON
-			screenshot_b64 = None
-			if include_screenshot and state.screenshot:
-				screenshot_b64 = state.screenshot
-				# Include viewport dimensions in JSON so LLM can map pixels to coordinates
-				if state.page_info:
-					result['screenshot_dimensions'] = {
-						'width': state.page_info.viewport_width,
-						'height': state.page_info.viewport_height,
-					}
-
-			return json.dumps(result, indent=2), screenshot_b64
-
-		result = await self._run_browser_command(
-			_do_get_state(),
-			task_name='get_browser_state',
-			timeout=30.0,
-		)
-		if isinstance(result, str) and result.startswith('Error:'):
-			return result, None
-		return result  # type: ignore[return-value]
+		return json.dumps(result, indent=2), screenshot_b64
 
 	async def _get_html(self, selector: str | None = None) -> str:
 		"""Get raw HTML of the page or a specific element."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		async def _do_get_html() -> str:
-			cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=None, focus=False)
-			if not cdp_session:
-				return 'Error: No active CDP session'
+		self._update_session_activity(self.browser_session.id)
 
-			if selector:
-				js = (
-					f'(function(){{ const el = document.querySelector({json.dumps(selector)}); return el ? el.outerHTML : null; }})()'
-				)
-			else:
-				js = 'document.documentElement.outerHTML'
+		cdp_session = await self.browser_session.get_or_create_cdp_session(target_id=None, focus=False)
+		if not cdp_session:
+			return 'Error: No active CDP session'
 
-			result = await cdp_session.cdp_client.send.Runtime.evaluate(
-				params={'expression': js, 'returnByValue': True},
-				session_id=cdp_session.session_id,
+		if selector:
+			js = (
+				f'(function(){{ const el = document.querySelector({json.dumps(selector)}); return el ? el.outerHTML : null; }})()'
 			)
-			html = result.get('result', {}).get('value')
-			if html is None:
-				return f'No element found for selector: {selector}' if selector else 'Error: Could not get page HTML'
-			return html
+		else:
+			js = 'document.documentElement.outerHTML'
 
-		return await self._run_browser_command(
-			_do_get_html(),
-			task_name='get_html',
-			timeout=30.0,
+		result = await cdp_session.cdp_client.send.Runtime.evaluate(
+			params={'expression': js, 'returnByValue': True},
+			session_id=cdp_session.session_id,
 		)
+		html = result.get('result', {}).get('value')
+		if html is None:
+			return f'No element found for selector: {selector}' if selector else 'Error: Could not get page HTML'
+		return html
 
 	async def _screenshot(self, full_page: bool = False) -> tuple[str, str | None]:
 		"""Take a screenshot. Returns (metadata_json, screenshot_b64 | None)."""
 		if not self.browser_session:
 			return 'Error: No browser session active', None
 
-		async def _do_screenshot() -> tuple[str, str | None]:
-			import base64
+		import base64
 
-			data = await self.browser_session.take_screenshot(full_page=full_page)
-			b64 = base64.b64encode(data).decode()
+		self._update_session_activity(self.browser_session.id)
 
-			# Return screenshot separately as ImageContent instead of embedding base64 in JSON
-			state = await self.browser_session.get_browser_state_summary()
-			result: dict[str, Any] = {
-				'size_bytes': len(data),
+		data = await self.browser_session.take_screenshot(full_page=full_page)
+		b64 = base64.b64encode(data).decode()
+
+		# Return screenshot separately as ImageContent instead of embedding base64 in JSON
+		state = await self.browser_session.get_browser_state_summary()
+		result: dict[str, Any] = {
+			'size_bytes': len(data),
+		}
+		if state.page_info:
+			result['viewport'] = {
+				'width': state.page_info.viewport_width,
+				'height': state.page_info.viewport_height,
 			}
-			if state.page_info:
-				result['viewport'] = {
-					'width': state.page_info.viewport_width,
-					'height': state.page_info.viewport_height,
-				}
-			return json.dumps(result), b64
-
-		result = await self._run_browser_command(
-			_do_screenshot(),
-			task_name='screenshot',
-			timeout=30.0,
-		)
-		if isinstance(result, str) and result.startswith('Error:'):
-			return result, None
-		return result  # type: ignore[return-value]
+		return json.dumps(result), b64
 
 	async def _extract_content(self, query: str, extract_links: bool = False) -> str:
 		"""Extract content from current page."""
@@ -1051,40 +1008,33 @@ class BrowserUseServer:
 		if not self.tools:
 			return 'Error: Tools not initialized'
 
-		async def _do_extract() -> str:
-			state = await self.browser_session.get_browser_state_summary()
+		state = await self.browser_session.get_browser_state_summary()
 
-			# Use the extract action
-			# Create a dynamic action model that matches the tools's expectations
-			from pydantic import create_model
+		# Use the extract action
+		# Create a dynamic action model that matches the tools's expectations
+		from pydantic import create_model
 
-			# Create action model dynamically
-			ExtractAction = create_model(
-				'ExtractAction',
-				__base__=ActionModel,
-				extract=dict[str, Any],
-			)
-
-			# Use model_validate because Pyright does not understand the dynamic model
-			action = ExtractAction.model_validate(
-				{
-					'extract': {'query': query, 'extract_links': extract_links},
-				}
-			)
-			action_result = await self.tools.act(
-				action=action,
-				browser_session=self.browser_session,
-				page_extraction_llm=self.llm,
-				file_system=self.file_system,
-			)
-
-			return action_result.extracted_content or 'No content extracted'
-
-		return await self._run_browser_command(
-			_do_extract(),
-			task_name='extract_content',
-			timeout=60.0,  # LLM extraction can be slow
+		# Create action model dynamically
+		ExtractAction = create_model(
+			'ExtractAction',
+			__base__=ActionModel,
+			extract=dict[str, Any],
 		)
+
+		# Use model_validate because Pyright does not understand the dynamic model
+		action = ExtractAction.model_validate(
+			{
+				'extract': {'query': query, 'extract_links': extract_links},
+			}
+		)
+		action_result = await self.tools.act(
+			action=action,
+			browser_session=self.browser_session,
+			page_extraction_llm=self.llm,
+			file_system=self.file_system,
+		)
+
+		return action_result.extracted_content or 'No content extracted'
 
 	async def _scroll(self, direction: str = 'down') -> str:
 		"""Scroll the page."""
@@ -1093,21 +1043,15 @@ class BrowserUseServer:
 
 		from browser_use.browser.events import ScrollEvent
 
-		async def _do_scroll() -> str:
-			event = self.browser_session.event_bus.dispatch(
-				ScrollEvent(
-					direction=direction,
-					amount=500,
-				)
+		# Scroll by a standard amount (500 pixels)
+		event = self.browser_session.event_bus.dispatch(
+			ScrollEvent(
+				direction=direction,  # type: ignore
+				amount=500,
 			)
-			await event
-			return f'Scrolled {direction}'
-
-		return await self._run_browser_command(
-			_do_scroll(),
-			task_name=f'scroll_{direction}',
-			timeout=15.0,
 		)
+		await event
+		return f'Scrolled {direction}'
 
 	async def _go_back(self) -> str:
 		"""Go back in browser history."""
@@ -1116,103 +1060,58 @@ class BrowserUseServer:
 
 		from browser_use.browser.events import GoBackEvent
 
-		async def _do_go_back() -> str:
-			event = self.browser_session.event_bus.dispatch(GoBackEvent())
-			await event
-			return 'Navigated back'
-
-		return await self._run_browser_command(
-			_do_go_back(),
-			task_name='go_back',
-			timeout=15.0,
-		)
+		event = self.browser_session.event_bus.dispatch(GoBackEvent())
+		await event
+		return 'Navigated back'
 
 	async def _close_browser(self) -> str:
 		"""Close the browser session."""
-		if not self.browser_session:
-			return 'No browser session to close'
+		if self.browser_session:
+			from browser_use.browser.events import BrowserStopEvent
 
-		from browser_use.browser.events import BrowserStopEvent
-
-		async def _do_close() -> str:
 			event = self.browser_session.event_bus.dispatch(BrowserStopEvent())
 			await event
+			self.browser_session = None
+			self.tools = None
 			return 'Browser closed'
-
-		result = await self._run_browser_command(
-			_do_close(),
-			task_name='close_browser',
-			timeout=10.0,
-		)
-
-		# Clear references even if close had issues
-		if isinstance(result, str) and not result.startswith('Error:'):
-			self.browser_session = None
-			self.tools = None
-		elif result.startswith('Error:'):
-			# Force-clear on error too to avoid stale references
-			self.browser_session = None
-			self.tools = None
-
-		return result if isinstance(result, str) else 'Browser closed'
+		return 'No browser session to close'
 
 	async def _list_tabs(self) -> str:
 		"""List all open tabs."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		async def _do_list_tabs() -> str:
-			tabs_info = await self.browser_session.get_tabs()
-			tabs = []
-			for i, tab in enumerate(tabs_info):
-				tabs.append({'tab_id': tab.target_id[-4:], 'url': tab.url, 'title': tab.title or ''})
-			return json.dumps(tabs, indent=2)
-
-		return await self._run_browser_command(
-			_do_list_tabs(),
-			task_name='list_tabs',
-			timeout=15.0,
-		)
+		tabs_info = await self.browser_session.get_tabs()
+		tabs = []
+		for i, tab in enumerate(tabs_info):
+			tabs.append({'tab_id': tab.target_id[-4:], 'url': tab.url, 'title': tab.title or ''})
+		return json.dumps(tabs, indent=2)
 
 	async def _switch_tab(self, tab_id: str) -> str:
 		"""Switch to a different tab."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		async def _do_switch_tab() -> str:
-			from browser_use.browser.events import SwitchTabEvent
+		from browser_use.browser.events import SwitchTabEvent
 
-			target_id = await self.browser_session.get_target_id_from_tab_id(tab_id)
-			event = self.browser_session.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
-			await event
-			state = await self.browser_session.get_browser_state_summary()
-			return f'Switched to tab {tab_id}: {state.url}'
-
-		return await self._run_browser_command(
-			_do_switch_tab(),
-			task_name='switch_tab',
-			timeout=15.0,
-		)
+		target_id = await self.browser_session.get_target_id_from_tab_id(tab_id)
+		event = self.browser_session.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
+		await event
+		state = await self.browser_session.get_browser_state_summary()
+		return f'Switched to tab {tab_id}: {state.url}'
 
 	async def _close_tab(self, tab_id: str) -> str:
 		"""Close a specific tab."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		async def _do_close_tab() -> str:
-			from browser_use.browser.events import CloseTabEvent
+		from browser_use.browser.events import CloseTabEvent
 
-			target_id = await self.browser_session.get_target_id_from_tab_id(tab_id)
-			event = self.browser_session.event_bus.dispatch(CloseTabEvent(target_id=target_id))
-			await event
-			current_url = await self.browser_session.get_current_page_url()
-			return f'Closed tab # {tab_id}, now on {current_url}'
-
-		return await self._run_browser_command(
-			_do_close_tab(),
-			task_name='close_tab',
-			timeout=15.0,
-		)
+		target_id = await self.browser_session.get_target_id_from_tab_id(tab_id)
+		event = self.browser_session.event_bus.dispatch(CloseTabEvent(target_id=target_id))
+		await event
+		current_url = await self.browser_session.get_current_page_url()
+		return f'Closed tab # {tab_id}, now on {current_url}'
 
 	def _track_session(self, session: BrowserSession) -> None:
 		"""Track a browser session for management."""
@@ -1263,32 +1162,24 @@ class BrowserUseServer:
 		session_data = self.active_sessions[session_id]
 		session = session_data['session']
 
-		# Use RuntimeSessionController for unified session close with timeout and exception normalization
-		controller = RuntimeSessionController(browser_session=session)
-		use_cdp = bool(getattr(session, 'cdp_url', None))
-		use_cloud = bool(getattr(session, '_cloud_browser_client', None))
+		try:
+			# Close the session
+			if hasattr(session, 'kill'):
+				await session.kill()
+			elif hasattr(session, 'close'):
+				await session.close()
 
-		close_result = await controller.close_session(
-			timeout=10.0,
-			force=False,
-			cloud=use_cloud,
-			cdp_url=use_cdp,
-		)
+			# Remove from tracking
+			del self.active_sessions[session_id]
 
-		# Remove from tracking regardless of close success
-		del self.active_sessions[session_id]
+			# If this was the current session, clear it
+			if self.browser_session and self.browser_session.id == session_id:
+				self.browser_session = None
+				self.tools = None
 
-		# If this was the current session, clear it
-		if self.browser_session and self.browser_session.id == session_id:
-			self.browser_session = None
-			self.tools = None
-
-		if close_result.success:
 			return f'Successfully closed session {session_id}'
-		elif close_result.timed_out:
-			return f'Warning: Session {session_id} close timed out'
-		else:
-			return f'Error closing session {session_id}: {close_result.error or "Unknown error"}'
+		except Exception as e:
+			return f'Error closing session {session_id}: {str(e)}'
 
 	async def _close_all_sessions(self) -> str:
 		"""Close all active browser sessions."""
@@ -1299,11 +1190,14 @@ class BrowserUseServer:
 		errors = []
 
 		for session_id in list(self.active_sessions.keys()):
-			result = await self._close_session(session_id)
-			if 'Successfully closed' in result:
-				closed_count += 1
-			elif result.startswith('Error') or result.startswith('Warning'):
-				errors.append(f'{session_id}: {result}')
+			try:
+				result = await self._close_session(session_id)
+				if 'Successfully closed' in result:
+					closed_count += 1
+				else:
+					errors.append(f'{session_id}: {result}')
+			except Exception as e:
+				errors.append(f'{session_id}: {str(e)}')
 
 		# Clear current session references
 		self.browser_session = None
@@ -1314,36 +1208,6 @@ class BrowserUseServer:
 			result += f'. Errors: {"; ".join(errors)}'
 
 		return result
-
-	async def _run_browser_command[T](
-		self,
-		coro: Coroutine[Any, Any, T],
-		*,
-		task_name: str = 'browser_command',
-		timeout: float = 30.0,
-		default_error: str = 'Command failed',
-	) -> T | str:
-		"""Helper to wrap any direct browser command with controller lifecycle.
-
-		Returns the successful result (any type), or an error string starting with 'Error:'.
-		"""
-		if not self.browser_session:
-			return 'Error: No browser session active'
-
-		self._update_session_activity(self.browser_session.id)
-
-		controller = RuntimeSessionController(browser_session=self.browser_session)
-		result = await controller.run_browser_session_task(
-			coro,
-			timeout=timeout,
-			task_name=task_name,
-		)
-
-		if result.success:
-			return result.result  # type: ignore[return-value]
-		if result.timed_out:
-			return f'Error: {task_name} timed out after {timeout}s'
-		return f'Error: {result.error or default_error}'
 
 	async def _cleanup_expired_sessions(self) -> None:
 		"""Background task to clean up expired sessions."""

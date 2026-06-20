@@ -148,16 +148,11 @@ from typing import Any
 
 from dotenv import load_dotenv
 
-from browser_use.llm.anthropic.chat import ChatAnthropic
-from browser_use.llm.google.chat import ChatGoogle
-from browser_use.llm.openai.chat import ChatOpenAI
-
 load_dotenv()
 
-from browser_use import Agent, Controller, RuntimeSessionController
+from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserProfile, BrowserSession
-from browser_use.controller.runtime_session import LifecycleCallbacks, TaskResult
 from browser_use.logging_config import addLoggingLevel
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
@@ -366,16 +361,22 @@ def get_llm(config: dict[str, Any]):
 			if not api_key and not CONFIG.OPENAI_API_KEY:
 				print('⚠️  OpenAI API key not found. Please update your config or set OPENAI_API_KEY environment variable.')
 				sys.exit(1)
+			from browser_use.llm.openai.chat import ChatOpenAI
+
 			return ChatOpenAI(model=model_name, temperature=temperature, api_key=api_key or CONFIG.OPENAI_API_KEY)
 		elif model_name.startswith('claude'):
 			if not CONFIG.ANTHROPIC_API_KEY:
 				print('⚠️  Anthropic API key not found. Please update your config or set ANTHROPIC_API_KEY environment variable.')
 				sys.exit(1)
+			from browser_use.llm.anthropic.chat import ChatAnthropic
+
 			return ChatAnthropic(model=model_name, temperature=temperature)
 		elif model_name.startswith('gemini'):
 			if not CONFIG.GOOGLE_API_KEY:
 				print('⚠️  Google API key not found. Please update your config or set GOOGLE_API_KEY environment variable.')
 				sys.exit(1)
+			from browser_use.llm.google.chat import ChatGoogle
+
 			return ChatGoogle(model=model_name, temperature=temperature)
 		elif model_name.startswith('oci'):
 			# OCI models require additional configuration
@@ -386,10 +387,16 @@ def get_llm(config: dict[str, Any]):
 
 	# Auto-detect based on available API keys
 	if api_key or CONFIG.OPENAI_API_KEY:
+		from browser_use.llm.openai.chat import ChatOpenAI
+
 		return ChatOpenAI(model='gpt-5-mini', temperature=temperature, api_key=api_key or CONFIG.OPENAI_API_KEY)
 	elif CONFIG.ANTHROPIC_API_KEY:
+		from browser_use.llm.anthropic.chat import ChatAnthropic
+
 		return ChatAnthropic(model='claude-4-sonnet', temperature=temperature)
 	elif CONFIG.GOOGLE_API_KEY:
+		from browser_use.llm.google.chat import ChatGoogle
+
 		return ChatGoogle(model='gemini-2.5-pro', temperature=temperature)
 	else:
 		print(
@@ -1023,23 +1030,17 @@ class BrowserUseApp(App):
 		async def agent_task_worker() -> None:
 			logger.debug('\n🚀 Working on task: %s', task)
 
-			if not self.agent:
-				return
-
 			# Set flags to indicate the agent is running
-			self.agent.running = True  # type: ignore
-			self.agent.last_response_time = 0  # type: ignore
+			if self.agent:
+				self.agent.running = True  # type: ignore
+				self.agent.last_response_time = 0  # type: ignore
+
+			# Panel updates are already happening via the timer in update_info_panels
 
 			task_start_time = time.time()
+			error_msg = None
 
-			# Closure variables for cleanup to know success/error state
-			_worker_had_error = False
-			_worker_error_msg: str | None = None
-
-			# Use RuntimeSessionController explicitly for unified lifecycle management
-			controller = RuntimeSessionController(agent=self.agent)
-
-			async def _on_start() -> None:
+			try:
 				# Capture telemetry for message sent
 				self._telemetry.capture(
 					CLITelemetryEvent(
@@ -1051,16 +1052,13 @@ class BrowserUseApp(App):
 					)
 				)
 
-			async def _on_error(e: Exception) -> None:
+				# Run the agent task, redirecting output to RichLog through our handler
+				if self.agent:
+					await self.agent.run()
+			except Exception as e:
+				error_msg = str(e)
 				logger.error('\nError running agent: %s', str(e))
-
-			async def _track_error(e: Exception) -> None:
-				nonlocal _worker_had_error, _worker_error_msg
-				_worker_had_error = True
-				_worker_error_msg = str(e)
-				await _on_error(e)
-
-			async def _on_cleanup() -> None:
+			finally:
 				# Clear the running flag
 				if self.agent:
 					self.agent.running = False  # type: ignore
@@ -1070,12 +1068,12 @@ class BrowserUseApp(App):
 				self._telemetry.capture(
 					CLITelemetryEvent(
 						version=get_browser_use_version(),
-						action='task_completed' if not _worker_had_error else 'error',
+						action='task_completed' if error_msg is None else 'error',
 						mode='interactive',
 						model=self.llm.model if self.llm and hasattr(self.llm, 'model') else None,
 						model_provider=self.llm.provider if self.llm and hasattr(self.llm, 'provider') else None,
 						duration_seconds=duration,
-						error_message=_worker_error_msg,
+						error_message=error_msg,
 					)
 				)
 
@@ -1091,20 +1089,6 @@ class BrowserUseApp(App):
 
 				# Ensure the input is visible by scrolling to it
 				self.call_after_refresh(self.scroll_to_input)
-
-			callbacks = LifecycleCallbacks(
-				on_start=_on_start,
-				on_error=_track_error,
-				on_cleanup=_on_cleanup,
-			)
-
-			# Run agent via controller with unified lifecycle
-			await controller.run_with_lifecycle(
-				controller.run_agent_task(),
-				timeout=None,
-				task_name=f'CLI agent task "{task[:40]}..."',
-				callbacks=callbacks,
-			)
 
 		# Run the worker
 		self.run_worker(agent_task_worker, name='agent_task')

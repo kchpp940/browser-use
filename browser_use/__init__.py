@@ -50,10 +50,11 @@ if TYPE_CHECKING:
 	from browser_use.agent.views import ActionModel, ActionResult, AgentHistoryList
 	from browser_use.browser import BrowserProfile, BrowserSession
 	from browser_use.browser import BrowserSession as Browser
-	from browser_use.controller.runtime_session import LifecycleCallbacks, RuntimeSessionController, TaskResult
 	from browser_use.dom.service import DomService
 	from browser_use.llm import models
 	from browser_use.llm.anthropic.chat import ChatAnthropic
+	from browser_use.llm.aws.chat_anthropic import ChatAnthropicBedrock
+	from browser_use.llm.aws.chat_bedrock import ChatAWSBedrock
 	from browser_use.llm.azure.chat import ChatAzureOpenAI
 	from browser_use.llm.browser_use.chat import ChatBrowserUse
 	from browser_use.llm.google.chat import ChatGoogle
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
 	from browser_use.llm.openai.chat import ChatOpenAI
 	from browser_use.llm.vercel.chat import ChatVercel
 	from browser_use.sandbox import sandbox
+	from browser_use.skills.service import SkillService
 	from browser_use.tools.service import Controller, Tools
 
 	# Lazy imports mapping - only import when actually accessed
@@ -80,10 +82,6 @@ _LAZY_IMPORTS = {
 	'BrowserSession': ('browser_use.browser', 'BrowserSession'),
 	'Browser': ('browser_use.browser', 'BrowserSession'),  # Alias for BrowserSession
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
-	# Runtime lifecycle controller
-	'RuntimeSessionController': ('browser_use.controller.runtime_session', 'RuntimeSessionController'),
-	'TaskResult': ('browser_use.controller.runtime_session', 'TaskResult'),
-	'LifecycleCallbacks': ('browser_use.controller.runtime_session', 'LifecycleCallbacks'),
 	# Tools (moderate weight)
 	'Tools': ('browser_use.tools.service', 'Tools'),
 	'Controller': ('browser_use.tools.service', 'Controller'),  # alias
@@ -101,10 +99,37 @@ _LAZY_IMPORTS = {
 	'ChatOCIRaw': ('browser_use.llm.oci_raw.chat', 'ChatOCIRaw'),
 	'ChatOllama': ('browser_use.llm.ollama.chat', 'ChatOllama'),
 	'ChatVercel': ('browser_use.llm.vercel.chat', 'ChatVercel'),
+	'ChatAWSBedrock': ('browser_use.llm.aws.chat_bedrock', 'ChatAWSBedrock'),
+	'ChatAnthropicBedrock': ('browser_use.llm.aws.chat_anthropic', 'ChatAnthropicBedrock'),
 	# LLM models module
 	'models': ('browser_use.llm.models', None),
 	# Sandbox execution
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
+	# Skills service (requires browser-use-sdk / cloud extra)
+	'SkillService': ('browser_use.skills.service', 'SkillService'),
+}
+
+
+_EXTRA_HINTS: dict[str, tuple[str, str]] = {
+	# LLM providers
+	'ChatOpenAI': ('llm-openai', 'OpenAI'),
+	'ChatAzureOpenAI': ('llm-openai', 'Azure OpenAI'),
+	'ChatAnthropic': ('llm-anthropic', 'Anthropic Claude'),
+	'ChatGoogle': ('llm-google', 'Google Gemini'),
+	'ChatGroq': ('llm-groq', 'Groq'),
+	'ChatOllama': ('llm-ollama', 'Ollama'),
+	'ChatMistral': ('llm-openai', 'Mistral'),
+	'ChatCerebras': ('llm-openai', 'Cerebras'),
+	'ChatOCIRaw': ('llm-oci', 'OCI'),
+	'ChatLiteLLM': ('llm-openai', 'LiteLLM'),
+	'ChatDeepSeek': ('llm-openai', 'DeepSeek'),
+	'ChatOpenRouter': ('llm-openai', 'OpenRouter'),
+	'ChatVercel': ('llm-openai', 'Vercel'),
+	'ChatAWSBedrock': ('llm-aws', 'AWS Bedrock'),
+	'ChatAnthropicBedrock': ('llm-aws', 'Anthropic via AWS Bedrock'),
+	# Sandbox / Cloud
+	'sandbox': ('cloud', 'Sandbox & Cloud'),
+	'SkillService': ('cloud', 'Skills API & Cloud Browser'),
 }
 
 
@@ -117,14 +142,21 @@ def __getattr__(name: str):
 
 			module = import_module(module_path)
 			if attr_name is None:
-				# For modules like 'models', return the module itself
 				attr = module
 			else:
 				attr = getattr(module, attr_name)
-			# Cache the imported attribute in the module's globals
 			globals()[name] = attr
 			return attr
 		except ImportError as e:
+			hint = _EXTRA_HINTS.get(name)
+			if hint:
+				extra, feature = hint
+				msg = (
+					f'{feature} is not available. Install the required dependencies with: '
+					f'`pip install "browser-use[{extra}]"` or `uv pip install "browser-use[{extra}]"`.'
+					f'\nOriginal error: {e}'
+				)
+				raise ImportError(msg) from e
 			raise ImportError(f'Failed to import {name} from {module_path}: {e}') from e
 
 	raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
@@ -137,9 +169,6 @@ __all__ = [
 	'BrowserProfile',
 	'Controller',
 	'DomService',
-	'RuntimeSessionController',
-	'TaskResult',
-	'LifecycleCallbacks',
 	'SystemPrompt',
 	'ActionResult',
 	'ActionModel',
@@ -156,10 +185,14 @@ __all__ = [
 	'ChatOCIRaw',
 	'ChatOllama',
 	'ChatVercel',
+	'ChatAWSBedrock',
+	'ChatAnthropicBedrock',
 	'Tools',
 	'Controller',
 	# LLM models module
 	'models',
 	# Sandbox execution
 	'sandbox',
+	# Skills service
+	'SkillService',
 ]

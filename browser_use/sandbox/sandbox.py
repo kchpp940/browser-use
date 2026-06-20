@@ -12,8 +12,28 @@ from collections.abc import Callable, Coroutine
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, Union, cast, get_args, get_origin
 
-import cloudpickle
 import httpx
+
+try:
+	import cloudpickle
+
+	CLOUDPICKLE_AVAILABLE = True
+except ImportError as _e:
+	cloudpickle = None  # type: ignore
+	CLOUDPICKLE_AVAILABLE = False
+	_CLOUDPICKLE_MISSING = _e
+
+
+def _require_cloudpickle():
+	"""Raise a friendly ImportError if cloudpickle (browser-use[cloud]) is not installed."""
+	if not CLOUDPICKLE_AVAILABLE:
+		msg = (
+			'The `@sandbox` decorator requires the `cloud` extra dependencies. '
+			'Install them with: `pip install "browser-use[cloud]"` or `uv pip install "browser-use[cloud]"`.'
+		)
+		if _CLOUDPICKLE_MISSING is not None:
+			msg += f'\nOriginal error: {_CLOUDPICKLE_MISSING}'
+		raise ImportError(msg)
 
 from browser_use.sandbox.views import (
 	BrowserCreatedData,
@@ -24,7 +44,6 @@ from browser_use.sandbox.views import (
 	SSEEvent,
 	SSEEventType,
 )
-from browser_use.controller.runtime_session import LifecycleCallbacks, RuntimeSessionController, TaskResult
 
 if TYPE_CHECKING:
 	from browser_use.browser import BrowserSession
@@ -285,6 +304,9 @@ def sandbox(
 
 		@wraps(func)
 		async def wrapper(*args, **kwargs) -> T:
+			# 0. Ensure cloudpickle (sandbox/cloud dep) is available
+			_require_cloudpickle()
+
 			# 1. Get API key
 			api_key = BROWSER_USE_API_KEY or os.getenv('BROWSER_USE_API_KEY')
 			if not api_key:
@@ -370,24 +392,18 @@ async def run(browser):
 			if headers:
 				request_headers.update(headers)
 
-			# 10. Handle SSE streaming via RuntimeSessionController for unified lifecycle
+			# 10. Handle SSE streaming
 			_NO_RESULT = object()
 			execution_result = _NO_RESULT
 			live_url_shown = False
 			execution_started = False
 			received_final_event = False
 
-			# Use RuntimeSessionController for unified timeout, cancellation, and exception handling
-			controller = RuntimeSessionController()
+			async with httpx.AsyncClient(timeout=1800.0) as client:
+				async with client.stream('POST', url, json=payload, headers=request_headers) as response:
+					response.raise_for_status()
 
-			async def _execute_sandbox_stream() -> Any:
-				"""Inner function containing the actual SSE stream + result parsing."""
-				nonlocal execution_result, live_url_shown, execution_started, received_final_event
-
-				async with httpx.AsyncClient(timeout=1800.0) as client:
-					async with client.stream('POST', url, json=payload, headers=request_headers) as response:
-						response.raise_for_status()
-
+					try:
 						async for line in response.aiter_lines():
 							if not line or not line.startswith('data: '):
 								continue
@@ -507,59 +523,22 @@ async def run(browser):
 							except (json.JSONDecodeError, ValueError):
 								continue
 
-				# 11. Parse result with type annotation
-				if execution_result is not _NO_RESULT:
-					return_annotation = func.__annotations__.get('return')
-					if return_annotation:
-						parsed_result = _parse_with_type_annotation(execution_result, return_annotation)
-						return parsed_result
-					return execution_result
+					except (httpx.RemoteProtocolError, httpx.ReadError, httpx.StreamClosed) as e:
+						# With deterministic handshake, these should never happen
+						# If they do, it's a real error
+						raise SandboxError(
+							f'Stream error: {e.__class__.__name__}: {e or "connection closed unexpectedly"}'
+						) from e
 
-				raise SandboxError('No result received from execution')
+			# 11. Parse result with type annotation
+			if execution_result is not _NO_RESULT:
+				return_annotation = func.__annotations__.get('return')
+				if return_annotation:
+					parsed_result = _parse_with_type_annotation(execution_result, return_annotation)
+					return parsed_result
+				return execution_result  # type: ignore[return-value]
 
-			async def _on_stream_error(e: Exception) -> None:
-				"""Normalize httpx stream errors to SandboxError."""
-				if isinstance(e, (httpx.RemoteProtocolError, httpx.ReadError, httpx.StreamClosed)):
-					# Convert httpx stream errors to SandboxError
-					raise SandboxError(
-						f'Stream error: {e.__class__.__name__}: {e or "connection closed unexpectedly"}'
-					) from e
-				# Other exceptions propagate as-is
-
-			async def _convert_and_handle_error(e: Exception) -> None:
-				"""Interceptor that converts httpx errors before passing to user callback."""
-				try:
-					await _on_stream_error(e)
-				except SandboxError:
-					# Re-raise as the normalized form
-					raise
-				except Exception:
-					# If _on_stream_error didn't handle it, propagate original
-					pass
-
-			callbacks = LifecycleCallbacks(on_error=_convert_and_handle_error)
-
-			stream_result: TaskResult = await controller.run_with_lifecycle(
-				_execute_sandbox_stream(),
-				timeout=None,  # httpx already has 1800s timeout
-				task_name=f'sandbox_execution_{func.__name__}',
-				callbacks=callbacks,
-			)
-
-			if stream_result.success:
-				return stream_result.result  # type: ignore[return-value]
-
-			if stream_result.cancelled:
-				raise SandboxError(f'Sandbox execution cancelled: {stream_result.error or "Cancelled by user"}')
-
-			if stream_result.timed_out:
-				raise SandboxError(f'Sandbox execution timed out: {stream_result.error or "Timeout"}')
-
-			# Re-raise normalized error
-			error_msg = stream_result.error or 'Unknown sandbox error'
-			if isinstance(stream_result.error, SandboxError):
-				raise stream_result.error
-			raise SandboxError(error_msg)
+			raise SandboxError('No result received from execution')
 
 		# Update wrapper signature to remove browser parameter
 		wrapper.__annotations__ = func.__annotations__.copy()

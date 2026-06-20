@@ -14,21 +14,149 @@ Usage:
 import os
 from typing import TYPE_CHECKING
 
-from browser_use.llm.azure.chat import ChatAzureOpenAI
+# ChatBrowserUse uses httpx only (core dep), always available
 from browser_use.llm.browser_use.chat import ChatBrowserUse
-from browser_use.llm.cerebras.chat import ChatCerebras
-from browser_use.llm.google.chat import ChatGoogle
-from browser_use.llm.mistral.chat import ChatMistral
-from browser_use.llm.openai.chat import ChatOpenAI
 
-# Optional OCI import
+# --- Optional per-provider imports with friendly install hints ---
+try:
+	from browser_use.llm.openai.chat import ChatOpenAI
+
+	OPENAI_AVAILABLE = True
+except ImportError as _e:
+	ChatOpenAI = None  # type: ignore
+	OPENAI_AVAILABLE = False
+	_OPENAI_MISSING = _e
+
+try:
+	from browser_use.llm.azure.chat import ChatAzureOpenAI
+
+	AZURE_AVAILABLE = True
+except ImportError as _e:
+	ChatAzureOpenAI = None  # type: ignore
+	AZURE_AVAILABLE = False
+	_AZURE_MISSING = _e
+
+try:
+	from browser_use.llm.google.chat import ChatGoogle
+
+	GOOGLE_AVAILABLE = True
+except ImportError as _e:
+	ChatGoogle = None  # type: ignore
+	GOOGLE_AVAILABLE = False
+	_GOOGLE_MISSING = _e
+
+try:
+	from browser_use.llm.mistral.chat import ChatMistral
+
+	MISTRAL_AVAILABLE = True
+except ImportError as _e:
+	ChatMistral = None  # type: ignore
+	MISTRAL_AVAILABLE = False
+	_MISTRAL_MISSING = _e
+
+try:
+	from browser_use.llm.cerebras.chat import ChatCerebras
+
+	CEREBRAS_AVAILABLE = True
+except ImportError as _e:
+	ChatCerebras = None  # type: ignore
+	CEREBRAS_AVAILABLE = False
+	_CEREBRAS_MISSING = _e
+
+try:
+	from browser_use.llm.anthropic.chat import ChatAnthropic
+
+	ANTHROPIC_AVAILABLE = True
+except ImportError as _e:
+	ChatAnthropic = None  # type: ignore
+	ANTHROPIC_AVAILABLE = False
+	_ANTHROPIC_MISSING = _e
+
 try:
 	from browser_use.llm.oci_raw.chat import ChatOCIRaw
 
 	OCI_AVAILABLE = True
-except ImportError:
-	ChatOCIRaw = None
+except ImportError as _e:
+	ChatOCIRaw = None  # type: ignore
 	OCI_AVAILABLE = False
+	_OCI_MISSING = _e
+
+try:
+	from browser_use.llm.groq.chat import ChatGroq
+
+	GROQ_AVAILABLE = True
+except ImportError as _e:
+	ChatGroq = None  # type: ignore
+	GROQ_AVAILABLE = False
+	_GROQ_MISSING = _e
+
+try:
+	from browser_use.llm.ollama.chat import ChatOllama
+
+	OLLAMA_AVAILABLE = True
+except ImportError as _e:
+	ChatOllama = None  # type: ignore
+	OLLAMA_AVAILABLE = False
+	_OLLAMA_MISSING = _e
+
+try:
+	from browser_use.llm.aws.chat_bedrock import ChatAWSBedrock
+	from browser_use.llm.aws.chat_anthropic import ChatAnthropicBedrock
+
+	AWS_AVAILABLE = True
+except ImportError as _e:
+	ChatAWSBedrock = None  # type: ignore
+	ChatAnthropicBedrock = None  # type: ignore
+	AWS_AVAILABLE = False
+	_AWS_MISSING = _e
+
+try:
+	from browser_use.llm.deepseek.chat import ChatDeepSeek
+
+	DEEPSEEK_AVAILABLE = True
+except ImportError as _e:
+	ChatDeepSeek = None  # type: ignore
+	DEEPSEEK_AVAILABLE = False
+	_DEEPSEEK_MISSING = _e
+
+try:
+	from browser_use.llm.openrouter.chat import ChatOpenRouter
+
+	OPENROUTER_AVAILABLE = True
+except ImportError as _e:
+	ChatOpenRouter = None  # type: ignore
+	OPENROUTER_AVAILABLE = False
+	_OPENROUTER_MISSING = _e
+
+try:
+	from browser_use.llm.litellm.chat import ChatLiteLLM
+
+	LITELLM_AVAILABLE = True
+except ImportError as _e:
+	ChatLiteLLM = None  # type: ignore
+	LITELLM_AVAILABLE = False
+	_LITELLM_MISSING = _e
+
+try:
+	from browser_use.llm.vercel.chat import ChatVercel
+
+	VERCEL_AVAILABLE = True
+except ImportError as _e:
+	ChatVercel = None  # type: ignore
+	VERCEL_AVAILABLE = False
+	_VERCEL_MISSING = _e
+
+
+def _require_provider(provider: str, extra: str, original_error: Exception | None):
+	"""Raise a friendly ImportError directing the user to install the missing provider extra."""
+	msg = (
+		f'The {provider} LLM provider is not installed. '
+		f'Install it with: `pip install "browser-use[{extra}]"` '
+		f'or `uv pip install "browser-use[{extra}]"`'
+	)
+	if original_error is not None:
+		msg += f'\nOriginal error: {original_error}'
+	raise ImportError(msg)
 
 if TYPE_CHECKING:
 	from browser_use.llm.base import BaseChatModel
@@ -168,29 +296,37 @@ def get_llm_by_name(model_name: str):
 
 	# OpenAI Models
 	if provider == 'openai':
+		if not OPENAI_AVAILABLE:
+			_require_provider('OpenAI', 'llm-openai', _OPENAI_MISSING)
 		api_key = os.getenv('OPENAI_API_KEY')
-		return ChatOpenAI(model=model, api_key=api_key)
+		return ChatOpenAI(model=model, api_key=api_key)  # type: ignore
 
 	# Azure OpenAI Models
 	elif provider == 'azure':
+		if not AZURE_AVAILABLE:
+			_require_provider('Azure OpenAI', 'llm-openai', _AZURE_MISSING)
 		api_key = os.getenv('AZURE_OPENAI_KEY') or os.getenv('AZURE_OPENAI_API_KEY')
 		azure_endpoint = os.getenv('AZURE_OPENAI_ENDPOINT')
-		return ChatAzureOpenAI(model=model, api_key=api_key, azure_endpoint=azure_endpoint)
+		return ChatAzureOpenAI(model=model, api_key=api_key, azure_endpoint=azure_endpoint)  # type: ignore
 
 	# Google Models
 	elif provider == 'google':
+		if not GOOGLE_AVAILABLE:
+			_require_provider('Google Gemini', 'llm-google', _GOOGLE_MISSING)
 		api_key = os.getenv('GOOGLE_API_KEY')
-		return ChatGoogle(model=model, api_key=api_key)
+		return ChatGoogle(model=model, api_key=api_key)  # type: ignore
 
 	# Anthropic Models
 	elif provider == 'anthropic':
-		from browser_use.llm.anthropic.chat import ChatAnthropic
-
+		if not ANTHROPIC_AVAILABLE:
+			_require_provider('Anthropic Claude', 'llm-anthropic', _ANTHROPIC_MISSING)
 		api_key = os.getenv('ANTHROPIC_API_KEY')
-		return ChatAnthropic(model=model, api_key=api_key)
+		return ChatAnthropic(model=model, api_key=api_key)  # type: ignore
 
 	# Mistral Models
 	elif provider == 'mistral':
+		if not MISTRAL_AVAILABLE:
+			_require_provider('Mistral', 'llm-openai', _MISTRAL_MISSING)
 		api_key = os.getenv('MISTRAL_API_KEY')
 		base_url = os.getenv('MISTRAL_BASE_URL', 'https://api.mistral.ai/v1')
 		mistral_map = {
@@ -202,22 +338,23 @@ def get_llm_by_name(model_name: str):
 		}
 		normalized_model_part = model_part.replace('_', '-')
 		resolved_model = mistral_map.get(normalized_model_part, model.replace('_', '-'))
-		return ChatMistral(model=resolved_model, api_key=api_key, base_url=base_url)
+		return ChatMistral(model=resolved_model, api_key=api_key, base_url=base_url)  # type: ignore
 
 	# OCI Models
 	elif provider == 'oci':
-		# OCI requires more complex configuration that can't be easily inferred from env vars
-		# Users should use ChatOCIRaw directly with proper configuration
+		if not OCI_AVAILABLE:
+			_require_provider('OCI', 'llm-oci', _OCI_MISSING)
 		raise ValueError('OCI models require manual configuration. Use ChatOCIRaw directly with your OCI credentials.')
 
 	# Cerebras Models
 	elif provider == 'cerebras':
+		if not CEREBRAS_AVAILABLE:
+			_require_provider('Cerebras', 'llm-openai', _CEREBRAS_MISSING)
 		api_key = os.getenv('CEREBRAS_API_KEY')
-		return ChatCerebras(model=model, api_key=api_key)
+		return ChatCerebras(model=model, api_key=api_key)  # type: ignore
 
 	# Browser Use Models
 	elif provider == 'bu':
-		# Handle bu_latest -> bu-latest conversion (need to prepend 'bu-' back)
 		model = f'bu-{model_part.replace("_", "-")}'
 		api_key = os.getenv('BROWSER_USE_API_KEY')
 		return ChatBrowserUse(model=model, api_key=api_key)
@@ -232,20 +369,32 @@ def __getattr__(name: str) -> 'BaseChatModel':
 	"""Create model instances on demand with API keys from environment."""
 	# Handle chat classes first
 	if name == 'ChatOpenAI':
+		if not OPENAI_AVAILABLE:
+			_require_provider('OpenAI', 'llm-openai', _OPENAI_MISSING)
 		return ChatOpenAI  # type: ignore
 	elif name == 'ChatAzureOpenAI':
+		if not AZURE_AVAILABLE:
+			_require_provider('Azure OpenAI', 'llm-openai', _AZURE_MISSING)
 		return ChatAzureOpenAI  # type: ignore
 	elif name == 'ChatGoogle':
+		if not GOOGLE_AVAILABLE:
+			_require_provider('Google Gemini', 'llm-google', _GOOGLE_MISSING)
 		return ChatGoogle  # type: ignore
-
+	elif name == 'ChatAnthropic':
+		if not ANTHROPIC_AVAILABLE:
+			_require_provider('Anthropic Claude', 'llm-anthropic', _ANTHROPIC_MISSING)
+		return ChatAnthropic  # type: ignore
 	elif name == 'ChatMistral':
+		if not MISTRAL_AVAILABLE:
+			_require_provider('Mistral', 'llm-openai', _MISTRAL_MISSING)
 		return ChatMistral  # type: ignore
-
 	elif name == 'ChatOCIRaw':
 		if not OCI_AVAILABLE:
-			raise ImportError('OCI integration not available. Install with: pip install "browser-use[oci]"')
+			_require_provider('OCI', 'llm-oci', _OCI_MISSING)
 		return ChatOCIRaw  # type: ignore
 	elif name == 'ChatCerebras':
+		if not CEREBRAS_AVAILABLE:
+			_require_provider('Cerebras', 'llm-openai', _CEREBRAS_MISSING)
 		return ChatCerebras  # type: ignore
 	elif name == 'ChatBrowserUse':
 		return ChatBrowserUse  # type: ignore
@@ -257,16 +406,23 @@ def __getattr__(name: str) -> 'BaseChatModel':
 		raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
-# Export all classes and preconfigured instances, conditionally including ChatOCIRaw
+# Export all classes and preconfigured instances, conditionally including optional providers
 __all__ = [
-	'ChatOpenAI',
-	'ChatAzureOpenAI',
-	'ChatGoogle',
-	'ChatMistral',
-	'ChatCerebras',
 	'ChatBrowserUse',
 ]
 
+if OPENAI_AVAILABLE:
+	__all__.append('ChatOpenAI')
+if AZURE_AVAILABLE:
+	__all__.append('ChatAzureOpenAI')
+if GOOGLE_AVAILABLE:
+	__all__.append('ChatGoogle')
+if ANTHROPIC_AVAILABLE:
+	__all__.append('ChatAnthropic')
+if MISTRAL_AVAILABLE:
+	__all__.append('ChatMistral')
+if CEREBRAS_AVAILABLE:
+	__all__.append('ChatCerebras')
 if OCI_AVAILABLE:
 	__all__.append('ChatOCIRaw')
 

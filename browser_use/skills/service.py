@@ -4,9 +4,31 @@ import logging
 import os
 from typing import Any, Literal
 
-from browser_use_sdk import AsyncBrowserUse, ExecuteSkillResponse, SkillListResponse
 from cdp_use.cdp.network import Cookie
 from pydantic import BaseModel, ValidationError
+
+try:
+	from browser_use_sdk import AsyncBrowserUse, ExecuteSkillResponse, SkillListResponse
+
+	SKILLS_SDK_AVAILABLE = True
+except ImportError as _e:
+	AsyncBrowserUse = None  # type: ignore
+	ExecuteSkillResponse = None  # type: ignore
+	SkillListResponse = None  # type: ignore
+	SKILLS_SDK_AVAILABLE = False
+	_SKILLS_SDK_MISSING = _e
+
+
+def _require_skills_sdk():
+	"""Raise a friendly ImportError if browser-use-sdk (browser-use[cloud]) is not installed."""
+	if not SKILLS_SDK_AVAILABLE:
+		msg = (
+			'Skills require the `cloud` extra dependencies. '
+			'Install them with: `pip install "browser-use[cloud]"` or `uv pip install "browser-use[cloud]"`.'
+		)
+		if _SKILLS_SDK_MISSING is not None:
+			msg += f'\nOriginal error: {_SKILLS_SDK_MISSING}'
+		raise ImportError(msg)
 
 from browser_use.skills.views import (
 	MissingCookieException,
@@ -23,9 +45,11 @@ class SkillService:
 		"""Initialize the skills service
 
 		Args:
-			skill_ids: List of skill IDs to fetch and cache, or ['*'] to fetch all available skills
-			api_key: Browser Use API key (optional, will use env var if not provided)
+		    skill_ids: List of skill IDs to fetch and cache, or ['*'] to fetch all available skills
+		    api_key: Browser Use API key (optional, will use env var if not provided)
 		"""
+		_require_skills_sdk()
+
 		self.skill_ids = skill_ids
 		self.api_key = api_key or os.getenv('BROWSER_USE_API_KEY') or ''
 
