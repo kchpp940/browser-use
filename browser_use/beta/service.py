@@ -705,9 +705,9 @@ def _resolve_default_llm(llm: BaseChatModel | None) -> BaseChatModel:
 	if llm is not None:
 		return llm
 	try:
-		from browser_use.runtime_config import get_runtime_config
+		from browser_use.config import CONFIG
 
-		default_llm_name = get_runtime_config().llm.default_llm
+		default_llm_name = CONFIG.DEFAULT_LLM
 	except Exception:
 		default_llm_name = ''
 	if default_llm_name:
@@ -4551,9 +4551,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.llm is None:
 			return True
 		try:
-			from browser_use.runtime_config import get_runtime_config
+			from browser_use.config import CONFIG
 
-			skip_verification = get_runtime_config().llm.skip_api_key_verification
+			skip_verification = CONFIG.SKIP_LLM_API_KEY_VERIFICATION
 		except Exception:
 			skip_verification = False
 		if getattr(self.llm, '_verified_api_keys', None) is True or skip_verification:

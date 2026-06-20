@@ -13,8 +13,6 @@ import psutil
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from browser_use.runtime_config import ConfigResolver, RuntimeConfig
-
 logger = logging.getLogger(__name__)
 
 
@@ -49,47 +47,43 @@ def is_running_in_docker() -> bool:
 class OldConfig:
 	"""Original lazy-loading configuration class for environment variables."""
 
+	# Cache for directory creation tracking
 	_dirs_created = False
-
-	def __init__(self):
-		pass
-
-	@property
-	def _rc(self) -> RuntimeConfig:
-		return ConfigResolver(include_env=True, include_file=False).resolve()
 
 	@property
 	def BROWSER_USE_LOGGING_LEVEL(self) -> str:
-		return self._rc.logging.level
+		return os.getenv('BROWSER_USE_LOGGING_LEVEL', 'info').lower()
 
 	@property
 	def ANONYMIZED_TELEMETRY(self) -> bool:
-		return self._rc.telemetry.anonymized_telemetry
+		return os.getenv('ANONYMIZED_TELEMETRY', 'true').lower()[:1] in 'ty1'
 
 	@property
 	def BROWSER_USE_CLOUD_SYNC(self) -> bool:
-		return self._rc.telemetry.cloud_sync_enabled
+		return os.getenv('BROWSER_USE_CLOUD_SYNC', str(self.ANONYMIZED_TELEMETRY)).lower()[:1] in 'ty1'
 
 	@property
 	def BROWSER_USE_CLOUD_API_URL(self) -> str:
-		url = self._rc.cloud.api_url
+		url = os.getenv('BROWSER_USE_CLOUD_API_URL', 'https://api.browser-use.com')
 		assert '://' in url, 'BROWSER_USE_CLOUD_API_URL must be a valid URL'
 		return url
 
 	@property
 	def BROWSER_USE_CLOUD_UI_URL(self) -> str:
-		url = self._rc.cloud.ui_url
+		url = os.getenv('BROWSER_USE_CLOUD_UI_URL', '')
+		# Allow empty string as default, only validate if set
 		if url and '://' not in url:
 			raise AssertionError('BROWSER_USE_CLOUD_UI_URL must be a valid URL if set')
 		return url
 
 	@property
 	def BROWSER_USE_MODEL_PRICING_URL(self) -> str:
-		url = self._rc.cloud.model_pricing_url
+		url = os.getenv('BROWSER_USE_MODEL_PRICING_URL', '')
 		if url and '://' not in url:
 			raise AssertionError('BROWSER_USE_MODEL_PRICING_URL must be a valid URL if set')
 		return url
 
+	# Path configuration
 	@property
 	def XDG_CACHE_HOME(self) -> Path:
 		return Path(os.getenv('XDG_CACHE_HOME', '~/.cache')).expanduser().resolve()
@@ -125,6 +119,7 @@ class OldConfig:
 		return path
 
 	def _ensure_dirs(self) -> None:
+		"""Create directories if they don't exist (only once)"""
 		if not self._dirs_created:
 			config_dir = (
 				Path(os.getenv('BROWSER_USE_CONFIG_DIR', str(self.XDG_CONFIG_HOME / 'browseruse'))).expanduser().resolve()
@@ -134,46 +129,48 @@ class OldConfig:
 			(config_dir / 'extensions').mkdir(parents=True, exist_ok=True)
 			self._dirs_created = True
 
+	# LLM API key configuration
 	@property
 	def OPENAI_API_KEY(self) -> str:
-		return self._rc.llm.openai_api_key or ''
+		return os.getenv('OPENAI_API_KEY', '')
 
 	@property
 	def ANTHROPIC_API_KEY(self) -> str:
-		return self._rc.llm.anthropic_api_key or ''
+		return os.getenv('ANTHROPIC_API_KEY', '')
 
 	@property
 	def GOOGLE_API_KEY(self) -> str:
-		return self._rc.llm.google_api_key or ''
+		return os.getenv('GOOGLE_API_KEY', '')
 
 	@property
 	def DEEPSEEK_API_KEY(self) -> str:
-		return self._rc.llm.deepseek_api_key or ''
+		return os.getenv('DEEPSEEK_API_KEY', '')
 
 	@property
 	def GROK_API_KEY(self) -> str:
-		return self._rc.llm.grok_api_key or ''
+		return os.getenv('GROK_API_KEY', '')
 
 	@property
 	def NOVITA_API_KEY(self) -> str:
-		return self._rc.llm.novita_api_key or ''
+		return os.getenv('NOVITA_API_KEY', '')
 
 	@property
 	def AZURE_OPENAI_ENDPOINT(self) -> str:
-		return self._rc.llm.azure_endpoint or ''
+		return os.getenv('AZURE_OPENAI_ENDPOINT', '')
 
 	@property
 	def AZURE_OPENAI_KEY(self) -> str:
-		return self._rc.llm.azure_api_key or ''
+		return os.getenv('AZURE_OPENAI_KEY', '')
 
 	@property
 	def SKIP_LLM_API_KEY_VERIFICATION(self) -> bool:
-		return self._rc.llm.skip_api_key_verification
+		return os.getenv('SKIP_LLM_API_KEY_VERIFICATION', 'false').lower()[:1] in 'ty1'
 
 	@property
 	def DEFAULT_LLM(self) -> str:
-		return self._rc.llm.default_llm
+		return os.getenv('DEFAULT_LLM', '')
 
+	# Runtime hints
 	@property
 	def IN_DOCKER(self) -> bool:
 		return os.getenv('IN_DOCKER', 'false').lower()[:1] in 'ty1' or is_running_in_docker()
@@ -184,7 +181,7 @@ class OldConfig:
 
 	@property
 	def BROWSER_USE_VERSION_CHECK(self) -> bool:
-		return self._rc.telemetry.version_check
+		return os.getenv('BROWSER_USE_VERSION_CHECK', 'true').lower()[:1] in 'ty1'
 
 	@property
 	def WIN_FONT_DIR(self) -> str:
@@ -367,17 +364,31 @@ class Config:
 	"""
 
 	def __init__(self):
+		# Cache for directory creation tracking only
 		self._dirs_created = False
 
 	def __getattr__(self, name: str) -> Any:
+		"""Dynamically proxy all attributes to fresh instances.
+
+		This ensures env vars are re-read on every access.
+		"""
+		# Special handling for internal attributes
 		if name.startswith('_'):
 			raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
+		# Create fresh instances on every access
 		old_config = OldConfig()
 
+		# Always use old config for all attributes (it handles env vars with proper transformations)
 		if hasattr(old_config, name):
 			return getattr(old_config, name)
 
+		# For new MCP-specific attributes not in old config
+		env_config = FlatEnvConfig()
+		if hasattr(env_config, name):
+			return getattr(env_config, name)
+
+		# Handle special methods
 		if name == 'get_default_profile':
 			return lambda: self._get_default_profile()
 		elif name == 'get_default_llm':
@@ -392,6 +403,7 @@ class Config:
 		raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
 	def _get_config_path(self) -> Path:
+		"""Get config path from fresh env config."""
 		env_config = FlatEnvConfig()
 		if env_config.BROWSER_USE_CONFIG_PATH:
 			return Path(env_config.BROWSER_USE_CONFIG_PATH).expanduser()
@@ -402,51 +414,95 @@ class Config:
 			return xdg_config / 'browseruse' / 'config.json'
 
 	def _get_db_config(self) -> DBStyleConfigJSON:
+		"""Load and migrate config.json."""
 		config_path = self._get_config_path()
 		return load_and_migrate_config(config_path)
 
 	def _get_default_profile(self) -> dict[str, Any]:
+		"""Get the default browser profile configuration."""
 		db_config = self._get_db_config()
 		for profile in db_config.browser_profile.values():
 			if profile.default:
 				return profile.model_dump(exclude_none=True)
 
+		# Return first profile if no default
 		if db_config.browser_profile:
 			return next(iter(db_config.browser_profile.values())).model_dump(exclude_none=True)
 
 		return {}
 
 	def _get_default_llm(self) -> dict[str, Any]:
+		"""Get the default LLM configuration."""
 		db_config = self._get_db_config()
 		for llm in db_config.llm.values():
 			if llm.default:
 				return llm.model_dump(exclude_none=True)
 
+		# Return first LLM if no default
 		if db_config.llm:
 			return next(iter(db_config.llm.values())).model_dump(exclude_none=True)
 
 		return {}
 
 	def _get_default_agent(self) -> dict[str, Any]:
+		"""Get the default agent configuration."""
 		db_config = self._get_db_config()
 		for agent in db_config.agent.values():
 			if agent.default:
 				return agent.model_dump(exclude_none=True)
 
+		# Return first agent if no default
 		if db_config.agent:
 			return next(iter(db_config.agent.values())).model_dump(exclude_none=True)
 
 		return {}
 
 	def _load_config(self) -> dict[str, Any]:
-		from browser_use.runtime_config.utils import browser_config_to_profile_dict
-
-		runtime_config = ConfigResolver(include_env=True, include_file=True).resolve()
-		return {
-			'browser_profile': browser_config_to_profile_dict(runtime_config.browser),
-			'llm': runtime_config.llm.model_dump(exclude_none=True),
-			'agent': runtime_config.agent.model_dump(exclude_none=True),
+		"""Load configuration with env var overrides for MCP components."""
+		config = {
+			'browser_profile': self._get_default_profile(),
+			'llm': self._get_default_llm(),
+			'agent': self._get_default_agent(),
 		}
+
+		# Fresh env config for overrides
+		env_config = FlatEnvConfig()
+
+		# Apply MCP-specific env var overrides
+		if env_config.BROWSER_USE_HEADLESS is not None:
+			config['browser_profile']['headless'] = env_config.BROWSER_USE_HEADLESS
+
+		if env_config.BROWSER_USE_ALLOWED_DOMAINS:
+			domains = [d.strip() for d in env_config.BROWSER_USE_ALLOWED_DOMAINS.split(',') if d.strip()]
+			config['browser_profile']['allowed_domains'] = domains
+
+		# Proxy settings (Chromium) -> consolidated `proxy` dict
+		proxy_dict: dict[str, Any] = {}
+		if env_config.BROWSER_USE_PROXY_URL:
+			proxy_dict['server'] = env_config.BROWSER_USE_PROXY_URL
+		if env_config.BROWSER_USE_NO_PROXY:
+			# store bypass as comma-separated string to match Chrome flag
+			proxy_dict['bypass'] = ','.join([d.strip() for d in env_config.BROWSER_USE_NO_PROXY.split(',') if d.strip()])
+		if env_config.BROWSER_USE_PROXY_USERNAME:
+			proxy_dict['username'] = env_config.BROWSER_USE_PROXY_USERNAME
+		if env_config.BROWSER_USE_PROXY_PASSWORD:
+			proxy_dict['password'] = env_config.BROWSER_USE_PROXY_PASSWORD
+		if proxy_dict:
+			# ensure section exists
+			config.setdefault('browser_profile', {})
+			config['browser_profile']['proxy'] = proxy_dict
+
+		if env_config.OPENAI_API_KEY:
+			config['llm']['api_key'] = env_config.OPENAI_API_KEY
+
+		if env_config.BROWSER_USE_LLM_MODEL:
+			config['llm']['model'] = env_config.BROWSER_USE_LLM_MODEL
+
+		# Extension settings
+		if env_config.BROWSER_USE_DISABLE_EXTENSIONS is not None:
+			config['browser_profile']['enable_default_extensions'] = not env_config.BROWSER_USE_DISABLE_EXTENSIONS
+
+		return config
 
 
 # Create singleton instance
@@ -455,104 +511,15 @@ CONFIG = Config()
 
 # Helper functions for MCP components
 def load_browser_use_config() -> dict[str, Any]:
-	from browser_use.runtime_config.utils import browser_config_to_profile_dict
-
-	runtime_config = ConfigResolver(include_env=True, include_file=True).resolve()
-	return {
-		'browser_profile': browser_config_to_profile_dict(runtime_config.browser),
-		'llm': runtime_config.llm.model_dump(exclude_none=True),
-		'agent': runtime_config.agent.model_dump(exclude_none=True),
-	}
+	"""Load browser-use configuration for MCP components."""
+	return CONFIG.load_config()
 
 
-def get_default_profile(config: RuntimeConfig | dict[str, Any]) -> dict[str, Any]:
-	if isinstance(config, RuntimeConfig):
-		from browser_use.runtime_config.utils import browser_config_to_profile_dict
-
-		return browser_config_to_profile_dict(config.browser)
+def get_default_profile(config: dict[str, Any]) -> dict[str, Any]:
+	"""Get default browser profile from config dict."""
 	return config.get('browser_profile', {})
 
 
-def get_default_llm(config: RuntimeConfig | dict[str, Any]) -> dict[str, Any]:
-	if isinstance(config, RuntimeConfig):
-		return config.llm.model_dump(exclude_none=True)
+def get_default_llm(config: dict[str, Any]) -> dict[str, Any]:
+	"""Get default LLM config from config dict."""
 	return config.get('llm', {})
-
-
-# ============================================================================
-# New unified runtime configuration system
-# ============================================================================
-#
-# The following functions provide access to the new RuntimeConfig / ConfigResolver
-# system while maintaining backward compatibility with existing code.
-#
-# Priority order (highest to lowest):
-#   1. Explicit parameters
-#   2. CLI arguments
-#   3. Environment variables
-#   4. Configuration file (config.json)
-#   5. Model defaults
-#
-# ============================================================================
-
-
-def get_runtime_config() -> Any:
-	"""Get the unified runtime configuration.
-
-	Returns:
-	    RuntimeConfig instance with all configuration merged from all sources.
-
-	Example:
-	    >>> from browser_use.config import get_runtime_config
-	    >>> config = get_runtime_config()
-	    >>> print(config.logging.level)
-	    >>> print(config.browser.headless)
-	"""
-	from browser_use.runtime_config import get_runtime_config as _get_runtime_config
-
-	return _get_runtime_config()
-
-
-def get_config_resolver() -> Any:
-	"""Get the default ConfigResolver instance.
-
-	Use this to add custom configuration sources before resolving.
-
-	Returns:
-	    ConfigResolver instance with env and file sources already added.
-
-	Example:
-	    >>> from browser_use.config import get_config_resolver
-	    >>> resolver = get_config_resolver()
-	    >>> resolver.add_explicit({'browser': {'headless': True}})
-	    >>> config = resolver.resolve()
-	"""
-	from browser_use.runtime_config import get_default_resolver
-
-	return get_default_resolver()
-
-
-def create_runtime_config(**kwargs) -> Any:
-	"""Create a RuntimeConfig with explicit overrides.
-
-	Convenience function that creates a resolver, adds explicit overrides,
-	and returns the resolved config.
-
-	Args:
-	    **kwargs: Configuration overrides (can be nested or flat format)
-
-	Returns:
-	    Resolved RuntimeConfig instance
-
-	Example:
-	    >>> config = create_runtime_config(browser_headless=True, logging_level='debug')
-	"""
-	from browser_use.runtime_config import ConfigResolver
-
-	resolver = ConfigResolver()
-	if kwargs:
-		# Check if kwargs are nested or flat
-		known_groups = {'logging', 'telemetry', 'cloud', 'llm', 'browser', 'agent', 'security', 'filesystem'}
-		is_nested = any(k in known_groups for k in kwargs)
-		resolver.add_explicit(kwargs, flat=not is_nested)
-	return resolver.resolve()

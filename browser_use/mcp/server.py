@@ -92,11 +92,9 @@ logging.disable(logging.CRITICAL)
 # Import browser_use modules
 from browser_use import ActionModel, Agent
 from browser_use.browser import BrowserProfile, BrowserSession
-from browser_use.config import load_browser_use_config
+from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.openai.chat import ChatOpenAI
-from browser_use.runtime_config import ConfigResolver, RuntimeConfig
-from browser_use.runtime_config.utils import browser_config_to_profile_dict
 from browser_use.tools.service import Tools
 
 logger = logging.getLogger(__name__)
@@ -189,28 +187,12 @@ def get_parent_process_cmdline() -> str | None:
 class BrowserUseServer:
 	"""MCP Server for browser-use capabilities."""
 
-	def __init__(
-		self,
-		session_timeout_minutes: int = 10,
-		runtime_config: RuntimeConfig | ConfigResolver | None = None,
-	):
+	def __init__(self, session_timeout_minutes: int = 10):
 		# Ensure all logging goes to stderr (in case new loggers were created)
 		_ensure_all_loggers_use_stderr()
 
 		self.server = Server('browser-use')
-
-		# Resolve runtime configuration
-		if runtime_config is None:
-			resolver = ConfigResolver()
-			self.runtime_config: RuntimeConfig = resolver.resolve()
-		elif isinstance(runtime_config, ConfigResolver):
-			self.runtime_config = runtime_config.resolve()
-		else:
-			self.runtime_config = runtime_config
-
-		# Legacy config dict for backward compatibility
 		self.config = load_browser_use_config()
-
 		self.agent: Agent | None = None
 		self.browser_session: BrowserSession | None = None
 		self.tools: Tools | None = None
@@ -587,7 +569,7 @@ class BrowserUseServer:
 		return f'Unknown tool: {tool_name}'
 
 	async def _init_browser_session(self, allowed_domains: list[str] | None = None, **kwargs):
-		"""Initialize browser session using unified runtime config"""
+		"""Initialize browser session using config"""
 		if self.browser_session:
 			return
 
@@ -596,29 +578,31 @@ class BrowserUseServer:
 
 		logger.debug('Initializing browser session...')
 
-		# ===== Build unified ConfigResolver for MCP server =====
-		resolver = ConfigResolver()
-		resolver.add_defaults(
-			{
-				'browser_downloads_path': str(Path.home() / 'Downloads' / 'browser-use-mcp'),
-				'browser_wait_between_actions': 0.5,
-				'browser_keep_alive': True,
-				'browser_user_data_dir': '~/.config/browseruse/profiles/default',
-				'browser_device_scale_factor': 1.0,
-				'browser_disable_security': False,
-				'browser_headless': False,
-			},
-			flat=True,
-		)
-		if allowed_domains is not None:
-			resolver.add_explicit({'browser_allowed_domains': allowed_domains}, flat=True)
-		if kwargs:
-			resolver.add_explicit({'browser': kwargs})
-		mcp_runtime_config = resolver.resolve()
+		# Get profile config
+		profile_config = get_default_profile(self.config)
 
-		# Build BrowserProfile from unified RuntimeConfig
-		profile_dict = browser_config_to_profile_dict(mcp_runtime_config.browser)
-		profile = BrowserProfile(**profile_dict)
+		# Merge profile config with defaults and overrides
+		profile_data = {
+			'downloads_path': str(Path.home() / 'Downloads' / 'browser-use-mcp'),
+			'wait_between_actions': 0.5,
+			'keep_alive': True,
+			'user_data_dir': '~/.config/browseruse/profiles/default',
+			'device_scale_factor': 1.0,
+			'disable_security': False,
+			'headless': False,
+			**profile_config,  # Config values override defaults
+		}
+
+		# Tool parameter overrides (highest priority)
+		if allowed_domains is not None:
+			profile_data['allowed_domains'] = allowed_domains
+
+		# Merge any additional kwargs that are valid BrowserProfile fields
+		for key, value in kwargs.items():
+			profile_data[key] = value
+
+		# Create browser profile
+		profile = BrowserProfile(**profile_data)
 
 		# Create browser session
 		self.browser_session = BrowserSession(browser_profile=profile)
@@ -630,24 +614,22 @@ class BrowserUseServer:
 		# Create tools for direct actions
 		self.tools = Tools()
 
-		model_name = mcp_runtime_config.llm.model or 'gpt-o4-mini'
-		api_key = mcp_runtime_config.llm.openai_api_key or mcp_runtime_config.llm.api_key
-		temperature = mcp_runtime_config.llm.temperature if mcp_runtime_config.llm.temperature is not None else 0.7
-		base_url = mcp_runtime_config.llm.api_base
-
-		llm_kwargs = {}
+		# Initialize LLM from config
+		llm_config = get_default_llm(self.config)
+		base_url = llm_config.get('base_url', None)
+		kwargs = {}
 		if base_url:
-			llm_kwargs['base_url'] = base_url
-
-		if api_key:
+			kwargs['base_url'] = base_url
+		if api_key := llm_config.get('api_key'):
 			self.llm = ChatOpenAI(
-				model=model_name,
+				model=llm_config.get('model', 'gpt-o4-mini'),
 				api_key=api_key,
-				temperature=temperature,
-				**llm_kwargs,
+				temperature=llm_config.get('temperature', 0.7),
+				**kwargs,
 			)
 
-		file_system_path = mcp_runtime_config.filesystem.file_system_path or '~/.browser-use-mcp'
+		# Initialize FileSystem for extraction actions
+		file_system_path = profile_config.get('file_system_path', '~/.browser-use-mcp')
 		self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())
 
 		logger.debug('Browser session initialized')
@@ -660,60 +642,65 @@ class BrowserUseServer:
 		allowed_domains: list[str] | None = None,
 		use_vision: bool = True,
 	) -> str:
-		"""Run an autonomous agent task using unified runtime config."""
+		"""Run an autonomous agent task."""
 		logger.debug(f'Running agent task: {task}')
 
-		# ===== Build unified ConfigResolver for this agent call =====
-		resolver = ConfigResolver()
-		resolver.add_defaults({'agent_max_steps': 100}, flat=True)
-		if model:
-			resolver.add_explicit({'llm_model': model}, flat=True)
-		if max_steps != 100:
-			resolver.add_explicit({'agent_max_steps': max_steps}, flat=True)
-		if allowed_domains:
-			resolver.add_explicit({'browser_allowed_domains': allowed_domains}, flat=True)
-		agent_runtime_config = resolver.resolve()
+		# Get LLM config
+		llm_config = get_default_llm(self.config)
 
-		model_provider = agent_runtime_config.llm.provider or os.getenv('MODEL_PROVIDER')
+		# Get LLM provider
+		model_provider = llm_config.get('model_provider') or os.getenv('MODEL_PROVIDER')
 
+		# Get Bedrock-specific config
 		if model_provider and model_provider.lower() == 'bedrock':
-			llm_model = agent_runtime_config.llm.model or os.getenv('MODEL') or 'us.anthropic.claude-sonnet-4-20250514-v1:0'
-			aws_region = agent_runtime_config.llm.region or os.getenv('REGION') or 'us-east-1'
-			aws_sso_auth = agent_runtime_config.llm.aws_sso_auth
+			llm_model = llm_config.get('model') or os.getenv('MODEL') or 'us.anthropic.claude-sonnet-4-20250514-v1:0'
+			aws_region = llm_config.get('region') or os.getenv('REGION')
+			if not aws_region:
+				aws_region = 'us-east-1'
+			aws_sso_auth = llm_config.get('aws_sso_auth', False)
 			llm = ChatAWSBedrock(
-				model=llm_model,
+				model=llm_model,  # or any Bedrock model
 				aws_region=aws_region,
 				aws_sso_auth=aws_sso_auth,
 			)
 		else:
-			api_key = agent_runtime_config.llm.openai_api_key or agent_runtime_config.llm.api_key or os.getenv('OPENAI_API_KEY')
+			api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
 			if not api_key:
-				return 'Error: BROWSER_USE_OPENAI_API_KEY or OPENAI_API_KEY not set in config or environment'
+				return 'Error: OPENAI_API_KEY not set in config or environment'
 
-			llm_model = agent_runtime_config.llm.model or 'gpt-4o'
+			# Use explicit model from tool call, otherwise fall back to configured default
+			llm_model = model or llm_config.get('model', 'gpt-4o')
 
-			base_url = agent_runtime_config.llm.api_base
-			llm_kwargs = {}
+			base_url = llm_config.get('base_url', None)
+			kwargs = {}
 			if base_url:
-				llm_kwargs['base_url'] = base_url
+				kwargs['base_url'] = base_url
 			llm = ChatOpenAI(
 				model=llm_model,
 				api_key=api_key,
-				temperature=agent_runtime_config.llm.temperature if agent_runtime_config.llm.temperature is not None else 0.7,
-				**llm_kwargs,
+				temperature=llm_config.get('temperature', 0.7),
+				**kwargs,
 			)
 
-		# Build BrowserProfile from unified RuntimeConfig
-		profile_dict = browser_config_to_profile_dict(agent_runtime_config.browser)
-		profile = BrowserProfile(**profile_dict)
+		# Get profile config and merge with tool parameters
+		profile_config = get_default_profile(self.config)
 
-		# Create and run agent with unified config
+		# Override allowed_domains only when the client supplied a non-empty list.
+		# Treating an empty list as an override would silently disable any
+		# admin-configured allowlist on the default profile, since
+		# SecurityWatchdog interprets allowed_domains=[] as "no restrictions".
+		if allowed_domains:
+			profile_config['allowed_domains'] = allowed_domains
+
+		# Create browser profile using config
+		profile = BrowserProfile(**profile_config)
+
+		# Create and run agent
 		agent = Agent(
 			task=task,
 			llm=llm,
 			browser_profile=profile,
 			use_vision=use_vision,
-			runtime_config=agent_runtime_config,
 		)
 
 		try:

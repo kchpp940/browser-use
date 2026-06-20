@@ -7,7 +7,7 @@ import logging
 import httpx
 from bubus import BaseEvent
 
-from browser_use.runtime_config import get_runtime_config
+from browser_use.config import CONFIG
 from browser_use.sync.auth import TEMP_USER_ID, DeviceAuthClient
 
 logger = logging.getLogger(__name__)
@@ -18,13 +18,13 @@ class CloudSync:
 
 	def __init__(self, base_url: str | None = None, allow_session_events_for_auth: bool = False):
 		# Backend API URL for all API requests - can be passed directly or defaults to env var
-		self.base_url = base_url or get_runtime_config().cloud.api_url
+		self.base_url = base_url or CONFIG.BROWSER_USE_CLOUD_API_URL
 		self.auth_client = DeviceAuthClient(base_url=self.base_url)
 		self.session_id: str | None = None
 		self.allow_session_events_for_auth = allow_session_events_for_auth
 		self.auth_flow_active = False  # Flag to indicate auth flow is running
 		# Check if cloud sync is actually enabled - if not, we should remain silent
-		self.enabled = get_runtime_config().telemetry.cloud_sync_enabled
+		self.enabled = CONFIG.BROWSER_USE_CLOUD_SYNC
 
 	async def handle_event(self, event: BaseEvent) -> None:
 		"""Handle an event by sending it to the cloud"""

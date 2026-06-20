@@ -140,9 +140,10 @@ class ChatBrowserUse(BaseChatModel):
 		Returns:
 			ChatInvokeCompletion with structured response and usage info
 		"""
-		from browser_use.runtime_config import get_runtime_config
+		# Get ANONYMIZED_TELEMETRY setting from config
+		from browser_use.config import CONFIG
 
-		anonymized_telemetry = get_runtime_config().telemetry.anonymized_telemetry
+		anonymized_telemetry = CONFIG.ANONYMIZED_TELEMETRY
 
 		# Extract session_id from kwargs for sticky routing
 		session_id = kwargs.get('session_id')

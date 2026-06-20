@@ -158,8 +158,6 @@ from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
-from browser_use.runtime_config import ConfigResolver, RuntimeConfig
-from browser_use.runtime_config.utils import browser_config_to_profile_dict
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
 
@@ -234,34 +232,38 @@ TEXTUAL_BORDER_STYLES = {'logo': 'blue', 'info': 'blue', 'input': 'orange3', 'wo
 
 
 def get_default_config() -> dict[str, Any]:
-	"""Return default configuration dictionary using ConfigResolver."""
-	resolver = ConfigResolver()
-	resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
-	runtime_config = resolver.resolve()
+	"""Return default configuration dictionary using the new config system."""
+	# Load config from the new config system
+	config_data = CONFIG.load_config()
+
+	# Extract browser profile, llm, and agent configs
+	browser_profile = config_data.get('browser_profile', {})
+	llm_config = config_data.get('llm', {})
+	agent_config = config_data.get('agent', {})
 
 	return {
 		'model': {
-			'name': runtime_config.llm.model,
-			'temperature': runtime_config.llm.temperature if runtime_config.llm.temperature is not None else 0.0,
+			'name': llm_config.get('model'),
+			'temperature': llm_config.get('temperature', 0.0),
 			'api_keys': {
-				'OPENAI_API_KEY': runtime_config.llm.openai_api_key or CONFIG.OPENAI_API_KEY,
-				'ANTHROPIC_API_KEY': runtime_config.llm.anthropic_api_key or CONFIG.ANTHROPIC_API_KEY,
-				'GOOGLE_API_KEY': runtime_config.llm.google_api_key or CONFIG.GOOGLE_API_KEY,
-				'DEEPSEEK_API_KEY': runtime_config.llm.deepseek_api_key or CONFIG.DEEPSEEK_API_KEY,
-				'GROK_API_KEY': runtime_config.llm.grok_api_key or CONFIG.GROK_API_KEY,
+				'OPENAI_API_KEY': llm_config.get('api_key', CONFIG.OPENAI_API_KEY),
+				'ANTHROPIC_API_KEY': CONFIG.ANTHROPIC_API_KEY,
+				'GOOGLE_API_KEY': CONFIG.GOOGLE_API_KEY,
+				'DEEPSEEK_API_KEY': CONFIG.DEEPSEEK_API_KEY,
+				'GROK_API_KEY': CONFIG.GROK_API_KEY,
 			},
 		},
-		'agent': runtime_config.agent.model_dump(exclude_defaults=True),
+		'agent': agent_config,
 		'browser': {
-			'headless': runtime_config.browser.headless,
-			'keep_alive': runtime_config.browser.keep_alive,
-			'ignore_https_errors': runtime_config.browser.disable_security,
-			'user_data_dir': runtime_config.browser.user_data_dir,
-			'allowed_domains': runtime_config.browser.allowed_domains,
-			'wait_between_actions': runtime_config.browser.wait_between_actions,
-			'is_mobile': None,
-			'device_scale_factor': None,
-			'disable_security': runtime_config.browser.disable_security,
+			'headless': browser_profile.get('headless', True),
+			'keep_alive': browser_profile.get('keep_alive', True),
+			'ignore_https_errors': browser_profile.get('ignore_https_errors', False),
+			'user_data_dir': browser_profile.get('user_data_dir'),
+			'allowed_domains': browser_profile.get('allowed_domains'),
+			'wait_between_actions': browser_profile.get('wait_between_actions'),
+			'is_mobile': browser_profile.get('is_mobile'),
+			'device_scale_factor': browser_profile.get('device_scale_factor'),
+			'disable_security': browser_profile.get('disable_security'),
 		},
 		'command_history': [],
 	}
@@ -297,46 +299,6 @@ def save_user_config(config: dict[str, Any]) -> None:
 		history_file = CONFIG.BROWSER_USE_CONFIG_DIR / 'command_history.json'
 		with open(history_file, 'w', encoding='utf-8') as f:
 			json.dump(history, f, indent=2, ensure_ascii=False)
-
-
-def build_cli_flat_config(ctx: click.Context) -> dict[str, Any]:
-	"""Build flat config dict from click CLI arguments for ConfigResolver.
-
-	Returns a flat dictionary with keys like 'browser_headless', 'llm_model', etc.
-	suitable for passing to ConfigResolver.add_cli().
-	"""
-	params = ctx.params or {}
-	flat: dict[str, Any] = {}
-
-	# LLM config
-	if params.get('model'):
-		flat['llm_model'] = params['model']
-
-	# Browser config
-	if params.get('headless') is not None:
-		flat['browser_headless'] = params['headless']
-	if params.get('window_width'):
-		flat['browser_window_width'] = params['window_width']
-	if params.get('window_height'):
-		flat['browser_window_height'] = params['window_height']
-	if params.get('user_data_dir'):
-		flat['browser_user_data_dir'] = params['user_data_dir']
-	if params.get('profile_directory'):
-		flat['browser_profile_directory'] = params['profile_directory']
-	if params.get('cdp_url'):
-		flat['browser_cdp_url'] = params['cdp_url']
-
-	# Proxy config
-	if params.get('proxy_url'):
-		flat['browser_proxy_server'] = params['proxy_url']
-	if params.get('no_proxy'):
-		flat['browser_proxy_bypass'] = ','.join([p.strip() for p in params['no_proxy'].split(',') if p.strip()])
-	if params.get('proxy_username'):
-		flat['browser_proxy_username'] = params['proxy_username']
-	if params.get('proxy_password'):
-		flat['browser_proxy_password'] = params['proxy_password']
-
-	return flat
 
 
 def update_config_with_click_args(config: dict[str, Any], ctx: click.Context) -> dict[str, Any]:
@@ -390,11 +352,7 @@ def setup_readline_history(history: list[str]) -> None:
 
 
 def get_llm(config: dict[str, Any]):
-	"""Get the language model based on config and available API keys.
-
-	.. deprecated::
-		Kept for backward compatibility only. Prefer get_llm_from_runtime_config().
-	"""
+	"""Get the language model based on config and available API keys."""
 	model_config = config.get('model', {})
 	model_name = model_config.get('name')
 	temperature = model_config.get('temperature', 0.0)
@@ -435,50 +393,6 @@ def get_llm(config: dict[str, Any]):
 	else:
 		print(
 			'⚠️  No API keys found. Please update your config or set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY.'
-		)
-		sys.exit(1)
-
-
-def get_llm_from_runtime_config(runtime_config: RuntimeConfig):
-	"""Get the language model based on unified RuntimeConfig."""
-	model_name = runtime_config.llm.model
-	temperature = 0.0
-
-	# Get API keys from runtime_config
-	openai_key = runtime_config.llm.openai_api_key
-	anthropic_key = runtime_config.llm.anthropic_api_key
-	google_key = runtime_config.llm.google_api_key
-
-	if model_name:
-		if model_name.startswith('gpt'):
-			if not openai_key:
-				print('⚠️  OpenAI API key not found. Please update your config or set BROWSER_USE_OPENAI_API_KEY environment variable.')
-				sys.exit(1)
-			return ChatOpenAI(model=model_name, temperature=temperature, api_key=openai_key)
-		elif model_name.startswith('claude'):
-			if not anthropic_key:
-				print('⚠️  Anthropic API key not found. Please update your config or set BROWSER_USE_ANTHROPIC_API_KEY environment variable.')
-				sys.exit(1)
-			return ChatAnthropic(model=model_name, temperature=temperature)
-		elif model_name.startswith('gemini'):
-			if not google_key:
-				print('⚠️  Google API key not found. Please update your config or set BROWSER_USE_GOOGLE_API_KEY environment variable.')
-				sys.exit(1)
-			return ChatGoogle(model=model_name, temperature=temperature)
-		elif model_name.startswith('oci'):
-			print('⚠️  OCI models require manual configuration.')
-			sys.exit(1)
-
-	# Auto-detect based on available API keys
-	if openai_key:
-		return ChatOpenAI(model='gpt-5-mini', temperature=temperature, api_key=openai_key)
-	elif anthropic_key:
-		return ChatAnthropic(model='claude-4-sonnet', temperature=temperature)
-	elif google_key:
-		return ChatGoogle(model='gemini-2.5-pro', temperature=temperature)
-	else:
-		print(
-			'⚠️  No API keys found. Please set one of: BROWSER_USE_OPENAI_API_KEY, BROWSER_USE_ANTHROPIC_API_KEY, or BROWSER_USE_GOOGLE_API_KEY.'
 		)
 		sys.exit(1)
 
@@ -1589,21 +1503,14 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 	telemetry = ProductTelemetry()
 	start_time = time.time()
 	error_msg = None
-	llm = None
 
 	try:
-		# ===== Use unified ConfigResolver instead of legacy config dict =====
-		resolver = ConfigResolver()
-		# Add CLI args (priority 90)
-		cli_flat = build_cli_flat_config(ctx)
-		if cli_flat:
-			resolver.add_cli(cli_flat, flat=True)
-		# Add CLI-specific default: user_data_dir for CLI
-		resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
-		runtime_config = resolver.resolve()
+		# Load config
+		config = load_user_config()
+		config = update_config_with_click_args(config, ctx)
 
-		# Get LLM from unified config
-		llm = get_llm_from_runtime_config(runtime_config)
+		# Get LLM
+		llm = get_llm(config)
 
 		# Capture telemetry for CLI start in oneshot mode
 		telemetry.capture(
@@ -1616,20 +1523,26 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 			)
 		)
 
-		# Build BrowserProfile from unified RuntimeConfig
-		profile_dict = browser_config_to_profile_dict(runtime_config.browser)
-		profile = BrowserProfile(**profile_dict)
+		# Get agent settings from config
+		agent_settings = AgentSettings.model_validate(config.get('agent', {}))
+
+		# Create browser session with config parameters
+		browser_config = config.get('browser', {})
+		# Remove None values from browser_config
+		browser_config = {k: v for k, v in browser_config.items() if v is not None}
+		# Create BrowserProfile with user_data_dir
+		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
 		browser_session = BrowserSession(
 			browser_profile=profile,
 		)
 
-		# Create and run agent, passing the resolved runtime_config
+		# Create and run agent
 		agent = Agent(
 			task=prompt,
 			llm=llm,
 			browser_session=browser_session,
 			source='cli',
-			runtime_config=runtime_config,
+			**agent_settings.model_dump(),
 		)
 
 		await agent.run()
@@ -1665,7 +1578,7 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 				version=get_browser_use_version(),
 				action='error',
 				mode='oneshot',
-				model=llm.model if llm is not None and hasattr(llm, 'model') else None,
+				model=llm.model if hasattr(llm, 'model') else None,
 				model_provider=llm.__class__.__name__ if llm and 'llm' in locals() else None,
 				duration_seconds=time.time() - start_time,
 				error_message=error_msg,
@@ -1716,25 +1629,25 @@ async def textual_interface(config: dict[str, Any]):
 
 	logger.debug('Setting up Browser, Controller, and LLM...')
 
-	resolver = ConfigResolver()
-	resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
-	runtime_config = resolver.resolve()
-
-	# Step 1: Initialize BrowserSession with unified config
+	# Step 1: Initialize BrowserSession with config
 	logger.debug('Initializing BrowserSession...')
 	try:
-		logger.info('Browser type: chromium')  # BrowserSession only supports chromium
+		# Get browser config from the config dict
+		browser_config = config.get('browser', {})
 
-		# Build BrowserProfile from unified RuntimeConfig
-		profile_dict = browser_config_to_profile_dict(runtime_config.browser)
-		if profile_dict.get('executable_path'):
-			logger.info(f'Browser binary: {profile_dict["executable_path"]}')
-		if profile_dict.get('headless'):
+		logger.info('Browser type: chromium')  # BrowserSession only supports chromium
+		if browser_config.get('executable_path'):
+			logger.info(f'Browser binary: {browser_config["executable_path"]}')
+		if browser_config.get('headless'):
 			logger.info('Browser mode: headless')
 		else:
 			logger.info('Browser mode: visible')
 
-		profile = BrowserProfile(**profile_dict)
+		# Create BrowserSession directly with config parameters
+		# Remove None values from browser_config
+		browser_config = {k: v for k, v in browser_config.items() if v is not None}
+		# Create BrowserProfile with user_data_dir
+		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
 		browser_session = BrowserSession(
 			browser_profile=profile,
 		)
@@ -1763,12 +1676,12 @@ async def textual_interface(config: dict[str, Any]):
 		logger.error(f'Error initializing Controller: {str(e)}', exc_info=True)
 		raise RuntimeError(f'Failed to initialize Controller: {str(e)}')
 
-	# Step 4: Get LLM from unified RuntimeConfig
+	# Step 4: Get LLM
 	logger.debug('Getting LLM...')
 	try:
 		# Ensure setup_logging is not called when importing modules
 		os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
-		llm = get_llm_from_runtime_config(runtime_config)
+		llm = get_llm(config)
 		# Log LLM details
 		model_name = getattr(llm, 'model_name', None) or getattr(llm, 'model', 'Unknown model')
 		provider = llm.__class__.__name__
@@ -1794,10 +1707,10 @@ async def textual_interface(config: dict[str, Any]):
 		# Configure logging for Textual UI before going fullscreen
 		setup_textual_logging()
 
-		# Log browser and model configuration that will be used from unified config
+		# Log browser and model configuration that will be used
 		browser_type = 'Chromium'  # BrowserSession only supports Chromium
-		model_name = runtime_config.llm.model or 'auto-detected'
-		headless = runtime_config.browser.headless
+		model_name = config.get('model', {}).get('name', 'auto-detected')
+		headless = config.get('browser', {}).get('headless', False)
 		headless_str = 'headless' if headless else 'visible'
 
 		logger.info(f'Preparing {browser_type} browser ({headless_str}) with {model_name} LLM')
@@ -2176,44 +2089,43 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 	load_dotenv()
 	logger.debug('Environment variables loaded')
 
-	# ===== Build unified ConfigResolver =====
-	logger.debug('Building unified configuration...')
+	# Load user configuration
+	logger.debug('Loading user configuration...')
 	try:
-		resolver = ConfigResolver()
-		# Add CLI args (priority 90)
-		cli_flat = build_cli_flat_config(ctx)
-		if cli_flat:
-			resolver.add_cli(cli_flat, flat=True)
-		# Add CLI-specific default: user_data_dir
-		resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
-		runtime_config = resolver.resolve()
-		logger.debug('Unified configuration resolved')
+		config = load_user_config()
+		logger.debug(f'User configuration loaded from {CONFIG.BROWSER_USE_CONFIG_FILE}')
 	except Exception as e:
-		logger.error(f'Error building unified configuration: {str(e)}', exc_info=True)
-		print(f'Error building configuration: {str(e)}')
+		logger.error(f'Error loading user configuration: {str(e)}', exc_info=True)
+		print(f'Error loading configuration: {str(e)}')
 		sys.exit(1)
 
-	# Load command history (legacy config dict is only used for command_history now)
-	logger.debug('Loading command history...')
-	command_history: list[str] = []
+	# Update config with command-line arguments
+	logger.debug('Updating configuration with command line arguments...')
 	try:
-		history_file = CONFIG.BROWSER_USE_CONFIG_DIR / 'command_history.json'
-		if history_file.exists():
-			with open(history_file) as f:
-				command_history = json.load(f)
-		logger.debug('Command history loaded')
+		config = update_config_with_click_args(config, ctx)
+		logger.debug('Configuration updated')
 	except Exception as e:
-		logger.error(f'Error loading command history: {str(e)}', exc_info=True)
+		logger.error(f'Error updating config with command line args: {str(e)}', exc_info=True)
+		print(f'Error updating configuration: {str(e)}')
+		sys.exit(1)
 
-	config: dict[str, Any] = {'command_history': command_history}
+	# Save updated config
+	logger.debug('Saving user configuration...')
+	try:
+		save_user_config(config)
+		logger.debug('Configuration saved')
+	except Exception as e:
+		logger.error(f'Error saving user configuration: {str(e)}', exc_info=True)
+		print(f'Error saving configuration: {str(e)}')
+		sys.exit(1)
 
 	# Setup handlers for console output before entering Textual UI
 	logger.debug('Setting up handlers for Textual UI...')
 
-	# Log browser and model configuration from unified config
+	# Log browser and model configuration that will be used
 	browser_type = 'Chromium'  # BrowserSession only supports Chromium
-	model_name = runtime_config.llm.model or 'auto-detected'
-	headless = runtime_config.browser.headless
+	model_name = config.get('model', {}).get('name', 'auto-detected')
+	headless = config.get('browser', {}).get('headless', False)
 	headless_str = 'headless' if headless else 'visible'
 
 	logger.info(f'Preparing {browser_type} browser ({headless_str}) with {model_name} LLM')

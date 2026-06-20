@@ -64,11 +64,10 @@ from browser_use.agent.views import (
 from browser_use.browser.events import _get_timeout
 from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
+from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
-from browser_use.runtime_config import ConfigResolver, RuntimeConfig
-from browser_use.runtime_config.utils import browser_config_to_profile_dict
 from browser_use.telemetry.service import ProductTelemetry
 from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.tools.registry.views import ActionModel
@@ -138,7 +137,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		task: str,
 		llm: BaseChatModel | None = None,
 		# Optional parameters
-		runtime_config: RuntimeConfig | ConfigResolver | None = None,
 		browser_profile: BrowserProfile | None = None,
 		browser_session: BrowserSession | None = None,
 		browser: Browser | None = None,  # Alias for browser_session
@@ -213,15 +211,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		enable_signal_handler: bool = True,
 		**kwargs,
 	):
-		# Resolve runtime configuration
-		if runtime_config is None:
-			resolver = ConfigResolver()
-			self.runtime_config: RuntimeConfig = resolver.resolve()
-		elif isinstance(runtime_config, ConfigResolver):
-			self.runtime_config = runtime_config.resolve()
-		else:
-			self.runtime_config = runtime_config
-
 		# Validate llm_screenshot_size
 		if llm_screenshot_size is not None:
 			if not isinstance(llm_screenshot_size, tuple) or len(llm_screenshot_size) != 2:
@@ -233,20 +222,13 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				raise ValueError('llm_screenshot_size dimensions must be at least 100 pixels')
 			self.logger.info(f'🖼️  LLM screenshot resizing enabled: {width}x{height}')
 		if llm is None:
-			if self.runtime_config.llm.model:
+			default_llm_name = CONFIG.DEFAULT_LLM
+			if default_llm_name:
 				from browser_use.llm.models import get_llm_by_name
 
-				try:
-					llm = get_llm_by_name(self.runtime_config.llm.model)
-				except Exception:
-					pass
-
-			if llm is None and self.runtime_config.llm.default_llm:
-				from browser_use.llm.models import get_llm_by_name
-
-				llm = get_llm_by_name(self.runtime_config.llm.default_llm)
-
-			if llm is None:
+				llm = get_llm_by_name(default_llm_name)
+			else:
+				# No default LLM specified, use the original default
 				from browser_use import ChatBrowserUse
 
 				llm = ChatBrowserUse()
@@ -274,53 +256,35 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if available_file_paths is None:
 			available_file_paths = []
 
-		# Set timeout based on runtime_config first, then model name, then defaults
+		# Set timeout based on model name if not explicitly provided
 		if llm_timeout is None:
-			if self.runtime_config.agent.llm_timeout:
-				llm_timeout = self.runtime_config.agent.llm_timeout
-			else:
-				def _get_model_timeout(llm_model: BaseChatModel) -> int:
-					"""Determine timeout based on model name"""
-					model_name = getattr(llm_model, 'model', '').lower()
-					if 'gemini' in model_name:
-						if '3-pro' in model_name:
-							return 90
-						return 75
-					elif 'groq' in model_name:
-						return 30
-					elif 'o3' in model_name or 'claude' in model_name or 'sonnet' in model_name or 'deepseek' in model_name:
+
+			def _get_model_timeout(llm_model: BaseChatModel) -> int:
+				"""Determine timeout based on model name"""
+				model_name = getattr(llm_model, 'model', '').lower()
+				if 'gemini' in model_name:
+					if '3-pro' in model_name:
 						return 90
-					else:
-						return 75  # Default timeout
+					return 75
+				elif 'groq' in model_name:
+					return 30
+				elif 'o3' in model_name or 'claude' in model_name or 'sonnet' in model_name or 'deepseek' in model_name:
+					return 90
+				else:
+					return 75  # Default timeout
 
-				llm_timeout = _get_model_timeout(llm)
-
-		# Also use runtime_config for step_timeout if not explicitly provided
-		if step_timeout == 180 and self.runtime_config.agent.step_timeout != 180:
-			step_timeout = self.runtime_config.agent.step_timeout
+			llm_timeout = _get_model_timeout(llm)
 
 		self.id = task_id or uuid7str()
 		self.task_id: str = self.id
 		self.session_id: str = uuid7str()
 
-		# ===== Build BrowserProfile from unified runtime_config when not explicitly provided =====
-		if browser_profile is None:
-			# Build from runtime_config
-			profile_dict = browser_config_to_profile_dict(self.runtime_config.browser)
-			browser_profile = BrowserProfile(**profile_dict)
-		else:
-			# Copy if it's the default to avoid mutating shared state
-			base_profile = browser_profile or DEFAULT_BROWSER_PROFILE
-			if base_profile is DEFAULT_BROWSER_PROFILE:
-				base_profile = base_profile.model_copy()
-			browser_profile = base_profile
-
-		# Apply demo_mode override from runtime_config if not explicitly provided
-		if demo_mode is not None and browser_profile.demo_mode != demo_mode:
-			browser_profile = browser_profile.model_copy(update={'demo_mode': demo_mode})
-		elif demo_mode is None and self.runtime_config.browser.demo_mode is not None:
-			if browser_profile.demo_mode != self.runtime_config.browser.demo_mode:
-				browser_profile = browser_profile.model_copy(update={'demo_mode': self.runtime_config.browser.demo_mode})
+		base_profile = browser_profile or DEFAULT_BROWSER_PROFILE
+		if base_profile is DEFAULT_BROWSER_PROFILE:
+			base_profile = base_profile.model_copy()
+		if demo_mode is not None and base_profile.demo_mode != demo_mode:
+			base_profile = base_profile.model_copy(update={'demo_mode': demo_mode})
+		browser_profile = base_profile
 
 		# Handle browser vs browser_session parameter (browser takes precedence)
 		if browser and browser_session:
@@ -422,35 +386,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		if isinstance(message_compaction, bool):
 			message_compaction = MessageCompactionSettings(enabled=message_compaction)
-
-		# ===== Apply runtime_config defaults to AgentSettings parameters =====
-		rc_agent = self.runtime_config.agent
-		if use_vision == 'auto' and rc_agent.use_vision is not None:
-			use_vision = rc_agent.use_vision
-		if vision_detail_level == 'auto' and rc_agent.vision_detail_level is not None:
-			vision_detail_level = rc_agent.vision_detail_level
-		if save_conversation_path is None and rc_agent.save_conversation_path:
-			save_conversation_path = rc_agent.save_conversation_path
-		if save_conversation_path_encoding == 'utf-8' and rc_agent.save_conversation_path_encoding:
-			save_conversation_path_encoding = rc_agent.save_conversation_path_encoding
-		if max_failures == 3 and rc_agent.max_failures is not None:
-			max_failures = rc_agent.max_failures
-		if max_actions_per_step == 3 and rc_agent.max_actions_per_step is not None:
-			max_actions_per_step = rc_agent.max_actions_per_step
-		if use_thinking and rc_agent.use_thinking is not None:
-			use_thinking = rc_agent.use_thinking
-		if max_history_items is None and rc_agent.max_history_items is not None:
-			max_history_items = rc_agent.max_history_items
-		if not calculate_cost and rc_agent.calculate_cost:
-			calculate_cost = rc_agent.calculate_cost
-		if generate_gif is False and rc_agent.generate_gif:
-			generate_gif = rc_agent.generate_gif
-		if include_attributes is None and rc_agent.include_attributes:
-			include_attributes = rc_agent.include_attributes
-		if enable_planning and rc_agent.enable_planning is not None:
-			enable_planning = rc_agent.enable_planning
-		if directly_open_url and rc_agent.directly_open_url is not None:
-			directly_open_url = rc_agent.directly_open_url
 
 		self.settings = AgentSettings(
 			use_vision=use_vision,
@@ -776,13 +711,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Initialize new file system
 		try:
-			# Priority: explicit param > runtime_config.filesystem > agent_directory
-			resolved_path = file_system_path
-			if resolved_path is None and self.runtime_config.filesystem.file_system_path:
-				resolved_path = self.runtime_config.filesystem.file_system_path
-			if resolved_path:
-				self.file_system = FileSystem(resolved_path)
-				self.file_system_path = resolved_path
+			if file_system_path:
+				self.file_system = FileSystem(file_system_path)
+				self.file_system_path = file_system_path
 			else:
 				# Use the agent directory for file system
 				self.file_system = FileSystem(self.agent_directory)
@@ -2104,7 +2035,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.logger.debug(f'🤖 Browser-Use Library Version {self.version} ({self.source})')
 
 		# Check for latest version and log upgrade message if needed
-		if self.runtime_config.telemetry.version_check:
+		if CONFIG.BROWSER_USE_VERSION_CHECK:
 			latest_version = await check_latest_browser_use_version()
 			if latest_version and latest_version != self.version:
 				self.logger.info(
@@ -4016,7 +3947,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""
 
 		# Skip verification if already done
-		if getattr(self.llm, '_verified_api_keys', None) is True or self.runtime_config.llm.skip_api_key_verification:
+		if getattr(self.llm, '_verified_api_keys', None) is True or CONFIG.SKIP_LLM_API_KEY_VERIFICATION:
 			setattr(self.llm, '_verified_api_keys', True)
 			return True
 

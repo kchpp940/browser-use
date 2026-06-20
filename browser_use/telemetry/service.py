@@ -36,10 +36,8 @@ class ProductTelemetry:
 	_curr_user_id = None
 
 	def __init__(self) -> None:
-		from browser_use.runtime_config import get_runtime_config
-		rc = get_runtime_config()
-		telemetry_disabled = not rc.telemetry.anonymized_telemetry
-		self.debug_logging = rc.logging.level == 'debug'
+		telemetry_disabled = not CONFIG.ANONYMIZED_TELEMETRY
+		self.debug_logging = CONFIG.BROWSER_USE_LOGGING_LEVEL == 'debug'
 
 		if telemetry_disabled:
 			self._posthog_client = None

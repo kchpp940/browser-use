@@ -14,7 +14,6 @@ from pydantic import BaseModel
 from uuid_extensions import uuid7str
 
 from browser_use.config import CONFIG
-from browser_use.runtime_config import get_runtime_config
 
 # Temporary user ID for pre-auth events (matches cloud backend)
 TEMP_USER_ID = '99999999-9999-9999-9999-999999999999'
@@ -90,7 +89,7 @@ class DeviceAuthClient:
 
 	def __init__(self, base_url: str | None = None, http_client: httpx.AsyncClient | None = None):
 		# Backend API URL for OAuth requests - can be passed directly or defaults to env var
-		self.base_url = base_url or get_runtime_config().cloud.api_url
+		self.base_url = base_url or CONFIG.BROWSER_USE_CLOUD_API_URL
 		self.client_id = 'library'
 		self.scope = 'read write'
 
@@ -291,14 +290,14 @@ class DeviceAuthClient:
 			device_auth = await self.start_device_authorization(agent_session_id)
 
 			# Use frontend URL for user-facing links
-			frontend_url = get_runtime_config().cloud.ui_url or self.base_url.replace('//api.', '//cloud.')
+			frontend_url = CONFIG.BROWSER_USE_CLOUD_UI_URL or self.base_url.replace('//api.', '//cloud.')
 
 			# Replace backend URL with frontend URL in verification URIs
 			verification_uri = device_auth['verification_uri'].replace(self.base_url, frontend_url)
 			verification_uri_complete = device_auth['verification_uri_complete'].replace(self.base_url, frontend_url)
 
 			terminal_width, _terminal_height = shutil.get_terminal_size((80, 20))
-			if show_instructions and get_runtime_config().telemetry.cloud_sync_enabled:
+			if show_instructions and CONFIG.BROWSER_USE_CLOUD_SYNC:
 				logger.info('─' * max(terminal_width - 40, 20))
 				logger.info('🌐  View the details of this run in Browser Use Cloud:')
 				logger.info(f'    👉  {verification_uri_complete}')
@@ -339,7 +338,7 @@ class DeviceAuthClient:
 			logger.warning(f'❌ Unexpected error during cloud sync authentication: {type(e).__name__}: {e}')
 
 		if show_instructions:
-			logger.debug(f'❌ Sync authentication failed or timed out with {get_runtime_config().cloud.api_url}')
+			logger.debug(f'❌ Sync authentication failed or timed out with {CONFIG.BROWSER_USE_CLOUD_API_URL}')
 
 		return False
 
