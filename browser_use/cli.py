@@ -159,6 +159,7 @@ from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
 from browser_use.runtime_config import ConfigResolver, RuntimeConfig
+from browser_use.runtime_config.utils import browser_config_to_profile_dict
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
 
@@ -1591,14 +1592,21 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 	telemetry = ProductTelemetry()
 	start_time = time.time()
 	error_msg = None
+	llm = None
 
 	try:
-		# Load config
-		config = load_user_config()
-		config = update_config_with_click_args(config, ctx)
+		# ===== Use unified ConfigResolver instead of legacy config dict =====
+		resolver = ConfigResolver()
+		# Add CLI args (priority 90)
+		cli_flat = build_cli_flat_config(ctx)
+		if cli_flat:
+			resolver.add_cli(cli_flat, flat=True)
+		# Add CLI-specific default: user_data_dir for CLI
+		resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
+		runtime_config = resolver.resolve()
 
-		# Get LLM
-		llm = get_llm(config)
+		# Get LLM from unified config
+		llm = get_llm_from_runtime_config(runtime_config)
 
 		# Capture telemetry for CLI start in oneshot mode
 		telemetry.capture(
@@ -1611,26 +1619,20 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 			)
 		)
 
-		# Get agent settings from config
-		agent_settings = AgentSettings.model_validate(config.get('agent', {}))
-
-		# Create browser session with config parameters
-		browser_config = config.get('browser', {})
-		# Remove None values from browser_config
-		browser_config = {k: v for k, v in browser_config.items() if v is not None}
-		# Create BrowserProfile with user_data_dir
-		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
+		# Build BrowserProfile from unified RuntimeConfig
+		profile_dict = browser_config_to_profile_dict(runtime_config.browser)
+		profile = BrowserProfile(**profile_dict)
 		browser_session = BrowserSession(
 			browser_profile=profile,
 		)
 
-		# Create and run agent
+		# Create and run agent, passing the resolved runtime_config
 		agent = Agent(
 			task=prompt,
 			llm=llm,
 			browser_session=browser_session,
 			source='cli',
-			**agent_settings.model_dump(),
+			runtime_config=runtime_config,
 		)
 
 		await agent.run()
@@ -1717,25 +1719,36 @@ async def textual_interface(config: dict[str, Any]):
 
 	logger.debug('Setting up Browser, Controller, and LLM...')
 
-	# Step 1: Initialize BrowserSession with config
+	# ===== Use unified ConfigResolver instead of legacy config dict =====
+	# The config dict contains old-style config; extract runtime_config from it
+	# For the TUI path, the main entry point already resolved the config via
+	# ConfigResolver; we use that config dict for backward compat but also
+	# build a fresh ConfigResolver to ensure env vars / file are respected.
+	resolver = ConfigResolver()
+	# Add legacy config dict as explicit overrides (highest priority for the TUI)
+	if 'browser' in config:
+		resolver.add_explicit({'browser': config['browser']})
+	if 'model' in config and config['model'].get('name'):
+		resolver.add_explicit({'llm_model': config['model']['name']}, flat=True)
+	# Add CLI-specific default: user_data_dir
+	resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
+	runtime_config = resolver.resolve()
+
+	# Step 1: Initialize BrowserSession with unified config
 	logger.debug('Initializing BrowserSession...')
 	try:
-		# Get browser config from the config dict
-		browser_config = config.get('browser', {})
-
 		logger.info('Browser type: chromium')  # BrowserSession only supports chromium
-		if browser_config.get('executable_path'):
-			logger.info(f'Browser binary: {browser_config["executable_path"]}')
-		if browser_config.get('headless'):
+
+		# Build BrowserProfile from unified RuntimeConfig
+		profile_dict = browser_config_to_profile_dict(runtime_config.browser)
+		if profile_dict.get('executable_path'):
+			logger.info(f'Browser binary: {profile_dict["executable_path"]}')
+		if profile_dict.get('headless'):
 			logger.info('Browser mode: headless')
 		else:
 			logger.info('Browser mode: visible')
 
-		# Create BrowserSession directly with config parameters
-		# Remove None values from browser_config
-		browser_config = {k: v for k, v in browser_config.items() if v is not None}
-		# Create BrowserProfile with user_data_dir
-		profile = BrowserProfile(user_data_dir=str(USER_DATA_DIR), **browser_config)
+		profile = BrowserProfile(**profile_dict)
 		browser_session = BrowserSession(
 			browser_profile=profile,
 		)
@@ -1764,12 +1777,12 @@ async def textual_interface(config: dict[str, Any]):
 		logger.error(f'Error initializing Controller: {str(e)}', exc_info=True)
 		raise RuntimeError(f'Failed to initialize Controller: {str(e)}')
 
-	# Step 4: Get LLM
+	# Step 4: Get LLM from unified RuntimeConfig
 	logger.debug('Getting LLM...')
 	try:
 		# Ensure setup_logging is not called when importing modules
 		os.environ['BROWSER_USE_SETUP_LOGGING'] = 'false'
-		llm = get_llm(config)
+		llm = get_llm_from_runtime_config(runtime_config)
 		# Log LLM details
 		model_name = getattr(llm, 'model_name', None) or getattr(llm, 'model', 'Unknown model')
 		provider = llm.__class__.__name__
@@ -1795,10 +1808,10 @@ async def textual_interface(config: dict[str, Any]):
 		# Configure logging for Textual UI before going fullscreen
 		setup_textual_logging()
 
-		# Log browser and model configuration that will be used
+		# Log browser and model configuration that will be used from unified config
 		browser_type = 'Chromium'  # BrowserSession only supports Chromium
-		model_name = config.get('model', {}).get('name', 'auto-detected')
-		headless = config.get('browser', {}).get('headless', False)
+		model_name = runtime_config.llm.model or 'auto-detected'
+		headless = runtime_config.browser.headless
 		headless_str = 'headless' if headless else 'visible'
 
 		logger.info(f'Preparing {browser_type} browser ({headless_str}) with {model_name} LLM')
@@ -2177,8 +2190,25 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 	load_dotenv()
 	logger.debug('Environment variables loaded')
 
-	# Load user configuration
-	logger.debug('Loading user configuration...')
+	# ===== Build unified ConfigResolver =====
+	logger.debug('Building unified configuration...')
+	try:
+		resolver = ConfigResolver()
+		# Add CLI args (priority 90)
+		cli_flat = build_cli_flat_config(ctx)
+		if cli_flat:
+			resolver.add_cli(cli_flat, flat=True)
+		# Add CLI-specific default: user_data_dir
+		resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
+		runtime_config = resolver.resolve()
+		logger.debug('Unified configuration resolved')
+	except Exception as e:
+		logger.error(f'Error building unified configuration: {str(e)}', exc_info=True)
+		print(f'Error building configuration: {str(e)}')
+		sys.exit(1)
+
+	# Load user configuration (legacy path, for command history only)
+	logger.debug('Loading user configuration (legacy)...')
 	try:
 		config = load_user_config()
 		logger.debug(f'User configuration loaded from {CONFIG.BROWSER_USE_CONFIG_FILE}')
@@ -2187,18 +2217,18 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 		print(f'Error loading configuration: {str(e)}')
 		sys.exit(1)
 
-	# Update config with command-line arguments
-	logger.debug('Updating configuration with command line arguments...')
+	# Update config with command-line arguments (for backward compat of legacy config dict)
+	logger.debug('Updating legacy configuration with command line arguments...')
 	try:
 		config = update_config_with_click_args(config, ctx)
-		logger.debug('Configuration updated')
+		logger.debug('Legacy configuration updated')
 	except Exception as e:
-		logger.error(f'Error updating config with command line args: {str(e)}', exc_info=True)
+		logger.error(f'Error updating legacy config with command line args: {str(e)}', exc_info=True)
 		print(f'Error updating configuration: {str(e)}')
 		sys.exit(1)
 
-	# Save updated config
-	logger.debug('Saving user configuration...')
+	# Save updated config (command history only)
+	logger.debug('Saving user configuration (command history)...')
 	try:
 		save_user_config(config)
 		logger.debug('Configuration saved')
@@ -2210,10 +2240,10 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 	# Setup handlers for console output before entering Textual UI
 	logger.debug('Setting up handlers for Textual UI...')
 
-	# Log browser and model configuration that will be used
+	# Log browser and model configuration from unified config
 	browser_type = 'Chromium'  # BrowserSession only supports Chromium
-	model_name = config.get('model', {}).get('name', 'auto-detected')
-	headless = config.get('browser', {}).get('headless', False)
+	model_name = runtime_config.llm.model or 'auto-detected'
+	headless = runtime_config.browser.headless
 	headless_str = 'headless' if headless else 'visible'
 
 	logger.info(f'Preparing {browser_type} browser ({headless_str}) with {model_name} LLM')

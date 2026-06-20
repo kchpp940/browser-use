@@ -301,15 +301,24 @@ def sandbox(
 			if not api_key:
 				raise SandboxError('BROWSER_USE_API_KEY is required')
 
-			# 2. Resolve cloud parameters with runtime_config fallback
+			# 2. Resolve cloud parameters with runtime_config fallback (highest priority first)
 			_resolved_cloud_profile_id = cloud_profile_id or _resolved_config.browser.cloud_profile_id
 			_resolved_cloud_proxy = cloud_proxy_country_code or _resolved_config.browser.cloud_proxy_country_code
 			_resolved_cloud_timeout = cloud_timeout or _resolved_config.browser.cloud_timeout
 
-			# 3. Extract all parameters (explicit + closure)
+			# 3. Resolve logging level from runtime_config
+			_resolved_log_level = log_level
+			if _resolved_log_level == 'INFO':  # Only use runtime_config if not explicitly set
+				if _resolved_config.logging.level:
+					_resolved_log_level = _resolved_config.logging.level.upper()
+
+			# 4. Resolve server URL from runtime_config
+			_resolved_server_url = server_url or _resolved_config.cloud.api_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
+
+			# 5. Extract all parameters (explicit + closure)
 			all_params = _extract_all_params(func, args, kwargs)
 
-			# 3. Get function source without decorator and only needed imports
+			# 6. Get function source without decorator and only needed imports
 			func_source = _get_function_source_without_decorator(func)
 			needed_imports = _get_imports_used_in_function(func)
 
@@ -319,10 +328,10 @@ def sandbox(
 			else:
 				needed_imports = 'from browser_use import Browser'
 
-			# 4. Pickle parameters using cloudpickle for robust serialization
+			# 7. Pickle parameters using cloudpickle for robust serialization
 			pickled_params = base64.b64encode(cloudpickle.dumps(all_params)).decode()
 
-			# 5. Determine which params are in the function signature vs closure/globals
+			# 8. Determine which params are in the function signature vs closure/globals
 			func_param_names = {p.name for p in sig.parameters.values() if p.name != 'browser'}
 			non_explicit_params = {k: v for k, v in all_params.items() if k not in func_param_names}
 			explicit_params = {k: v for k, v in all_params.items() if k in func_param_names}
@@ -365,14 +374,27 @@ async def run(browser):
 
 """
 
-			# 9. Send to server
+			# 9. Build payload with unified runtime_config
 			payload: dict[str, Any] = {'code': base64.b64encode(execution_code.encode()).decode()}
 
+			# Build environment variables from unified config + explicit overrides
 			combined_env: dict[str, str] = env_vars.copy() if env_vars else {}
-			combined_env['LOG_LEVEL'] = log_level.upper()
+			combined_env['LOG_LEVEL'] = _resolved_log_level.upper()
+
+			# Serialize unified runtime_config as env var for the sandbox
+			# This ensures the sandboxed code has access to the same configuration
+			try:
+				flat_config = _resolved_config.to_flat_dict()
+				# Only include non-default, non-empty values to keep payload small
+				serializable_config = {k: str(v) for k, v in flat_config.items() if v is not None and v != ''}
+				combined_env['BROWSER_USE_RUNTIME_CONFIG'] = json.dumps(serializable_config)
+			except Exception:
+				# If serialization fails, skip - the sandbox will fall back to env vars
+				pass
+
 			payload['env'] = combined_env
 
-			# Add cloud parameters if provided
+			# Add cloud parameters from unified config
 			if _resolved_cloud_profile_id is not None:
 				payload['cloud_profile_id'] = _resolved_cloud_profile_id
 			if _resolved_cloud_proxy is not None:
@@ -380,7 +402,13 @@ async def run(browser):
 			if _resolved_cloud_timeout is not None:
 				payload['cloud_timeout'] = _resolved_cloud_timeout
 
-			url = server_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
+			# Also pass browser-level config from runtime_config to payload
+			if _resolved_config.browser.use_cloud:
+				payload['use_cloud'] = True
+			if _resolved_config.browser.cdp_url:
+				payload['cdp_url'] = _resolved_config.browser.cdp_url
+
+			url = _resolved_server_url
 
 			request_headers = {'X-API-Key': api_key}
 			if headers:
