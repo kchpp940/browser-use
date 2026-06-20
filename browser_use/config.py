@@ -13,7 +13,7 @@ import psutil
 from pydantic import BaseModel, ConfigDict, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from browser_use.runtime_config import RuntimeConfig, ConfigResolver, browser_config_to_profile_dict
+from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 
 logger = logging.getLogger(__name__)
 
