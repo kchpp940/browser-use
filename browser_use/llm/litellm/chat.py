@@ -7,11 +7,23 @@ Requires the `litellm` package to be installed separately:
 Note: litellm is NOT included as a dependency of browser-use.
 """
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass, field
 from typing import Any, TypeVar, overload
 
 from pydantic import BaseModel
+
+_LITELLM_AVAILABLE: bool | None = None
+_LITELLM_IMPORT_ERROR: Exception | None = None
+
+
+def _require_litellm_sdk(orig_error=None):
+	if not _LITELLM_AVAILABLE:
+		raise ImportError(
+			'The LiteLLM provider SDK is not available. Install with: pip install litellm'
+		) from (orig_error or _LITELLM_IMPORT_ERROR)
 
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
@@ -41,11 +53,16 @@ class ChatLiteLLM(BaseChatModel):
 
 	def __post_init__(self) -> None:
 		"""Resolve provider info from the model string via litellm."""
+		global _LITELLM_AVAILABLE, _LITELLM_IMPORT_ERROR
 		try:
 			from litellm import get_llm_provider  # type: ignore[reportMissingImports]
 
+			_LITELLM_AVAILABLE = True
+			_LITELLM_IMPORT_ERROR = None
 			self._clean_model, self._provider_name, _, _ = get_llm_provider(self.model)
-		except Exception:
+		except Exception as e:
+			_LITELLM_AVAILABLE = False
+			_LITELLM_IMPORT_ERROR = e
 			if '/' in self.model:
 				self._provider_name, self._clean_model = self.model.split('/', 1)
 			else:
@@ -117,6 +134,7 @@ class ChatLiteLLM(BaseChatModel):
 		output_format: type[T] | None = None,
 		**kwargs: Any,
 	) -> ChatInvokeCompletion[T] | ChatInvokeCompletion[str]:
+		_require_litellm_sdk()
 		from litellm import acompletion  # type: ignore[reportMissingImports]
 		from litellm.exceptions import APIConnectionError, APIError, RateLimitError, Timeout  # type: ignore[reportMissingImports]
 		from litellm.types.utils import ModelResponse  # type: ignore[reportMissingImports]

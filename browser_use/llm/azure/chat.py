@@ -1,13 +1,39 @@
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
 import httpx
-from openai import APIConnectionError, APIStatusError, RateLimitError
-from openai import AsyncAzureOpenAI as AsyncAzureOpenAIClient
-from openai.types.responses import Response
-from openai.types.shared import ChatModel
+
+_OPENAI_AVAILABLE = True
+_OPENAI_IMPORT_ERROR: Exception | None = None
+
+try:
+	from openai import APIConnectionError, APIStatusError, RateLimitError
+	from openai import AsyncAzureOpenAI as AsyncAzureOpenAIClient
+	from openai.types.responses import Response
+	from openai.types.shared import ChatModel
+except ImportError as _e:
+	_OPENAI_AVAILABLE = False
+	_OPENAI_IMPORT_ERROR = _e
+	APIConnectionError = Any  # type: ignore
+	APIStatusError = Any  # type: ignore
+	RateLimitError = Any  # type: ignore
+	AsyncAzureOpenAIClient = Any  # type: ignore
+	Response = Any  # type: ignore
+	ChatModel = Any  # type: ignore
+
 from pydantic import BaseModel
+
+
+def _require_openai_sdk(provider_name: str, extra_name: str, orig_error: Exception | None) -> None:
+	if not _OPENAI_AVAILABLE:
+		msg = (
+			f'{provider_name} requires the OpenAI SDK. '
+			f'Install it with: pip install "browser-use[{extra_name}]"'
+		)
+		raise ImportError(msg) from orig_error
 
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
 from browser_use.llm.messages import BaseMessage
@@ -100,6 +126,7 @@ class ChatAzureOpenAI(ChatOpenAILike):
 		Returns:
 			AsyncAzureOpenAIClient: An instance of the asynchronous OpenAI client.
 		"""
+		_require_openai_sdk('Azure OpenAI', 'llm-openai', _OPENAI_IMPORT_ERROR)
 		if self.client:
 			return self.client
 

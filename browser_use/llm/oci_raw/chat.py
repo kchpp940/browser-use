@@ -5,20 +5,44 @@ This module provides direct integration with Oracle Cloud Infrastructure's
 Generative AI service using raw API calls without Langchain dependencies.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
-import oci
-from oci.generative_ai_inference import GenerativeAiInferenceClient
-from oci.generative_ai_inference.models import (
-	BaseChatRequest,
-	ChatDetails,
-	CohereChatRequest,
-	GenericChatRequest,
-	OnDemandServingMode,
-)
+try:
+	import oci
+	from oci.generative_ai_inference import GenerativeAiInferenceClient
+	from oci.generative_ai_inference.models import (
+		BaseChatRequest,
+		ChatDetails,
+		CohereChatRequest,
+		GenericChatRequest,
+		OnDemandServingMode,
+	)
+	_OCI_AVAILABLE = True
+	_OCI_IMPORT_ERROR = None
+except ImportError as _e:
+	_OCI_AVAILABLE = False
+	_OCI_IMPORT_ERROR = _e
+	oci = Any  # type: ignore
+	GenerativeAiInferenceClient = Any  # type: ignore
+	BaseChatRequest = Any  # type: ignore
+	ChatDetails = Any  # type: ignore
+	CohereChatRequest = Any  # type: ignore
+	GenericChatRequest = Any  # type: ignore
+	OnDemandServingMode = Any  # type: ignore
+
+
+def _require_oci_sdk(orig_error=None):
+	if not _OCI_AVAILABLE:
+		raise ImportError(
+			'The OCI provider SDK is not available. Install with: pip install "browser-use[llm-oci]"'
+		) from (orig_error or _OCI_IMPORT_ERROR)
+
+
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
@@ -157,6 +181,7 @@ class ChatOCIRaw(BaseChatModel):
 
 	def _get_oci_client(self) -> GenerativeAiInferenceClient:
 		"""Get the OCI GenerativeAiInferenceClient following your working example."""
+		_require_oci_sdk()
 		if not hasattr(self, '_client'):
 			# Configure OCI client based on auth_type (following your working example)
 			if self.auth_type == 'API_KEY':

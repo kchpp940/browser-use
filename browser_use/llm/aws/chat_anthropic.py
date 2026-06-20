@@ -1,18 +1,45 @@
+from __future__ import annotations
+
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
-from anthropic import (
-	APIConnectionError,
-	APIStatusError,
-	AsyncAnthropicBedrock,
-	RateLimitError,
-	omit,
-)
-from anthropic.types import CacheControlEphemeralParam, Message, ToolParam
-from anthropic.types.text_block import TextBlock
-from anthropic.types.tool_choice_tool_param import ToolChoiceToolParam
+try:
+	from anthropic import (
+		APIConnectionError,
+		APIStatusError,
+		AsyncAnthropicBedrock,
+		RateLimitError,
+		omit,
+	)
+	from anthropic.types import CacheControlEphemeralParam, Message, ToolParam
+	from anthropic.types.text_block import TextBlock
+	from anthropic.types.tool_choice_tool_param import ToolChoiceToolParam
+	_ANTHROPIC_BEDROCK_AVAILABLE = True
+	_ANTHROPIC_BEDROCK_IMPORT_ERROR = None
+except ImportError as _e:
+	_ANTHROPIC_BEDROCK_AVAILABLE = False
+	_ANTHROPIC_BEDROCK_IMPORT_ERROR = _e
+	APIConnectionError = Any  # type: ignore
+	APIStatusError = Any  # type: ignore
+	AsyncAnthropicBedrock = Any  # type: ignore
+	RateLimitError = Any  # type: ignore
+	omit = Any  # type: ignore
+	CacheControlEphemeralParam = Any  # type: ignore
+	Message = Any  # type: ignore
+	ToolParam = Any  # type: ignore
+	TextBlock = Any  # type: ignore
+	ToolChoiceToolParam = Any  # type: ignore
+
+
+def _require_anthropic_bedrock_sdk(orig_error=None):
+	if not _ANTHROPIC_BEDROCK_AVAILABLE:
+		raise ImportError(
+			'The AWS Anthropic Bedrock provider SDK is not available. Install with: pip install "browser-use[llm-aws,llm-anthropic]"'
+		) from (orig_error or _ANTHROPIC_BEDROCK_IMPORT_ERROR)
+
+
 from pydantic import BaseModel
 
 from browser_use.llm.anthropic.serializer import AnthropicMessageSerializer
@@ -124,6 +151,7 @@ class ChatAnthropicBedrock(ChatAWSBedrock):
 		Returns:
 			AsyncAnthropicBedrock: An instance of the AsyncAnthropicBedrock client.
 		"""
+		_require_anthropic_bedrock_sdk()
 		client_params = self._get_client_params()
 		return AsyncAnthropicBedrock(**client_params)
 

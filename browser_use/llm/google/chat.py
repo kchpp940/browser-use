@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import importlib.metadata
 import json
@@ -7,10 +9,29 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeVar, overload
 
-from google import genai
-from google.auth.credentials import Credentials
-from google.genai import types
-from google.genai.types import MediaModality
+try:
+	from google import genai
+	from google.auth.credentials import Credentials
+	from google.genai import types
+	from google.genai.types import MediaModality
+	_GOOGLE_AVAILABLE = True
+	_GOOGLE_IMPORT_ERROR = None
+except ImportError as _e:
+	_GOOGLE_AVAILABLE = False
+	_GOOGLE_IMPORT_ERROR = _e
+	genai = Any  # type: ignore
+	Credentials = Any  # type: ignore
+	types = Any  # type: ignore
+	MediaModality = Any  # type: ignore
+
+
+def _require_google_sdk(orig_error=None):
+	if not _GOOGLE_AVAILABLE:
+		raise ImportError(
+			'The Google Gemini provider SDK is not available. Install with: pip install "browser-use[llm-google]"'
+		) from (orig_error or _GOOGLE_IMPORT_ERROR)
+
+
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
@@ -176,6 +197,7 @@ class ChatGoogle(BaseChatModel):
 		Returns:
 			genai.Client: An instance of the Google genai client.
 		"""
+		_require_google_sdk()
 		if self._client is not None:
 			return self._client
 

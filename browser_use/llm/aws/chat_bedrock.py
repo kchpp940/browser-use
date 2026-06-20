@@ -1,9 +1,17 @@
+from __future__ import annotations
+
 import json
 from dataclasses import dataclass
 from os import getenv
 from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 from pydantic import BaseModel
+
+
+def _require_bedrock_sdk(orig_error=None):
+	raise ImportError(
+		'The AWS Bedrock provider SDK is not available. Install with: pip install "browser-use[llm-aws]"'
+	) from orig_error
 
 from browser_use.llm.aws.serializer import AWSBedrockMessageSerializer
 from browser_use.llm.base import BaseChatModel
@@ -65,10 +73,8 @@ class ChatAWSBedrock(BaseChatModel):
 		"""Get the AWS Bedrock client."""
 		try:
 			from boto3 import client as AwsClient  # type: ignore
-		except ImportError:
-			raise ImportError(
-				'`boto3` not installed. Please install using `pip install browser-use[aws] or pip install browser-use[all]`'
-			)
+		except ImportError as e:
+			_require_bedrock_sdk(orig_error=e)
 
 		if self.session:
 			return self.session.client('bedrock-runtime')
@@ -167,10 +173,8 @@ class ChatAWSBedrock(BaseChatModel):
 		"""
 		try:
 			from botocore.exceptions import ClientError  # type: ignore
-		except ImportError:
-			raise ImportError(
-				'`boto3` not installed. Please install using `pip install browser-use[aws] or pip install browser-use[all]`'
-			)
+		except ImportError as e:
+			_require_bedrock_sdk(orig_error=e)
 
 		bedrock_messages, system_message = AWSBedrockMessageSerializer.serialize_messages(messages)
 

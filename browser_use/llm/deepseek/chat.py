@@ -5,15 +5,39 @@ from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
 import httpx
-from openai import (
-	APIConnectionError,
-	APIError,
-	APIStatusError,
-	APITimeoutError,
-	AsyncOpenAI,
-	RateLimitError,
-)
+
+_OPENAI_AVAILABLE = True
+_OPENAI_IMPORT_ERROR: Exception | None = None
+
+try:
+	from openai import (
+		APIConnectionError,
+		APIError,
+		APIStatusError,
+		APITimeoutError,
+		AsyncOpenAI,
+		RateLimitError,
+	)
+except ImportError as _e:
+	_OPENAI_AVAILABLE = False
+	_OPENAI_IMPORT_ERROR = _e
+	APIConnectionError = Any  # type: ignore
+	APIError = Any  # type: ignore
+	APIStatusError = Any  # type: ignore
+	APITimeoutError = Any  # type: ignore
+	AsyncOpenAI = Any  # type: ignore
+	RateLimitError = Any  # type: ignore
+
 from pydantic import BaseModel
+
+
+def _require_openai_sdk(provider_name: str, extra_name: str, orig_error: Exception | None) -> None:
+	if not _OPENAI_AVAILABLE:
+		msg = (
+			f'{provider_name} requires the OpenAI SDK. '
+			f'Install it with: pip install "browser-use[{extra_name}]"'
+		)
+		raise ImportError(msg) from orig_error
 
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.deepseek.serializer import DeepSeekMessageSerializer
@@ -48,6 +72,7 @@ class ChatDeepSeek(BaseChatModel):
 		return 'deepseek'
 
 	def _client(self) -> AsyncOpenAI:
+		_require_openai_sdk('DeepSeek', 'llm-openai', _OPENAI_IMPORT_ERROR)
 		return AsyncOpenAI(
 			api_key=self.api_key,
 			base_url=self.base_url,

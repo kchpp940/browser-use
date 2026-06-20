@@ -1,10 +1,30 @@
+from __future__ import annotations
+
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
 import httpx
-from ollama import AsyncClient as OllamaAsyncClient
-from ollama import Options
+
+try:
+	from ollama import AsyncClient as OllamaAsyncClient
+	from ollama import Options
+	_OLLAMA_AVAILABLE = True
+	_OLLAMA_IMPORT_ERROR = None
+except ImportError as _e:
+	_OLLAMA_AVAILABLE = False
+	_OLLAMA_IMPORT_ERROR = _e
+	OllamaAsyncClient = Any  # type: ignore
+	Options = Any  # type: ignore
+
+
+def _require_ollama_sdk(orig_error=None):
+	if not _OLLAMA_AVAILABLE:
+		raise ImportError(
+			'The Ollama provider SDK is not available. Install with: pip install "browser-use[llm-ollama]"'
+		) from (orig_error or _OLLAMA_IMPORT_ERROR)
+
+
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
@@ -51,6 +71,7 @@ class ChatOllama(BaseChatModel):
 		"""
 		Returns an OllamaAsyncClient client.
 		"""
+		_require_ollama_sdk()
 		return OllamaAsyncClient(host=self.host, timeout=self.timeout, **self.client_params or {})
 
 	@property
