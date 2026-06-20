@@ -63,10 +63,11 @@ if TYPE_CHECKING:
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
 	from browser_use.llm.vercel.chat import ChatVercel
+	from browser_use.runtime_config import ConfigResolver, RuntimeConfig, get_default_resolver, get_runtime_config
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
 
-	# Lazy imports mapping - only import when actually accessed
+# Lazy imports mapping - only import when actually accessed
 _LAZY_IMPORTS = {
 	# Agent service (heavy due to dependencies)
 	'Agent': ('browser_use.agent.service', 'Agent'),
@@ -100,6 +101,11 @@ _LAZY_IMPORTS = {
 	'models': ('browser_use.llm.models', None),
 	# Sandbox execution
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
+	# Unified runtime configuration
+	'RuntimeConfig': ('browser_use.runtime_config', 'RuntimeConfig'),
+	'ConfigResolver': ('browser_use.runtime_config', 'ConfigResolver'),
+	'get_runtime_config': ('browser_use.runtime_config', 'get_runtime_config'),
+	'get_default_resolver': ('browser_use.runtime_config', 'get_default_resolver'),
 }
 
 
@@ -154,4 +160,9 @@ __all__ = [
 	'models',
 	# Sandbox execution
 	'sandbox',
+	# Unified runtime configuration
+	'RuntimeConfig',
+	'ConfigResolver',
+	'get_runtime_config',
+	'get_default_resolver',
 ]

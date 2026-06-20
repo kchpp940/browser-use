@@ -252,12 +252,50 @@ class EnvConfigSource(ConfigSource):
 			if env_value is None:
 				continue
 
-			# Parse value to appropriate type
 			parsed_value = self._parse_env_value(env_value, target)
 
 			if parsed_value is None:
 				continue
 
+			if len(target) == 2:
+				group_name, field_name = target
+				if group_name not in result:
+					result[group_name] = {}
+				result[group_name][field_name] = parsed_value
+			elif len(target) == 1:
+				result[target[0]] = parsed_value
+
+		legacy_unprefixed = {
+			'ANONYMIZED_TELEMETRY',
+			'OPENAI_API_KEY',
+			'ANTHROPIC_API_KEY',
+			'GOOGLE_API_KEY',
+			'DEEPSEEK_API_KEY',
+			'GROK_API_KEY',
+			'NOVITA_API_KEY',
+			'AZURE_OPENAI_ENDPOINT',
+			'AZURE_OPENAI_KEY',
+			'SKIP_LLM_API_KEY_VERIFICATION',
+			'DEFAULT_LLM',
+			'IN_DOCKER',
+			'IS_IN_EVALS',
+			'WIN_FONT_DIR',
+		}
+
+		for env_suffix in legacy_unprefixed:
+			if env_suffix not in self.ENV_MAPPING:
+				continue
+			target = self.ENV_MAPPING[env_suffix]
+			env_name = env_suffix
+			prefixed_env_name = f'{self._prefix}{env_suffix}'
+			if os.getenv(prefixed_env_name) is not None:
+				continue
+			env_value = os.getenv(env_name)
+			if env_value is None:
+				continue
+			parsed_value = self._parse_env_value(env_value, target)
+			if parsed_value is None:
+				continue
 			if len(target) == 2:
 				group_name, field_name = target
 				if group_name not in result:

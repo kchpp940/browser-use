@@ -52,36 +52,40 @@ class OldConfig:
 	_dirs_created = False
 
 	def __init__(self):
-		self._runtime_config: RuntimeConfig = ConfigResolver(include_env=True, include_file=False).resolve()
+		pass
+
+	@property
+	def _rc(self) -> RuntimeConfig:
+		return ConfigResolver(include_env=True, include_file=False).resolve()
 
 	@property
 	def BROWSER_USE_LOGGING_LEVEL(self) -> str:
-		return self._runtime_config.logging.level
+		return self._rc.logging.level
 
 	@property
 	def ANONYMIZED_TELEMETRY(self) -> bool:
-		return self._runtime_config.telemetry.anonymized_telemetry
+		return self._rc.telemetry.anonymized_telemetry
 
 	@property
 	def BROWSER_USE_CLOUD_SYNC(self) -> bool:
-		return self._runtime_config.telemetry.cloud_sync_enabled
+		return self._rc.telemetry.cloud_sync_enabled
 
 	@property
 	def BROWSER_USE_CLOUD_API_URL(self) -> str:
-		url = self._runtime_config.cloud.api_url
+		url = self._rc.cloud.api_url
 		assert '://' in url, 'BROWSER_USE_CLOUD_API_URL must be a valid URL'
 		return url
 
 	@property
 	def BROWSER_USE_CLOUD_UI_URL(self) -> str:
-		url = self._runtime_config.cloud.ui_url
+		url = self._rc.cloud.ui_url
 		if url and '://' not in url:
 			raise AssertionError('BROWSER_USE_CLOUD_UI_URL must be a valid URL if set')
 		return url
 
 	@property
 	def BROWSER_USE_MODEL_PRICING_URL(self) -> str:
-		url = self._runtime_config.cloud.model_pricing_url
+		url = self._rc.cloud.model_pricing_url
 		if url and '://' not in url:
 			raise AssertionError('BROWSER_USE_MODEL_PRICING_URL must be a valid URL if set')
 		return url
@@ -132,43 +136,43 @@ class OldConfig:
 
 	@property
 	def OPENAI_API_KEY(self) -> str:
-		return self._runtime_config.llm.openai_api_key or ''
+		return self._rc.llm.openai_api_key or ''
 
 	@property
 	def ANTHROPIC_API_KEY(self) -> str:
-		return self._runtime_config.llm.anthropic_api_key or ''
+		return self._rc.llm.anthropic_api_key or ''
 
 	@property
 	def GOOGLE_API_KEY(self) -> str:
-		return self._runtime_config.llm.google_api_key or ''
+		return self._rc.llm.google_api_key or ''
 
 	@property
 	def DEEPSEEK_API_KEY(self) -> str:
-		return self._runtime_config.llm.deepseek_api_key or ''
+		return self._rc.llm.deepseek_api_key or ''
 
 	@property
 	def GROK_API_KEY(self) -> str:
-		return self._runtime_config.llm.grok_api_key or ''
+		return self._rc.llm.grok_api_key or ''
 
 	@property
 	def NOVITA_API_KEY(self) -> str:
-		return self._runtime_config.llm.novita_api_key or ''
+		return self._rc.llm.novita_api_key or ''
 
 	@property
 	def AZURE_OPENAI_ENDPOINT(self) -> str:
-		return self._runtime_config.llm.azure_endpoint or ''
+		return self._rc.llm.azure_endpoint or ''
 
 	@property
 	def AZURE_OPENAI_KEY(self) -> str:
-		return self._runtime_config.llm.azure_api_key or ''
+		return self._rc.llm.azure_api_key or ''
 
 	@property
 	def SKIP_LLM_API_KEY_VERIFICATION(self) -> bool:
-		return self._runtime_config.llm.skip_api_key_verification
+		return self._rc.llm.skip_api_key_verification
 
 	@property
 	def DEFAULT_LLM(self) -> str:
-		return self._runtime_config.llm.default_llm
+		return self._rc.llm.default_llm
 
 	@property
 	def IN_DOCKER(self) -> bool:
@@ -180,7 +184,7 @@ class OldConfig:
 
 	@property
 	def BROWSER_USE_VERSION_CHECK(self) -> bool:
-		return self._runtime_config.telemetry.version_check
+		return self._rc.telemetry.version_check
 
 	@property
 	def WIN_FONT_DIR(self) -> str:
@@ -435,6 +439,8 @@ class Config:
 		return {}
 
 	def _load_config(self) -> dict[str, Any]:
+		from browser_use.runtime_config.utils import browser_config_to_profile_dict
+
 		runtime_config = ConfigResolver(include_env=True, include_file=True).resolve()
 		return {
 			'browser_profile': browser_config_to_profile_dict(runtime_config.browser),
@@ -449,6 +455,8 @@ CONFIG = Config()
 
 # Helper functions for MCP components
 def load_browser_use_config() -> dict[str, Any]:
+	from browser_use.runtime_config.utils import browser_config_to_profile_dict
+
 	runtime_config = ConfigResolver(include_env=True, include_file=True).resolve()
 	return {
 		'browser_profile': browser_config_to_profile_dict(runtime_config.browser),
@@ -459,6 +467,8 @@ def load_browser_use_config() -> dict[str, Any]:
 
 def get_default_profile(config: RuntimeConfig | dict[str, Any]) -> dict[str, Any]:
 	if isinstance(config, RuntimeConfig):
+		from browser_use.runtime_config.utils import browser_config_to_profile_dict
+
 		return browser_config_to_profile_dict(config.browser)
 	return config.get('browser_profile', {})
 
