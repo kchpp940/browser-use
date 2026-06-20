@@ -158,6 +158,7 @@ from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
+from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
 
@@ -301,6 +302,46 @@ def save_user_config(config: dict[str, Any]) -> None:
 			json.dump(history, f, indent=2, ensure_ascii=False)
 
 
+def build_cli_flat_config(ctx: click.Context) -> dict[str, Any]:
+	"""Build flat config dict from click CLI arguments for ConfigResolver.
+
+	Returns a flat dictionary with keys like 'browser_headless', 'llm_model', etc.
+	suitable for passing to ConfigResolver.add_cli().
+	"""
+	params = ctx.params or {}
+	flat: dict[str, Any] = {}
+
+	# LLM config
+	if params.get('model'):
+		flat['llm_model'] = params['model']
+
+	# Browser config
+	if params.get('headless') is not None:
+		flat['browser_headless'] = params['headless']
+	if params.get('window_width'):
+		flat['browser_window_width'] = params['window_width']
+	if params.get('window_height'):
+		flat['browser_window_height'] = params['window_height']
+	if params.get('user_data_dir'):
+		flat['browser_user_data_dir'] = params['user_data_dir']
+	if params.get('profile_directory'):
+		flat['browser_profile_directory'] = params['profile_directory']
+	if params.get('cdp_url'):
+		flat['browser_cdp_url'] = params['cdp_url']
+
+	# Proxy config
+	if params.get('proxy_url'):
+		flat['browser_proxy_server'] = params['proxy_url']
+	if params.get('no_proxy'):
+		flat['browser_proxy_bypass'] = ','.join([p.strip() for p in params['no_proxy'].split(',') if p.strip()])
+	if params.get('proxy_username'):
+		flat['browser_proxy_username'] = params['proxy_username']
+	if params.get('proxy_password'):
+		flat['browser_proxy_password'] = params['proxy_password']
+
+	return flat
+
+
 def update_config_with_click_args(config: dict[str, Any], ctx: click.Context) -> dict[str, Any]:
 	"""Update configuration with command-line arguments."""
 	# Ensure required sections exist
@@ -352,7 +393,10 @@ def setup_readline_history(history: list[str]) -> None:
 
 
 def get_llm(config: dict[str, Any]):
-	"""Get the language model based on config and available API keys."""
+	"""Get the language model based on config and available API keys.
+
+	Kept for backward compatibility. Prefer get_llm_from_runtime_config().
+	"""
 	model_config = config.get('model', {})
 	model_name = model_config.get('name')
 	temperature = model_config.get('temperature', 0.0)
@@ -393,6 +437,50 @@ def get_llm(config: dict[str, Any]):
 	else:
 		print(
 			'⚠️  No API keys found. Please update your config or set one of: OPENAI_API_KEY, ANTHROPIC_API_KEY, or GOOGLE_API_KEY.'
+		)
+		sys.exit(1)
+
+
+def get_llm_from_runtime_config(runtime_config: RuntimeConfig):
+	"""Get the language model based on unified RuntimeConfig."""
+	model_name = runtime_config.llm.model
+	temperature = 0.0
+
+	# Get API keys from runtime_config
+	openai_key = runtime_config.llm.openai_api_key
+	anthropic_key = runtime_config.llm.anthropic_api_key
+	google_key = runtime_config.llm.google_api_key
+
+	if model_name:
+		if model_name.startswith('gpt'):
+			if not openai_key:
+				print('⚠️  OpenAI API key not found. Please update your config or set BROWSER_USE_OPENAI_API_KEY environment variable.')
+				sys.exit(1)
+			return ChatOpenAI(model=model_name, temperature=temperature, api_key=openai_key)
+		elif model_name.startswith('claude'):
+			if not anthropic_key:
+				print('⚠️  Anthropic API key not found. Please update your config or set BROWSER_USE_ANTHROPIC_API_KEY environment variable.')
+				sys.exit(1)
+			return ChatAnthropic(model=model_name, temperature=temperature)
+		elif model_name.startswith('gemini'):
+			if not google_key:
+				print('⚠️  Google API key not found. Please update your config or set BROWSER_USE_GOOGLE_API_KEY environment variable.')
+				sys.exit(1)
+			return ChatGoogle(model=model_name, temperature=temperature)
+		elif model_name.startswith('oci'):
+			print('⚠️  OCI models require manual configuration.')
+			sys.exit(1)
+
+	# Auto-detect based on available API keys
+	if openai_key:
+		return ChatOpenAI(model='gpt-5-mini', temperature=temperature, api_key=openai_key)
+	elif anthropic_key:
+		return ChatAnthropic(model='claude-4-sonnet', temperature=temperature)
+	elif google_key:
+		return ChatGoogle(model='gemini-2.5-pro', temperature=temperature)
+	else:
+		print(
+			'⚠️  No API keys found. Please set one of: BROWSER_USE_OPENAI_API_KEY, BROWSER_USE_ANTHROPIC_API_KEY, or BROWSER_USE_GOOGLE_API_KEY.'
 		)
 		sys.exit(1)
 
