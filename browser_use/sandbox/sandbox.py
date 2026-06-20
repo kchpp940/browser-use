@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, Union, c
 import cloudpickle
 import httpx
 
+from browser_use.observability_runtime import EventSource, EventType, RuntimeLogger, SinkConfig
 from browser_use.sandbox.views import (
 	BrowserCreatedData,
 	ErrorData,
@@ -375,6 +376,28 @@ async def run(browser):
 			live_url_shown = False
 			execution_started = False
 			received_final_event = False
+
+			# Unified RuntimeLogger - observability runtime (sandbox/cloud layer)
+			sb_rt = RuntimeLogger(source=EventSource.SANDBOX)
+			sb_rt.set_sinks(SinkConfig(console=not quiet, event_bus=False, telemetry=True, cloud=True))
+			try:
+				from uuid_extensions import uuid7str
+
+				_sb_run_id = f'sb-{uuid7str()}'
+			except Exception:
+				_sb_run_id = None
+			_rt_token = sb_rt.set_context(task_id=_sb_run_id)
+			sb_rt.emit(
+				event_type=EventType.CLOUD_EXECUTION_START,
+				message=f'Starting sandbox execution: {func.__name__}',
+				data={
+					'function_name': func.__name__,
+					'cloud_profile_id': cloud_profile_id,
+					'cloud_proxy_country_code': cloud_proxy_country_code,
+					'cloud_timeout_minutes': cloud_timeout,
+				},
+				task_id=_sb_run_id,
+			)
 
 			async with httpx.AsyncClient(timeout=1800.0) as client:
 				async with client.stream('POST', url, json=payload, headers=request_headers) as response:

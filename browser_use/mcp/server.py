@@ -149,6 +149,7 @@ except ImportError:
 	logger.error('MCP SDK not installed. Install with: pip install mcp')
 	sys.exit(1)
 
+from browser_use.observability_runtime import EventSource, RuntimeLogger, SinkConfig
 from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
 from browser_use.utils import create_task_with_error_handling, get_browser_use_version
 
@@ -200,6 +201,11 @@ class BrowserUseServer:
 		self.file_system: FileSystem | None = None
 		self._telemetry = ProductTelemetry()
 		self._start_time = time.time()
+
+		# Unified RuntimeLogger - observability runtime (MCP server layer)
+		self.runtime_logger = RuntimeLogger(source=EventSource.MCP_SERVER)
+		self.runtime_logger.set_sinks(SinkConfig(console=True, event_bus=False, telemetry=True, cloud=False))
+		self.runtime_logger._telemetry.telemetry_client = self._telemetry
 
 		# Session management
 		self.active_sessions: dict[str, dict[str, Any]] = {}  # session_id -> session info

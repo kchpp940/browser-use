@@ -56,6 +56,7 @@ from browser_use.browser.profile import BrowserProfile, ProxySettings
 from browser_use.browser.views import BrowserStateSummary, TabInfo
 from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, TargetInfo
 from browser_use.observability import observe_debug
+from browser_use.observability_runtime import EventSource, RuntimeLogger, SinkConfig
 from browser_use.utils import _log_pretty_url, create_task_with_error_handling, is_new_tab_page
 
 if TYPE_CHECKING:
@@ -686,6 +687,19 @@ class BrowserSession(BaseModel):
 		BaseWatchdog.attach_handler_to_session(self, AgentFocusChangedEvent, self.on_AgentFocusChangedEvent)
 		BaseWatchdog.attach_handler_to_session(self, FileDownloadedEvent, self.on_FileDownloadedEvent)
 		BaseWatchdog.attach_handler_to_session(self, CloseTabEvent, self.on_CloseTabEvent)
+
+		# Unified RuntimeLogger - observability runtime (browser layer)
+		self.runtime_logger = RuntimeLogger(source=EventSource.BROWSER)
+		self.runtime_logger.set_sinks(
+			SinkConfig(
+				console=True,
+				event_bus=True,
+				telemetry=True,
+				cloud=bool(self.cloud_profile_id or (self.browser_profile and self.browser_profile.cloud_profile_id)),
+			)
+		)
+		self.runtime_logger._event_bus = self.event_bus
+		self._runtime_logger_context_token = self.runtime_logger.set_context(session_id=self.id)
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='browser_session_start')
 	async def start(self) -> None:

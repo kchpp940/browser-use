@@ -68,6 +68,12 @@ from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
+from browser_use.observability_runtime import (
+	EventSource,
+	RuntimeLogger,
+	SinkConfig,
+	TokenUsage,
+)
 from browser_use.telemetry.service import ProductTelemetry
 from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.tools.registry.views import ActionModel
@@ -590,6 +596,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# wal_path = CONFIG.BROWSER_USE_CONFIG_DIR / 'events' / f'{self.session_id}.jsonl'
 		self.eventbus = EventBus(name=f'Agent_{str(self.id)[-4:]}')
 
+		# Unified RuntimeLogger - observability runtime
+		self.runtime_logger = RuntimeLogger(source=EventSource.AGENT)
+		self.runtime_logger.set_sinks(
+			SinkConfig(
+				console=True,
+				event_bus=True,
+				telemetry=True,
+				cloud=self.browser_session is not None and bool(getattr(self.browser_session, 'cloud_profile_id', None)),
+			)
+		)
+		self.runtime_logger._telemetry.telemetry_client = self.telemetry
+		self.runtime_logger._event_bus = self.eventbus
+
 		if self.settings.save_conversation_path:
 			self.settings.save_conversation_path = Path(self.settings.save_conversation_path).expanduser().resolve()
 			self.logger.info(f'💬 Saving conversation to {_log_pretty_path(self.settings.save_conversation_path)}')
@@ -1029,52 +1048,95 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Initialize timing first, before any exceptions can occur
 
 		self.step_start_time = time.time()
+		current_step = self.state.n_steps
 
 		browser_state_summary = None
 
-		try:
-			if self.browser_session:
-				try:
-					captcha_wait = await self.browser_session.wait_if_captcha_solving()
-					if captcha_wait and captcha_wait.waited:
-						# Reset step timing to exclude the captcha wait from step duration metrics
-						self.step_start_time = time.time()
-						duration_s = captcha_wait.duration_ms / 1000
-						outcome = captcha_wait.result  # 'success' | 'failed' | 'timeout'
-						msg = f'Waited {duration_s:.1f}s for {captcha_wait.vendor} CAPTCHA to be solved. Result: {outcome}.'
-						self.logger.info(f'🔒 {msg}')
-						# Inject the outcome so the LLM sees what happened
-						captcha_result = ActionResult(long_term_memory=msg)
-						if self.state.last_result:
-							self.state.last_result.append(captcha_result)
-						else:
-							self.state.last_result = [captcha_result]
-				except Exception as e:
-					self.logger.warning(f'Phase 0 captcha wait failed (non-fatal): {e}')
+		async with self.runtime_logger.async_context(
+			task_id=self.task_id,
+			session_id=self.session_id,
+			step=current_step,
+		):
+			self.runtime_logger.step_start(
+				task_id=self.task_id,
+				session_id=self.session_id,
+				step=current_step,
+				message=f'Step {current_step} started',
+				data={
+					'step': current_step,
+					'consecutive_failures': self.state.consecutive_failures,
+				},
+			)
 
-			# Phase 1: Prepare context and timing
-			browser_state_summary = await self._prepare_context(step_info)
+			try:
+				if self.browser_session:
+					try:
+						captcha_wait = await self.browser_session.wait_if_captcha_solving()
+						if captcha_wait and captcha_wait.waited:
+							# Reset step timing to exclude the captcha wait from step duration metrics
+							self.step_start_time = time.time()
+							duration_s = captcha_wait.duration_ms / 1000
+							outcome = captcha_wait.result  # 'success' | 'failed' | 'timeout'
+							msg = f'Waited {duration_s:.1f}s for {captcha_wait.vendor} CAPTCHA to be solved. Result: {outcome}.'
+							self.logger.info(f'🔒 {msg}')
+							# Inject the outcome so the LLM sees what happened
+							captcha_result = ActionResult(long_term_memory=msg)
+							if self.state.last_result:
+								self.state.last_result.append(captcha_result)
+							else:
+								self.state.last_result = [captcha_result]
+					except Exception as e:
+						self.logger.warning(f'Phase 0 captcha wait failed (non-fatal): {e}')
 
-			# Clear previous step state after context preparation (which needs
-			# them for the "previous action result" prompt) but before the LLM
-			# call, so a timeout during _get_next_action or _execute_actions
-			# won't leave stale data from the previous step.
-			self.state.last_model_output = None
-			self.state.last_result = None
+				# Phase 1: Prepare context and timing
+				browser_state_summary = await self._prepare_context(step_info)
 
-			# Phase 2: Get model output and execute actions
-			await self._get_next_action(browser_state_summary)
-			await self._execute_actions()
+				# Clear previous step state after context preparation (which needs
+				# them for the "previous action result" prompt) but before the LLM
+				# call, so a timeout during _get_next_action or _execute_actions
+				# won't leave stale data from the previous step.
+				self.state.last_model_output = None
+				self.state.last_result = None
 
-			# Phase 3: Post-processing
-			await self._post_process()
+				# Phase 2: Get model output and execute actions
+				await self._get_next_action(browser_state_summary)
+				await self._execute_actions()
 
-		except Exception as e:
-			# Handle ALL exceptions in one place
-			await self._handle_step_error(e)
+				# Phase 3: Post-processing
+				await self._post_process()
 
-		finally:
-			await self._finalize(browser_state_summary)
+			except Exception as e:
+				# Handle ALL exceptions in one place
+				await self._handle_step_error(e)
+				self.runtime_logger.exception(
+					e,
+					message=f'Step {current_step} failed: {type(e).__name__}',
+					data={'step': current_step},
+				)
+
+			finally:
+				await self._finalize(browser_state_summary)
+				self.runtime_logger.step_end(
+					task_id=self.task_id,
+					session_id=self.session_id,
+					step=current_step,
+					message=f'Step {current_step} ended',
+					duration_ms=(time.time() - self.step_start_time) * 1000,
+					data={
+						'step': current_step,
+						'has_result': self.state.last_result is not None and len(self.state.last_result) > 0,
+						'has_error': (
+							self.state.last_result[-1].error
+							if self.state.last_result and len(self.state.last_result) > 0
+							else False
+						),
+						'is_done': (
+							self.state.last_result[-1].is_done
+							if self.state.last_result and len(self.state.last_result) > 0
+							else False
+						),
+					},
+				)
 
 	async def _prepare_context(self, step_info: AgentStepInfo | None = None) -> BrowserStateSummary:
 		"""Prepare the context for the step: browser state, action models, page actions"""
@@ -2523,196 +2585,244 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		)
 		signal_handler.register()
 
-		try:
-			await self._log_agent_run()
-
-			self.logger.debug(
-				f'🔧 Agent setup: Agent Session ID {self.session_id[-4:]}, Task ID {self.task_id[-4:]}, Browser Session ID {self.browser_session.id[-4:] if self.browser_session else "None"} {"(connecting via CDP)" if (self.browser_session and self.browser_session.cdp_url) else "(launching local browser)"}'
-			)
-
-			# Initialize timing for session and task
-			self._session_start_time = time.time()
-			self._task_start_time = self._session_start_time  # Initialize task start time
-
-			# Only dispatch session events if this is the first run
-			if not self.state.session_initialized:
-				self.logger.debug('📡 Dispatching CreateAgentSessionEvent...')
-				# Emit CreateAgentSessionEvent at the START of run()
-				self.eventbus.dispatch(CreateAgentSessionEvent.from_agent(self))
-
-				self.state.session_initialized = True
-
-			self.logger.debug('📡 Dispatching CreateAgentTaskEvent...')
-			# Emit CreateAgentTaskEvent at the START of run()
-			self.eventbus.dispatch(CreateAgentTaskEvent.from_agent(self))
-
-			# Log startup message on first step (only if we haven't already done steps)
-			self._log_first_step_startup()
-			# Start browser session and attach watchdogs
-			await self.browser_session.start()
-			if self._demo_mode_enabled:
-				await self._demo_mode_log(f'Started task: {self.task}', 'info', {'tag': 'task'})
-				await self._demo_mode_log(
-					'Demo mode active - follow the side panel for live thoughts and actions.',
-					'info',
-					{'tag': 'status'},
-				)
-
-			# Register skills as actions if SkillService is configured
-			await self._register_skills_as_actions()
-
-			# Normally there was no try catch here but the callback can raise an InterruptedError.
-			# Wrap with step_timeout so initial actions (usually a single URL navigate) can't
-			# hang indefinitely on a silent CDP WebSocket — without this the agent would take
-			# zero steps and return with an empty history while any outer watchdog waits.
+		async with self.runtime_logger.async_context(
+			task_id=self.task_id,
+			session_id=self.session_id,
+		):
 			try:
-				await asyncio.wait_for(
-					self._execute_initial_actions(),
-					timeout=self.settings.step_timeout,
+				await self._log_agent_run()
+
+				self.runtime_logger.task_start(
+					task_id=self.task_id,
+					session_id=self.session_id,
+					message=f'Starting agent task: {self.task[:80]}{"..." if len(self.task) > 80 else ""}',
+					data={
+						'task': self.task,
+						'max_steps': max_steps,
+						'model': self.llm.model if hasattr(self.llm, 'model') else 'unknown',
+						'source': self.source,
+					},
 				)
-			except InterruptedError:
-				pass
-			except TimeoutError:
-				initial_timeout_msg = (
-					f'Initial actions timed out after {self.settings.step_timeout}s '
-					f'(browser may be unresponsive). Proceeding to main execution loop.'
+
+				self.logger.debug(
+					f'🔧 Agent setup: Agent Session ID {self.session_id[-4:]}, Task ID {self.task_id[-4:]}, Browser Session ID {self.browser_session.id[-4:] if self.browser_session else "None"} {"(connecting via CDP)" if (self.browser_session and self.browser_session.cdp_url) else "(launching local browser)"}'
 				)
-				self.logger.error(f'⏰ {initial_timeout_msg}')
-				self.state.last_result = [ActionResult(error=initial_timeout_msg)]
-				self.state.consecutive_failures += 1
+
+				# Initialize timing for session and task
+				self._session_start_time = time.time()
+				self._task_start_time = self._session_start_time  # Initialize task start time
+
+				# Only dispatch session events if this is the first run
+				if not self.state.session_initialized:
+					self.logger.debug('📡 Dispatching CreateAgentSessionEvent...')
+					# Emit CreateAgentSessionEvent at the START of run()
+					self.eventbus.dispatch(CreateAgentSessionEvent.from_agent(self))
+
+					self.state.session_initialized = True
+
+				self.logger.debug('📡 Dispatching CreateAgentTaskEvent...')
+				# Emit CreateAgentTaskEvent at the START of run()
+				self.eventbus.dispatch(CreateAgentTaskEvent.from_agent(self))
+
+				# Log startup message on first step (only if we haven't already done steps)
+				self._log_first_step_startup()
+				# Start browser session and attach watchdogs
+				await self.browser_session.start()
+				if self._demo_mode_enabled:
+					await self._demo_mode_log(f'Started task: {self.task}', 'info', {'tag': 'task'})
+					await self._demo_mode_log(
+						'Demo mode active - follow the side panel for live thoughts and actions.',
+						'info',
+						{'tag': 'status'},
+					)
+
+				# Register skills as actions if SkillService is configured
+				await self._register_skills_as_actions()
+
+				# Normally there was no try catch here but the callback can raise an InterruptedError.
+				# Wrap with step_timeout so initial actions (usually a single URL navigate) can't
+				# hang indefinitely on a silent CDP WebSocket — without this the agent would take
+				# zero steps and return with an empty history while any outer watchdog waits.
+				try:
+					await asyncio.wait_for(
+						self._execute_initial_actions(),
+						timeout=self.settings.step_timeout,
+					)
+				except InterruptedError:
+					pass
+				except TimeoutError:
+					initial_timeout_msg = (
+						f'Initial actions timed out after {self.settings.step_timeout}s '
+						f'(browser may be unresponsive). Proceeding to main execution loop.'
+					)
+					self.logger.error(f'⏰ {initial_timeout_msg}')
+					self.state.last_result = [ActionResult(error=initial_timeout_msg)]
+					self.state.consecutive_failures += 1
+				except Exception as e:
+					raise e
+
+				self.logger.debug(
+					f'🔄 Starting main execution loop with max {max_steps} steps (currently at step {self.state.n_steps})...'
+				)
+				while self.state.n_steps <= max_steps:
+					current_step = self.state.n_steps - 1  # Convert to 0-indexed for step_info
+
+					# Use the consolidated pause state management
+					if self.state.paused:
+						self.logger.debug(f'⏸️ Step {self.state.n_steps}: Agent paused, waiting to resume...')
+						await self._external_pause_event.wait()
+						signal_handler.reset()
+
+					# Check if we should stop due to too many failures, if final_response_after_failure is True, we try one last time
+					if (self.state.consecutive_failures) >= self.settings.max_failures + int(
+						self.settings.final_response_after_failure
+					):
+						self.logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures')
+						agent_run_error = f'Stopped due to {self.settings.max_failures} consecutive failures'
+						break
+
+					# Check control flags before each step
+					if self.state.stopped:
+						self.logger.info('🛑 Agent stopped')
+						agent_run_error = 'Agent stopped programmatically'
+						break
+
+					step_info = AgentStepInfo(step_number=current_step, max_steps=max_steps)
+					is_done = await self._execute_step(current_step, max_steps, step_info, on_step_start, on_step_end)
+
+					if is_done:
+						# Agent has marked the task as done
+						if self._demo_mode_enabled and self.history.history:
+							final_result_text = self.history.final_result() or 'Task completed'
+							await self._demo_mode_log(f'Final Result: {final_result_text}', 'success', {'tag': 'task'})
+
+						should_delay_close = True
+						break
+				else:
+					agent_run_error = 'Failed to complete task in maximum steps'
+
+					self.history.add_item(
+						AgentHistory(
+							model_output=None,
+							result=[ActionResult(error=agent_run_error, include_in_memory=True)],
+							state=BrowserStateHistory(
+								url='',
+								title='',
+								tabs=[],
+								interacted_element=[],
+								screenshot_path=None,
+							),
+							metadata=None,
+						)
+					)
+
+					self.logger.info(f'❌ {agent_run_error}')
+
+				self.history.usage = await self.token_cost_service.get_usage_summary()
+
+				# set the model output schema and call it on the fly
+				if self.history._output_model_schema is None and self.output_model_schema is not None:
+					self.history._output_model_schema = self.output_model_schema
+
+				return self.history
+
+			except KeyboardInterrupt:
+				# Already handled by our signal handler, but catch any direct KeyboardInterrupt as well
+				self.logger.debug('Got KeyboardInterrupt during execution, returning current history')
+				agent_run_error = 'KeyboardInterrupt'
+
+				self.history.usage = await self.token_cost_service.get_usage_summary()
+
+				return self.history
+
 			except Exception as e:
+				self.logger.error(f'Agent run failed with exception: {e}', exc_info=True)
+				agent_run_error = str(e)
 				raise e
 
-			self.logger.debug(
-				f'🔄 Starting main execution loop with max {max_steps} steps (currently at step {self.state.n_steps})...'
-			)
-			while self.state.n_steps <= max_steps:
-				current_step = self.state.n_steps - 1  # Convert to 0-indexed for step_info
+			finally:
+				if should_delay_close and self._demo_mode_enabled and agent_run_error is None:
+					await asyncio.sleep(30)
+				if agent_run_error:
+					await self._demo_mode_log(f'Agent stopped: {agent_run_error}', 'error', {'tag': 'run'})
+				# Log token usage summary
+				await self.token_cost_service.log_usage_summary()
 
-				# Use the consolidated pause state management
-				if self.state.paused:
-					self.logger.debug(f'⏸️ Step {self.state.n_steps}: Agent paused, waiting to resume...')
-					await self._external_pause_event.wait()
-					signal_handler.reset()
+				# Unregister signal handlers before cleanup
+				signal_handler.unregister()
 
-				# Check if we should stop due to too many failures, if final_response_after_failure is True, we try one last time
-				if (self.state.consecutive_failures) >= self.settings.max_failures + int(
-					self.settings.final_response_after_failure
-				):
-					self.logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures')
-					agent_run_error = f'Stopped due to {self.settings.max_failures} consecutive failures'
-					break
-
-				# Check control flags before each step
-				if self.state.stopped:
-					self.logger.info('🛑 Agent stopped')
-					agent_run_error = 'Agent stopped programmatically'
-					break
-
-				step_info = AgentStepInfo(step_number=current_step, max_steps=max_steps)
-				is_done = await self._execute_step(current_step, max_steps, step_info, on_step_start, on_step_end)
-
-				if is_done:
-					# Agent has marked the task as done
-					if self._demo_mode_enabled and self.history.history:
-						final_result_text = self.history.final_result() or 'Task completed'
-						await self._demo_mode_log(f'Final Result: {final_result_text}', 'success', {'tag': 'task'})
-
-					should_delay_close = True
-					break
-			else:
-				agent_run_error = 'Failed to complete task in maximum steps'
-
-				self.history.add_item(
-					AgentHistory(
-						model_output=None,
-						result=[ActionResult(error=agent_run_error, include_in_memory=True)],
-						state=BrowserStateHistory(
-							url='',
-							title='',
-							tabs=[],
-							interacted_element=[],
-							screenshot_path=None,
-						),
-						metadata=None,
+				token_summary = await self.token_cost_service.get_usage_summary()
+				self.runtime_logger.task_end(
+					task_id=self.task_id,
+					session_id=self.session_id,
+					message=f'Task ended: {self.task[:60]}{"..." if len(self.task) > 60 else ""}',
+					duration_ms=(time.time() - self._task_start_time) * 1000 if hasattr(self, '_task_start_time') else None,
+					tokens=TokenUsage(
+						prompt_tokens=token_summary.prompt_tokens,
+						completion_tokens=token_summary.completion_tokens,
+						total_tokens=token_summary.total_tokens,
 					)
+					if token_summary.total_tokens > 0
+					else None,
+					data={
+						'steps': self.state.n_steps,
+						'success': self.history.is_successful(),
+						'urls_visited': self.history.urls(),
+						'model': self.llm.model if hasattr(self.llm, 'model') else 'unknown',
+					},
+					error=agent_run_error,
+					output_files=(
+						[Path(output_path)]
+						if self.settings.generate_gif
+						and Path(
+							output_path := (
+								self.settings.generate_gif if isinstance(self.settings.generate_gif, str) else 'agent_history.gif'
+							)
+						).exists()
+						else None
+					),
 				)
 
-				self.logger.info(f'❌ {agent_run_error}')
+				if not self._force_exit_telemetry_logged:  # MODIFIED: Check the flag
+					try:
+						self._log_agent_event(max_steps=max_steps, agent_run_error=agent_run_error)
+					except Exception as log_e:  # Catch potential errors during logging itself
+						self.logger.error(f'Failed to log telemetry event: {log_e}', exc_info=True)
+				else:
+					# ADDED: Info message when custom telemetry for SIGINT was already logged
+					self.logger.debug('Telemetry for force exit (SIGINT) was logged by custom exit callback.')
 
-			self.history.usage = await self.token_cost_service.get_usage_summary()
+				# NOTE: CreateAgentSessionEvent and CreateAgentTaskEvent are now emitted at the START of run()
+				# to match backend requirements for CREATE events to be fired when entities are created,
+				# not when they are completed
 
-			# set the model output schema and call it on the fly
-			if self.history._output_model_schema is None and self.output_model_schema is not None:
-				self.history._output_model_schema = self.output_model_schema
+				# Emit UpdateAgentTaskEvent at the END of run() with final task state
+				self.eventbus.dispatch(UpdateAgentTaskEvent.from_agent(self))
 
-			return self.history
+				# Generate GIF if needed before stopping event bus
+				if self.settings.generate_gif:
+					output_path: str = 'agent_history.gif'
+					if isinstance(self.settings.generate_gif, str):
+						output_path = self.settings.generate_gif
 
-		except KeyboardInterrupt:
-			# Already handled by our signal handler, but catch any direct KeyboardInterrupt as well
-			self.logger.debug('Got KeyboardInterrupt during execution, returning current history')
-			agent_run_error = 'KeyboardInterrupt'
+					# Lazy import gif module to avoid heavy startup cost
+					from browser_use.agent.gif import create_history_gif
 
-			self.history.usage = await self.token_cost_service.get_usage_summary()
+					create_history_gif(task=self.task, history=self.history, output_path=output_path)
 
-			return self.history
+					# Only emit output file event if GIF was actually created
+					if Path(output_path).exists():
+						output_event = await CreateAgentOutputFileEvent.from_agent_and_file(self, output_path)
+						self.eventbus.dispatch(output_event)
 
-		except Exception as e:
-			self.logger.error(f'Agent run failed with exception: {e}', exc_info=True)
-			agent_run_error = str(e)
-			raise e
+				# Log final messages to user based on outcome
+				self._log_final_outcome_messages()
 
-		finally:
-			if should_delay_close and self._demo_mode_enabled and agent_run_error is None:
-				await asyncio.sleep(30)
-			if agent_run_error:
-				await self._demo_mode_log(f'Agent stopped: {agent_run_error}', 'error', {'tag': 'run'})
-			# Log token usage summary
-			await self.token_cost_service.log_usage_summary()
+				# Stop the event bus gracefully, waiting for all events to be processed
+				# Configurable via TIMEOUT_AgentEventBusStop env var (default: 3.0s)
+				await self.eventbus.stop(clear=True, timeout=_get_timeout('TIMEOUT_AgentEventBusStop', 3.0))
 
-			# Unregister signal handlers before cleanup
-			signal_handler.unregister()
-
-			if not self._force_exit_telemetry_logged:  # MODIFIED: Check the flag
-				try:
-					self._log_agent_event(max_steps=max_steps, agent_run_error=agent_run_error)
-				except Exception as log_e:  # Catch potential errors during logging itself
-					self.logger.error(f'Failed to log telemetry event: {log_e}', exc_info=True)
-			else:
-				# ADDED: Info message when custom telemetry for SIGINT was already logged
-				self.logger.debug('Telemetry for force exit (SIGINT) was logged by custom exit callback.')
-
-			# NOTE: CreateAgentSessionEvent and CreateAgentTaskEvent are now emitted at the START of run()
-			# to match backend requirements for CREATE events to be fired when entities are created,
-			# not when they are completed
-
-			# Emit UpdateAgentTaskEvent at the END of run() with final task state
-			self.eventbus.dispatch(UpdateAgentTaskEvent.from_agent(self))
-
-			# Generate GIF if needed before stopping event bus
-			if self.settings.generate_gif:
-				output_path: str = 'agent_history.gif'
-				if isinstance(self.settings.generate_gif, str):
-					output_path = self.settings.generate_gif
-
-				# Lazy import gif module to avoid heavy startup cost
-				from browser_use.agent.gif import create_history_gif
-
-				create_history_gif(task=self.task, history=self.history, output_path=output_path)
-
-				# Only emit output file event if GIF was actually created
-				if Path(output_path).exists():
-					output_event = await CreateAgentOutputFileEvent.from_agent_and_file(self, output_path)
-					self.eventbus.dispatch(output_event)
-
-			# Log final messages to user based on outcome
-			self._log_final_outcome_messages()
-
-			# Stop the event bus gracefully, waiting for all events to be processed
-			# Configurable via TIMEOUT_AgentEventBusStop env var (default: 3.0s)
-			await self.eventbus.stop(clear=True, timeout=_get_timeout('TIMEOUT_AgentEventBusStop', 3.0))
-
-			await self.close()
+				await self.close()
 
 	@observe_debug(ignore_input=True, ignore_output=True)
 	@time_execution_async('--multi_act')
@@ -2745,6 +2855,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Get action name from the action model BEFORE try block to ensure it's always available in except
 			action_data = action.model_dump(exclude_unset=True)
 			action_name = next(iter(action_data.keys())) if action_data else 'unknown'
+			action_index = i + 1
 
 			if i > 0:
 				# ONLY ALLOW TO CALL `done` IF IT IS A SINGLE ACTION
@@ -2762,21 +2873,46 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				await self._check_stop_or_pause()
 
 				# Log action before execution
-				await self._log_action(action, action_name, i + 1, total_actions)
+				await self._log_action(action, action_name, action_index, total_actions)
 
-				# Capture pre-action state for runtime page-change detection
-				pre_action_url = await self.browser_session.get_current_page_url()
-				pre_action_focus = self.browser_session.agent_focus_target_id
+				async with self.runtime_logger.async_context(
+					action_index=action_index,
+				):
+					action_start = time.time()
+					self.runtime_logger.agent_action(
+						task_id=self.task_id,
+						session_id=self.session_id,
+						step=self.state.n_steps,
+						action_index=action_index,
+						message=f'Executing action: {action_name}',
+						action_name=action_name,
+						action_params=action_data.get(action_name, {}),
+					)
 
-				result = await self.tools.act(
-					action=action,
-					browser_session=self.browser_session,
-					file_system=self.file_system,
-					page_extraction_llm=self.settings.page_extraction_llm,
-					sensitive_data=self.sensitive_data,
-					available_file_paths=self.available_file_paths,
-					extraction_schema=self.extraction_schema,
-				)
+					# Capture pre-action state for runtime page-change detection
+					pre_action_url = await self.browser_session.get_current_page_url()
+					pre_action_focus = self.browser_session.agent_focus_target_id
+
+					result = await self.tools.act(
+						action=action,
+						browser_session=self.browser_session,
+						file_system=self.file_system,
+						page_extraction_llm=self.settings.page_extraction_llm,
+						sensitive_data=self.sensitive_data,
+						available_file_paths=self.available_file_paths,
+						extraction_schema=self.extraction_schema,
+					)
+
+					self.runtime_logger.agent_action_result(
+						task_id=self.task_id,
+						session_id=self.session_id,
+						step=self.state.n_steps,
+						action_index=action_index,
+						message=f'Action {action_name} result: {"error" if result.error else "done" if result.is_done else "ok"}',
+						action_name=action_name,
+						result=result,
+						duration_ms=(time.time() - action_start) * 1000,
+					)
 
 				if result.error:
 					await self._demo_mode_log(

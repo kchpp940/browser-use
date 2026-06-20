@@ -158,6 +158,7 @@ from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
+from browser_use.observability_runtime import EventSource, RuntimeLogger, SinkConfig
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
 
@@ -614,6 +615,17 @@ class BrowserUseApp(App):
 		self._event_bus_handler_func = None
 		# Timer for info panel updates
 		self._info_panel_timer = None
+		# Unified RuntimeLogger - observability runtime (CLI layer)
+		self.runtime_logger = RuntimeLogger(source=EventSource.CLI)
+		self.runtime_logger.set_sinks(SinkConfig(console=True, event_bus=False, telemetry=True, cloud=False))
+		self.runtime_logger._telemetry.telemetry_client = self._telemetry
+		try:
+			from uuid_extensions import uuid7str
+
+			_cli_task_id = f'cli-{uuid7str()}'
+		except Exception:
+			_cli_task_id = None
+		self._rt_ctx_token = self.runtime_logger.set_context(task_id=_cli_task_id)
 
 	def setup_richlog_logging(self) -> None:
 		"""Set up logging to redirect to RichLog widget instead of stdout."""

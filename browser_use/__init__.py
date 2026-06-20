@@ -63,6 +63,17 @@ if TYPE_CHECKING:
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
 	from browser_use.llm.vercel.chat import ChatVercel
+	from browser_use.observability_runtime import (
+		ErrorInfo,
+		EventSeverity,
+		EventSource,
+		EventType,
+		OutputFile,
+		RuntimeEvent,
+		RuntimeLogger,
+		SinkConfig,
+		TokenUsage,
+	)
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
 
@@ -98,6 +109,16 @@ _LAZY_IMPORTS = {
 	'ChatVercel': ('browser_use.llm.vercel.chat', 'ChatVercel'),
 	# LLM models module
 	'models': ('browser_use.llm.models', None),
+	# Unified observability runtime
+	'RuntimeEvent': ('browser_use.observability_runtime', 'RuntimeEvent'),
+	'RuntimeLogger': ('browser_use.observability_runtime', 'RuntimeLogger'),
+	'SinkConfig': ('browser_use.observability_runtime', 'SinkConfig'),
+	'EventSource': ('browser_use.observability_runtime', 'EventSource'),
+	'EventType': ('browser_use.observability_runtime', 'EventType'),
+	'EventSeverity': ('browser_use.observability_runtime', 'EventSeverity'),
+	'ErrorInfo': ('browser_use.observability_runtime', 'ErrorInfo'),
+	'OutputFile': ('browser_use.observability_runtime', 'OutputFile'),
+	'TokenUsage': ('browser_use.observability_runtime', 'TokenUsage'),
 	# Sandbox execution
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
 }
@@ -152,6 +173,16 @@ __all__ = [
 	'Controller',
 	# LLM models module
 	'models',
+	# Unified observability runtime
+	'RuntimeEvent',
+	'RuntimeLogger',
+	'SinkConfig',
+	'EventSource',
+	'EventType',
+	'EventSeverity',
+	'ErrorInfo',
+	'OutputFile',
+	'TokenUsage',
 	# Sandbox execution
 	'sandbox',
 ]

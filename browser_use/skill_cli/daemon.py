@@ -27,6 +27,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger('browser_use.skill_cli.daemon')
 
+from browser_use.observability_runtime import EventSource, RuntimeLogger, SinkConfig
+
 
 class Daemon:
 	"""Single-session daemon that manages a browser and handles CLI commands."""
@@ -65,6 +67,22 @@ class Daemon:
 		self._idle_watchdog_task: asyncio.Task | None = None
 		self._is_shutting_down: bool = False
 		self._auth_token: str = ''
+
+		# Unified RuntimeLogger - observability runtime (skill_cli daemon layer)
+		self.runtime_logger = RuntimeLogger(source=EventSource.SKILL_CLI)
+		self.runtime_logger.set_sinks(
+			SinkConfig(console=True, event_bus=False, telemetry=True, cloud=bool(self.cloud_profile_id))
+		)
+		try:
+			from uuid_extensions import uuid7str
+
+			_daemon_id = f'skilld-{uuid7str()}'
+		except Exception:
+			_daemon_id = None
+		self._rt_ctx = self.runtime_logger.set_context(
+			task_id=_daemon_id,
+			session_id=self.session,
+		)
 
 	def _write_state(self, phase: str) -> None:
 		"""Atomically write session state file for CLI observability."""
