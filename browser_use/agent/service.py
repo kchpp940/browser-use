@@ -17,11 +17,7 @@ if TYPE_CHECKING:
 from dotenv import load_dotenv
 
 from browser_use.agent.cloud_events import (
-	CreateAgentOutputFileEvent,
-	CreateAgentSessionEvent,
 	CreateAgentStepEvent,
-	CreateAgentTaskEvent,
-	UpdateAgentTaskEvent,
 )
 from browser_use.agent.message_manager.utils import save_conversation
 from browser_use.llm.base import BaseChatModel
@@ -279,6 +275,10 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.task_id: str = self.id
 		self.session_id: str = uuid7str()
 
+		# Lifecycle timestamps - set by RuntimeSessionController at task start
+		self._session_start_time: float | None = None
+		self._task_start_time: float | None = None
+
 		base_profile = browser_profile or DEFAULT_BROWSER_PROFILE
 		if base_profile is DEFAULT_BROWSER_PROFILE:
 			base_profile = base_profile.model_copy()
@@ -491,22 +491,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.browser_session.llm_screenshot_size = llm_screenshot_size
 
 		# Check if LLM is ChatAnthropic instance
-		from browser_use.agent.prompt_context import PromptSectionConfig, default_registry
 		from browser_use.llm.anthropic.chat import ChatAnthropic
 
 		is_anthropic = isinstance(self.llm, ChatAnthropic)
+
+		# Check if model is a browser-use fine-tuned model (uses simplified prompts)
 		is_browser_use_model = 'browser-use/' in self.llm.model.lower()
 
-		registry = default_registry()
-
-		provider = 'browser-use' if is_browser_use_model else ('anthropic' if is_anthropic else 'default')
-		section_config = PromptSectionConfig.for_provider(
-			provider=provider,
-			flash_mode=self.settings.flash_mode,
-			use_thinking=self.settings.use_thinking,
-			enable_planning=self.settings.enable_planning,
-		)
-
+		# Initialize message manager with state
+		# Initial system prompt with all actions - will be updated during each step
 		self._message_manager = MessageManager(
 			task=self.task,
 			system_message=SystemPrompt(
@@ -518,7 +511,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				is_anthropic=is_anthropic,
 				is_browser_use_model=is_browser_use_model,
 				model_name=self.llm.model,
-				registry=registry,
 			).get_system_message(),
 			file_system=self.file_system,
 			state=self.state.message_manager_state,
@@ -533,8 +525,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			sample_images=self.sample_images,
 			llm_screenshot_size=llm_screenshot_size,
 			max_clickable_elements_length=self.settings.max_clickable_elements_length,
-			section_config=section_config,
-			registry=registry,
 		)
 
 		if self.sensitive_data:
@@ -1159,7 +1149,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self._inject_loop_detection_nudge()
 		await self._force_done_after_last_step(step_info)
 		await self._force_done_after_failure()
-
 		return browser_state_summary
 
 	async def _maybe_compact_messages(self, step_info: AgentStepInfo | None = None) -> None:
@@ -1471,15 +1460,14 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.settings.planning_replan_on_stall <= 0:
 			return
 		if self.state.consecutive_failures >= self.settings.planning_replan_on_stall:
+			msg = (
+				'REPLAN SUGGESTED: You have failed '
+				f'{self.state.consecutive_failures} consecutive times. '
+				'Your current plan may need revision. '
+				'Output a new `plan_update` with revised steps to recover.'
+			)
 			self.logger.info(f'📋 Replan nudge injected after {self.state.consecutive_failures} consecutive failures')
-			builder = self._message_manager.prompt_builder
-			if builder is not None:
-				builder.nudge_replan(self.state.consecutive_failures)
-				self._message_manager._sync_builder_context_to_history()
-			else:
-				self._message_manager._add_context_message(
-					UserMessage(content=f'REPLAN SUGGESTED: You have failed {self.state.consecutive_failures} consecutive times. Your current plan may need revision. Output a new `plan_update` with revised steps to recover.')
-				)
+			self._message_manager._add_context_message(UserMessage(content=msg))
 
 	def _inject_exploration_nudge(self) -> None:
 		"""Nudge the agent to create a plan (or call done) after exploring without one."""
@@ -1488,15 +1476,14 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.settings.planning_exploration_limit <= 0:
 			return
 		if self.state.n_steps >= self.settings.planning_exploration_limit:
+			msg = (
+				'PLANNING NUDGE: You have taken '
+				f'{self.state.n_steps} steps without creating a plan. '
+				'If the task is complex, output a `plan_update` with clear todo items now. '
+				'If the task is already done or nearly done, call `done` instead.'
+			)
 			self.logger.info(f'📋 Exploration nudge injected after {self.state.n_steps} steps without a plan')
-			builder = self._message_manager.prompt_builder
-			if builder is not None:
-				builder.nudge_exploration(self.state.n_steps)
-				self._message_manager._sync_builder_context_to_history()
-			else:
-				self._message_manager._add_context_message(
-					UserMessage(content=f'PLANNING NUDGE: You have taken {self.state.n_steps} steps without creating a plan. If the task is complex, output a `plan_update` with clear todo items now. If the task is already done or nearly done, call `done` instead.')
-				)
+			self._message_manager._add_context_message(UserMessage(content=msg))
 
 	def _inject_loop_detection_nudge(self) -> None:
 		"""Inject an escalating nudge when behavioral loops are detected."""
@@ -1508,12 +1495,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				f'🔁 Loop detection nudge injected (repetition={self.state.loop_detector.max_repetition_count}, '
 				f'stagnation={self.state.loop_detector.consecutive_stagnant_pages})'
 			)
-			builder = self._message_manager.prompt_builder
-			if builder is not None:
-				builder.nudge_loop_detection(nudge)
-				self._message_manager._sync_builder_context_to_history()
-			else:
-				self._message_manager._add_context_message(UserMessage(content=nudge))
+			self._message_manager._add_context_message(UserMessage(content=nudge))
 
 	def _update_loop_detector_actions(self) -> None:
 		"""Record the actions from the latest step into the loop detector."""
@@ -1550,61 +1532,53 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.state.loop_detector.record_page_state(url, dom_text, element_count)
 
 	async def _inject_budget_warning(self, step_info: AgentStepInfo | None = None) -> None:
-		"""Inject a prominent budget warning when the agent has used >= 75% of its step budget."""
+		"""Inject a prominent budget warning when the agent has used >= 75% of its step budget.
+
+		This gives the LLM advance notice to wrap up, save partial results, and call done
+		rather than exhausting all steps with nothing saved.
+		"""
 		if step_info is None:
 			return
 
-		steps_used = step_info.step_number + 1
+		steps_used = step_info.step_number + 1  # Convert 0-indexed to 1-indexed
 		budget_ratio = steps_used / step_info.max_steps
 
 		if budget_ratio >= 0.75 and not step_info.is_last_step():
 			steps_remaining = step_info.max_steps - steps_used
 			pct = int(budget_ratio * 100)
+			msg = (
+				f'BUDGET WARNING: You have used {steps_used}/{step_info.max_steps} steps '
+				f'({pct}%). {steps_remaining} steps remaining. '
+				f'If the task cannot be completed in the remaining steps, prioritize: '
+				f'(1) consolidate your results (save to files if the file system is in use), '
+				f'(2) call done with what you have. '
+				f'Partial results are far more valuable than exhausting all steps with nothing saved.'
+			)
 			self.logger.info(f'Step budget warning: {steps_used}/{step_info.max_steps} ({pct}%)')
-			builder = self._message_manager.prompt_builder
-			if builder is not None:
-				builder.nudge_budget_warning(steps_used, step_info.max_steps, steps_remaining)
-				self._message_manager._sync_builder_context_to_history()
-			else:
-				msg = (
-					f'BUDGET WARNING: You have used {steps_used}/{step_info.max_steps} steps '
-					f'({pct}%). {steps_remaining} steps remaining. '
-					f'If the task cannot be completed in the remaining steps, prioritize: '
-					f'(1) consolidate your results (save to files if the file system is in use), '
-					f'(2) call done with what you have. '
-					f'Partial results are far more valuable than exhausting all steps with nothing saved.'
-				)
-				self._message_manager._add_context_message(UserMessage(content=msg))
+			self._message_manager._add_context_message(UserMessage(content=msg))
 
 	async def _force_done_after_last_step(self, step_info: AgentStepInfo | None = None) -> None:
 		"""Handle special processing for the last step"""
 		if step_info and step_info.is_last_step():
+			# Add last step warning if needed
+			msg = 'You reached max_steps - this is your last step. Your only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
+			msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
+			msg += '\nInclude everything you found out for the ultimate task in the done text.'
 			self.logger.debug('Last step finishing up')
-			builder = self._message_manager.prompt_builder
-			if builder is not None:
-				builder.nudge_last_step(step_info.max_steps)
-				self._message_manager._sync_builder_context_to_history()
-			else:
-				msg = 'You reached max_steps - this is your last step. Your only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
-				msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
-				msg += '\nInclude everything you found out for the ultimate task in the done text.'
-				self._message_manager._add_context_message(UserMessage(content=msg))
+			self._message_manager._add_context_message(UserMessage(content=msg))
 			self.AgentOutput = self.DoneAgentOutput
 
 	async def _force_done_after_failure(self) -> None:
 		"""Force done after failure"""
+		# Create recovery message
 		if self.state.consecutive_failures >= self.settings.max_failures and self.settings.final_response_after_failure:
+			msg = f'You failed {self.settings.max_failures} times. Therefore we terminate the agent.'
+			msg += '\nYour only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
+			msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
+			msg += '\nInclude everything you found out for the ultimate task in the done text.'
+
 			self.logger.debug('Force done action, because we reached max_failures.')
-			builder = self._message_manager.prompt_builder
-			if builder is not None:
-				builder.nudge_force_done(self.settings.max_failures)
-				self._message_manager._sync_builder_context_to_history()
-			else:
-				msg = f'You failed {self.settings.max_failures} times. Therefore we terminate the agent.'
-				msg += '\nYour only tool available is the "done" tool. No other tool is available. All other tools which you see in history or examples are not available.'
-				msg += '\nIf the task is not yet fully finished as requested by the user, set success in "done" to false! E.g. if not all steps are fully completed. Else success to true.'
-				msg += '\nInclude everything you found out for the ultimate task in the done text.'
-				self._message_manager._add_context_message(UserMessage(content=msg))
+			self._message_manager._add_context_message(UserMessage(content=msg))
 			self.AgentOutput = self.DoneAgentOutput
 
 	@observe(ignore_input=True, ignore_output=False)
@@ -2521,224 +2495,19 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		on_step_start: AgentHookFunc | None = None,
 		on_step_end: AgentHookFunc | None = None,
 	) -> AgentHistoryList[AgentStructuredOutput]:
-		"""Execute the task with maximum number of steps"""
+		"""Execute the task with maximum number of steps.
 
-		loop = asyncio.get_event_loop()
-		agent_run_error: str | None = None  # Initialize error tracking variable
-		self._force_exit_telemetry_logged = False  # ADDED: Flag for custom telemetry on force exit
-		should_delay_close = False
+		Delegates all lifecycle management to RuntimeSessionController to ensure
+		consistent behavior across all entry points (Python API, CLI, MCP, daemon, sandbox).
+		"""
+		from browser_use.controller.runtime_session import RuntimeSessionController
 
-		# Set up the  signal handler with callbacks specific to this agent
-		from browser_use.utils import SignalHandler
-
-		# Define the custom exit callback function for second CTRL+C
-		def on_force_exit_log_telemetry():
-			self._log_agent_event(max_steps=max_steps, agent_run_error='SIGINT: Cancelled by user')
-			# NEW: Call the flush method on the telemetry instance
-			if hasattr(self, 'telemetry') and self.telemetry:
-				self.telemetry.flush()
-			self._force_exit_telemetry_logged = True  # Set the flag
-
-		signal_handler = SignalHandler(
-			loop=loop,
-			pause_callback=self.pause,
-			resume_callback=self.resume,
-			custom_exit_callback=on_force_exit_log_telemetry,  # Pass the new telemetrycallback
-			exit_on_second_int=True,
-			disabled=not self.enable_signal_handler,
+		controller = RuntimeSessionController(self)
+		return await controller.run(
+			max_steps=max_steps,
+			on_step_start=on_step_start,
+			on_step_end=on_step_end,
 		)
-		signal_handler.register()
-
-		try:
-			await self._log_agent_run()
-
-			self.logger.debug(
-				f'🔧 Agent setup: Agent Session ID {self.session_id[-4:]}, Task ID {self.task_id[-4:]}, Browser Session ID {self.browser_session.id[-4:] if self.browser_session else "None"} {"(connecting via CDP)" if (self.browser_session and self.browser_session.cdp_url) else "(launching local browser)"}'
-			)
-
-			# Initialize timing for session and task
-			self._session_start_time = time.time()
-			self._task_start_time = self._session_start_time  # Initialize task start time
-
-			# Only dispatch session events if this is the first run
-			if not self.state.session_initialized:
-				self.logger.debug('📡 Dispatching CreateAgentSessionEvent...')
-				# Emit CreateAgentSessionEvent at the START of run()
-				self.eventbus.dispatch(CreateAgentSessionEvent.from_agent(self))
-
-				self.state.session_initialized = True
-
-			self.logger.debug('📡 Dispatching CreateAgentTaskEvent...')
-			# Emit CreateAgentTaskEvent at the START of run()
-			self.eventbus.dispatch(CreateAgentTaskEvent.from_agent(self))
-
-			# Log startup message on first step (only if we haven't already done steps)
-			self._log_first_step_startup()
-			# Start browser session and attach watchdogs
-			await self.browser_session.start()
-			if self._demo_mode_enabled:
-				await self._demo_mode_log(f'Started task: {self.task}', 'info', {'tag': 'task'})
-				await self._demo_mode_log(
-					'Demo mode active - follow the side panel for live thoughts and actions.',
-					'info',
-					{'tag': 'status'},
-				)
-
-			# Register skills as actions if SkillService is configured
-			await self._register_skills_as_actions()
-
-			# Normally there was no try catch here but the callback can raise an InterruptedError.
-			# Wrap with step_timeout so initial actions (usually a single URL navigate) can't
-			# hang indefinitely on a silent CDP WebSocket — without this the agent would take
-			# zero steps and return with an empty history while any outer watchdog waits.
-			try:
-				await asyncio.wait_for(
-					self._execute_initial_actions(),
-					timeout=self.settings.step_timeout,
-				)
-			except InterruptedError:
-				pass
-			except TimeoutError:
-				initial_timeout_msg = (
-					f'Initial actions timed out after {self.settings.step_timeout}s '
-					f'(browser may be unresponsive). Proceeding to main execution loop.'
-				)
-				self.logger.error(f'⏰ {initial_timeout_msg}')
-				self.state.last_result = [ActionResult(error=initial_timeout_msg)]
-				self.state.consecutive_failures += 1
-			except Exception as e:
-				raise e
-
-			self.logger.debug(
-				f'🔄 Starting main execution loop with max {max_steps} steps (currently at step {self.state.n_steps})...'
-			)
-			while self.state.n_steps <= max_steps:
-				current_step = self.state.n_steps - 1  # Convert to 0-indexed for step_info
-
-				# Use the consolidated pause state management
-				if self.state.paused:
-					self.logger.debug(f'⏸️ Step {self.state.n_steps}: Agent paused, waiting to resume...')
-					await self._external_pause_event.wait()
-					signal_handler.reset()
-
-				# Check if we should stop due to too many failures, if final_response_after_failure is True, we try one last time
-				if (self.state.consecutive_failures) >= self.settings.max_failures + int(
-					self.settings.final_response_after_failure
-				):
-					self.logger.error(f'❌ Stopping due to {self.settings.max_failures} consecutive failures')
-					agent_run_error = f'Stopped due to {self.settings.max_failures} consecutive failures'
-					break
-
-				# Check control flags before each step
-				if self.state.stopped:
-					self.logger.info('🛑 Agent stopped')
-					agent_run_error = 'Agent stopped programmatically'
-					break
-
-				step_info = AgentStepInfo(step_number=current_step, max_steps=max_steps)
-				is_done = await self._execute_step(current_step, max_steps, step_info, on_step_start, on_step_end)
-
-				if is_done:
-					# Agent has marked the task as done
-					if self._demo_mode_enabled and self.history.history:
-						final_result_text = self.history.final_result() or 'Task completed'
-						await self._demo_mode_log(f'Final Result: {final_result_text}', 'success', {'tag': 'task'})
-
-					should_delay_close = True
-					break
-			else:
-				agent_run_error = 'Failed to complete task in maximum steps'
-
-				self.history.add_item(
-					AgentHistory(
-						model_output=None,
-						result=[ActionResult(error=agent_run_error, include_in_memory=True)],
-						state=BrowserStateHistory(
-							url='',
-							title='',
-							tabs=[],
-							interacted_element=[],
-							screenshot_path=None,
-						),
-						metadata=None,
-					)
-				)
-
-				self.logger.info(f'❌ {agent_run_error}')
-
-			self.history.usage = await self.token_cost_service.get_usage_summary()
-
-			# set the model output schema and call it on the fly
-			if self.history._output_model_schema is None and self.output_model_schema is not None:
-				self.history._output_model_schema = self.output_model_schema
-
-			return self.history
-
-		except KeyboardInterrupt:
-			# Already handled by our signal handler, but catch any direct KeyboardInterrupt as well
-			self.logger.debug('Got KeyboardInterrupt during execution, returning current history')
-			agent_run_error = 'KeyboardInterrupt'
-
-			self.history.usage = await self.token_cost_service.get_usage_summary()
-
-			return self.history
-
-		except Exception as e:
-			self.logger.error(f'Agent run failed with exception: {e}', exc_info=True)
-			agent_run_error = str(e)
-			raise e
-
-		finally:
-			if should_delay_close and self._demo_mode_enabled and agent_run_error is None:
-				await asyncio.sleep(30)
-			if agent_run_error:
-				await self._demo_mode_log(f'Agent stopped: {agent_run_error}', 'error', {'tag': 'run'})
-			# Log token usage summary
-			await self.token_cost_service.log_usage_summary()
-
-			# Unregister signal handlers before cleanup
-			signal_handler.unregister()
-
-			if not self._force_exit_telemetry_logged:  # MODIFIED: Check the flag
-				try:
-					self._log_agent_event(max_steps=max_steps, agent_run_error=agent_run_error)
-				except Exception as log_e:  # Catch potential errors during logging itself
-					self.logger.error(f'Failed to log telemetry event: {log_e}', exc_info=True)
-			else:
-				# ADDED: Info message when custom telemetry for SIGINT was already logged
-				self.logger.debug('Telemetry for force exit (SIGINT) was logged by custom exit callback.')
-
-			# NOTE: CreateAgentSessionEvent and CreateAgentTaskEvent are now emitted at the START of run()
-			# to match backend requirements for CREATE events to be fired when entities are created,
-			# not when they are completed
-
-			# Emit UpdateAgentTaskEvent at the END of run() with final task state
-			self.eventbus.dispatch(UpdateAgentTaskEvent.from_agent(self))
-
-			# Generate GIF if needed before stopping event bus
-			if self.settings.generate_gif:
-				output_path: str = 'agent_history.gif'
-				if isinstance(self.settings.generate_gif, str):
-					output_path = self.settings.generate_gif
-
-				# Lazy import gif module to avoid heavy startup cost
-				from browser_use.agent.gif import create_history_gif
-
-				create_history_gif(task=self.task, history=self.history, output_path=output_path)
-
-				# Only emit output file event if GIF was actually created
-				if Path(output_path).exists():
-					output_event = await CreateAgentOutputFileEvent.from_agent_and_file(self, output_path)
-					self.eventbus.dispatch(output_event)
-
-			# Log final messages to user based on outcome
-			self._log_final_outcome_messages()
-
-			# Stop the event bus gracefully, waiting for all events to be processed
-			# Configurable via TIMEOUT_AgentEventBusStop env var (default: 3.0s)
-			await self.eventbus.stop(clear=True, timeout=_get_timeout('TIMEOUT_AgentEventBusStop', 3.0))
-
-			await self.close()
 
 	@observe_debug(ignore_input=True, ignore_output=True)
 	@time_execution_async('--multi_act')

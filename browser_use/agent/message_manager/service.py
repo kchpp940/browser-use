@@ -6,12 +6,6 @@ from typing import Literal
 from browser_use.agent.message_manager.views import (
 	HistoryItem,
 )
-from browser_use.agent.prompt_context import (
-	ContextMessageSection,
-	PromptContextBuilder,
-	PromptSectionConfig,
-	PromptSectionRegistry,
-)
 from browser_use.agent.prompts import AgentMessagePrompt
 from browser_use.agent.views import (
 	ActionResult,
@@ -126,8 +120,6 @@ class MessageManager:
 		sample_images: list[ContentPartTextParam | ContentPartImageParam] | None = None,
 		llm_screenshot_size: tuple[int, int] | None = None,
 		max_clickable_elements_length: int = 40000,
-		section_config: PromptSectionConfig | None = None,
-		registry: PromptSectionRegistry | None = None,
 	):
 		self.task = task
 		self.state = state
@@ -142,8 +134,6 @@ class MessageManager:
 		self.sample_images = sample_images
 		self.llm_screenshot_size = llm_screenshot_size
 		self.max_clickable_elements_length = max_clickable_elements_length
-		self.section_config = section_config or PromptSectionConfig()
-		self.registry = registry
 
 		assert max_history_items is None or max_history_items > 5, 'max_history_items must be None or greater than 5'
 
@@ -152,27 +142,9 @@ class MessageManager:
 		self.sensitive_data = sensitive_data
 		self.last_input_messages = []
 		self.last_state_message_text: str | None = None
-		self.current_prompt: AgentMessagePrompt | None = None
 		# Only initialize messages if state is empty
 		if len(self.state.history.get_messages()) == 0:
 			self._set_message_with_type(self.system_prompt, 'system')
-
-	@property
-	def prompt_builder(self) -> PromptContextBuilder | None:
-		"""Access the PromptContextBuilder from the current (last-created) state prompt."""
-		if self.current_prompt is not None:
-			return self.current_prompt.builder
-		return None
-
-	def enable_prompt_section(self, section_name: str) -> None:
-		"""Enable a prompt section by name."""
-		if self.prompt_builder is not None:
-			self.prompt_builder.enable_section(section_name)
-
-	def disable_prompt_section(self, section_name: str) -> None:
-		"""Disable a prompt section by name."""
-		if self.prompt_builder is not None:
-			self.prompt_builder.disable_section(section_name)
 
 	@property
 	def agent_history_description(self) -> str:
@@ -230,10 +202,7 @@ class MessageManager:
 		sensitive_data=None,
 	) -> None:
 		"""Prepare state for the next LLM call without building the final state message."""
-		# Clear both the old-style context_messages list and the builder-based context messages
 		self.state.history.context_messages.clear()
-		if self.prompt_builder is not None:
-			self.prompt_builder.clear_context_messages()
 		self._update_agent_history_description(model_output, result, step_info)
 
 		effective_sensitive_data = sensitive_data if sensitive_data is not None else self.sensitive_data
@@ -458,9 +427,9 @@ class MessageManager:
 		use_vision: bool | Literal['auto'] = True,
 		page_filtered_actions: str | None = None,
 		sensitive_data=None,
-		available_file_paths: list[str] | None = None,
-		unavailable_skills_info: str | None = None,
-		plan_description: str | None = None,
+		available_file_paths: list[str] | None = None,  # Always pass current available_file_paths
+		unavailable_skills_info: str | None = None,  # Information about skills that cannot be used yet
+		plan_description: str | None = None,  # Rendered plan for injection into agent state
 		skip_state_update: bool = False,
 	) -> None:
 		"""Create single state message with all content"""
@@ -474,9 +443,11 @@ class MessageManager:
 				sensitive_data=sensitive_data,
 			)
 
+		# Use only the current screenshot, but check if action results request screenshot inclusion
 		screenshots = []
 		include_screenshot_requested = False
 
+		# Check if any action results request screenshot inclusion
 		if result:
 			for action_result in result:
 				if action_result.metadata and action_result.metadata.get('include_screenshot'):
@@ -484,19 +455,28 @@ class MessageManager:
 					logger.debug('Screenshot inclusion requested by action result')
 					break
 
+		# Handle different use_vision modes:
+		# - "auto": Only include screenshot if explicitly requested by action (e.g., screenshot)
+		# - True: Always include screenshot
+		# - False: Never include screenshot
 		include_screenshot = False
 		if use_vision is True:
+			# Always include screenshot when use_vision=True
 			include_screenshot = True
 		elif use_vision == 'auto':
+			# Only include screenshot if explicitly requested by action when use_vision="auto"
 			include_screenshot = include_screenshot_requested
+		# else: use_vision is False, never include screenshot (include_screenshot stays False)
 
 		if include_screenshot and browser_state_summary.screenshot:
 			screenshots.append(browser_state_summary.screenshot)
 
+		# Use vision in the user message if screenshots are included
 		effective_use_vision = len(screenshots) > 0
 
+		# Create single state message with all content
 		assert browser_state_summary
-		self.current_prompt = AgentMessagePrompt(
+		state_message = AgentMessagePrompt(
 			browser_state_summary=browser_state_summary,
 			file_system=self.file_system,
 			agent_history_description=self.agent_history_description,
@@ -516,30 +496,13 @@ class MessageManager:
 			llm_screenshot_size=self.llm_screenshot_size,
 			unavailable_skills_info=unavailable_skills_info,
 			plan_description=plan_description,
-			registry=self.registry,
-		)
+		).get_user_message(effective_use_vision)
 
-		self.section_config.apply_to_user_builder(self.current_prompt.builder)
-
-		builder = self.current_prompt.builder
-		state_message, context_messages = builder.build_state_and_context_messages(
-			use_vision=effective_use_vision,
-			screenshots=self.current_prompt.screenshots,
-			read_state_images=self.current_prompt.read_state_images,
-			sample_images=self.current_prompt.sample_images,
-			vision_detail_level=self.current_prompt.vision_detail_level,
-			llm_screenshot_size=self.current_prompt.llm_screenshot_size,
-		)
-
+		# Store state message text for history
 		self.last_state_message_text = state_message.text
 
+		# Set the state message with caching enabled
 		self._set_message_with_type(state_message, 'state')
-
-		self.state.history.context_messages.clear()
-		for ctx_msg in context_messages:
-			if self.sensitive_data:
-				ctx_msg = self._filter_sensitive_data(ctx_msg)
-			self.state.history.context_messages.append(ctx_msg)
 
 	def _log_history_lines(self) -> str:
 		"""Generate a formatted log string of message history for debugging / printing to terminal"""
@@ -602,39 +565,10 @@ class MessageManager:
 			raise ValueError(f'Invalid state message type: {message_type}')
 
 	def _add_context_message(self, message: BaseMessage) -> None:
-		"""Add a contextual message specific to this step (nudges, warnings, etc.).
-
-		For UserMessage nudges, the text is also registered in the builder's
-		ContextMessageSection so it participates in section-level enable/disable.
-		"""
-		if isinstance(message, UserMessage) and isinstance(message.content, str):
-			if self.prompt_builder is not None:
-				self.prompt_builder.add_context_message(message.content)
+		"""Add a contextual message specific to this step (e.g., validation errors, retry instructions, timeout warnings)"""
+		# Context messages typically contain error messages and validation info, not action results
+		# with sensitive data, so filtering is not needed here
 		self.state.history.context_messages.append(message)
-
-	def _sync_builder_context_to_history(self) -> None:
-		"""Sync new builder context messages to history.context_messages.
-
-		After builder.nudge_* calls add messages to the builder's
-		ContextMessageSection, this method appends them as UserMessages
-		to the history's context_messages list for the LLM to see.
-		"""
-		if self.prompt_builder is None:
-			return
-		ctx_msg_section = self.prompt_builder.get_section('context_messages')
-		if not isinstance(ctx_msg_section, ContextMessageSection):
-			return
-		existing_count = sum(
-			1 for m in self.state.history.context_messages
-			if isinstance(m, UserMessage) and isinstance(m.content, str)
-		)
-		builder_msgs = ctx_msg_section._messages
-		new_msgs = builder_msgs[existing_count:]
-		for msg_text in new_msgs:
-			ctx_msg = UserMessage(content=msg_text)
-			if self.sensitive_data:
-				ctx_msg = self._filter_sensitive_data(ctx_msg)
-			self.state.history.context_messages.append(ctx_msg)
 
 	@time_execution_sync('--filter_sensitive_data')
 	def _filter_sensitive_data(self, message: BaseMessage) -> BaseMessage:

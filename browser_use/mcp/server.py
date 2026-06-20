@@ -734,9 +734,6 @@ class BrowserUseServer:
 		except Exception as e:
 			logger.error(f'Agent task failed: {e}', exc_info=True)
 			return f'Agent task failed: {str(e)}'
-		finally:
-			# Clean up
-			await agent.close()
 
 	async def _navigate(self, url: str, new_tab: bool = False) -> str:
 		"""Navigate to a URL."""
