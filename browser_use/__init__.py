@@ -50,7 +50,7 @@ if TYPE_CHECKING:
 	from browser_use.agent.views import ActionModel, ActionResult, AgentHistoryList
 	from browser_use.browser import BrowserProfile, BrowserSession
 	from browser_use.browser import BrowserSession as Browser
-	from browser_use.controller.runtime_session import RuntimeSessionController
+	from browser_use.controller.runtime_session import LifecycleCallbacks, RuntimeSessionController, TaskResult
 	from browser_use.dom.service import DomService
 	from browser_use.llm import models
 	from browser_use.llm.anthropic.chat import ChatAnthropic
@@ -82,6 +82,8 @@ _LAZY_IMPORTS = {
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
 	# Runtime lifecycle controller
 	'RuntimeSessionController': ('browser_use.controller.runtime_session', 'RuntimeSessionController'),
+	'TaskResult': ('browser_use.controller.runtime_session', 'TaskResult'),
+	'LifecycleCallbacks': ('browser_use.controller.runtime_session', 'LifecycleCallbacks'),
 	# Tools (moderate weight)
 	'Tools': ('browser_use.tools.service', 'Tools'),
 	'Controller': ('browser_use.tools.service', 'Controller'),  # alias
@@ -136,6 +138,8 @@ __all__ = [
 	'Controller',
 	'DomService',
 	'RuntimeSessionController',
+	'TaskResult',
+	'LifecycleCallbacks',
 	'SystemPrompt',
 	'ActionResult',
 	'ActionModel',

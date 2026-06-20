@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
 	from browser_use.skill_cli.sessions import SessionInfo
 
+from browser_use.controller.runtime_session import LifecycleCallbacks, RuntimeSessionController, TaskResult
+
 # Configure logging before imports
 logging.basicConfig(
 	level=logging.INFO,
@@ -159,18 +161,16 @@ class Daemon:
 				self._idle_watchdog_task = asyncio.create_task(self._watch_idle())
 
 			except Exception:
-				# Startup failed — rollback browser resources
+				# Startup failed — rollback browser resources using unified controller
 				logger.exception('Session startup failed, rolling back')
 				self._write_state('failed')
-				try:
-					if self.use_cloud and hasattr(bs, '_cloud_browser_client') and bs._cloud_browser_client.current_session_id:
-						await asyncio.wait_for(bs._cloud_browser_client.stop_browser(), timeout=10.0)
-					elif not self.cdp_url and not self.use_cloud:
-						await asyncio.wait_for(bs.kill(), timeout=10.0)
-					else:
-						await asyncio.wait_for(bs.stop(), timeout=10.0)
-				except Exception as cleanup_err:
-					logger.debug(f'Rollback cleanup error: {cleanup_err}')
+				controller = RuntimeSessionController(browser_session=bs)
+				await controller.close_session(
+					timeout=10.0,
+					force=False,
+					cloud=self.use_cloud,
+					cdp_url=bool(self.cdp_url),
+				)
 				raise
 
 			self._write_state('running')
@@ -269,61 +269,77 @@ class Daemon:
 
 		logger.info(f'Dispatch: {action} (id={req_id})')
 
-		try:
-			# Handle shutdown
-			if action == 'shutdown':
-				return {'id': req_id, 'success': True, 'data': {'shutdown': True}}
+		# Handle shutdown
+		if action == 'shutdown':
+			return {'id': req_id, 'success': True, 'data': {'shutdown': True}}
 
-			# Handle ping — returns daemon config for mismatch detection
-			if action == 'ping':
-				# Return live CDP URL (may differ from constructor arg for cloud sessions)
-				live_cdp_url = self.cdp_url
-				if self._session and self._session.browser_session.cdp_url:
-					live_cdp_url = self._session.browser_session.cdp_url
-				return {
-					'id': req_id,
-					'success': True,
-					'data': {
-						'session': self.session,
-						'pid': os.getpid(),
-						'headed': self.headed,
-						'profile': self.profile,
-						'cdp_url': live_cdp_url,
-						'use_cloud': self.use_cloud,
-					},
-				}
+		# Handle ping — returns daemon config for mismatch detection
+		if action == 'ping':
+			# Return live CDP URL (may differ from constructor arg for cloud sessions)
+			live_cdp_url = self.cdp_url
+			if self._session and self._session.browser_session.cdp_url:
+				live_cdp_url = self._session.browser_session.cdp_url
+			return {
+				'id': req_id,
+				'success': True,
+				'data': {
+					'session': self.session,
+					'pid': os.getpid(),
+					'headed': self.headed,
+					'profile': self.profile,
+					'cdp_url': live_cdp_url,
+					'use_cloud': self.use_cloud,
+				},
+			}
 
-			# Handle connect — forces immediate session creation (used by cloud connect)
-			if action == 'connect':
-				session = await self._get_or_create_session()
-				bs = session.browser_session
-				result_data: dict = {'status': 'connected'}
-				if bs.cdp_url:
-					result_data['cdp_url'] = bs.cdp_url
-				if self.use_cloud and bs.cdp_url:
-					from urllib.parse import quote
-
-					result_data['live_url'] = f'https://live.browser-use.com/?wss={quote(bs.cdp_url, safe="")}'
-				return {'id': req_id, 'success': True, 'data': result_data}
-
-			from browser_use.skill_cli.commands import browser, python_exec
-
-			# Get or create the single session
+		# Handle connect — forces immediate session creation (used by cloud connect)
+		if action == 'connect':
 			session = await self._get_or_create_session()
+			bs = session.browser_session
+			result_data: dict = {'status': 'connected'}
+			if bs.cdp_url:
+				result_data['cdp_url'] = bs.cdp_url
+			if self.use_cloud and bs.cdp_url:
+				from urllib.parse import quote
 
-			# Dispatch to handler
-			if action in browser.COMMANDS:
-				result = await browser.handle(action, session, params)
-			elif action == 'python':
-				result = await python_exec.handle(session, params)
+				result_data['live_url'] = f'https://live.browser-use.com/?wss={quote(bs.cdp_url, safe="")}'
+			return {'id': req_id, 'success': True, 'data': result_data}
+
+		from browser_use.skill_cli.commands import browser, python_exec
+
+		# Get or create the single session
+		session = await self._get_or_create_session()
+		bs = session.browser_session
+
+		# Dispatch to handler with unified controller lifecycle for browser commands
+		if action in browser.COMMANDS:
+			# Wrap browser command execution with controller for timeout, cancellation, and exception normalization
+			controller = RuntimeSessionController(browser_session=bs)
+
+			async def _do_handle() -> dict:
+				return await browser.handle(action, session, params)
+
+			result: TaskResult = await controller.run_browser_session_task(
+				_do_handle(),
+				timeout=60.0,
+				task_name=f'browser_{action}',
+			)
+
+			if result.success and result.result is not None:
+				return {'id': req_id, 'success': True, 'data': result.result}
+			elif result.timed_out:
+				return {'id': req_id, 'success': False, 'error': f'Command {action} timed out after 60s'}
+			elif result.cancelled:
+				return {'id': req_id, 'success': False, 'error': f'Command {action} was cancelled'}
 			else:
-				return {'id': req_id, 'success': False, 'error': f'Unknown action: {action}'}
+				return {'id': req_id, 'success': False, 'error': result.error or f'Command {action} failed'}
 
+		elif action == 'python':
+			result = await python_exec.handle(session, params)
 			return {'id': req_id, 'success': True, 'data': result}
 
-		except Exception as e:
-			logger.exception(f'Error dispatching {action}: {e}')
-			return {'id': req_id, 'success': False, 'error': str(e)}
+		else:
+			return {'id': req_id, 'success': False, 'error': f'Unknown action: {action}'}
 
 	async def run(self) -> None:
 		"""Listen on Unix socket (or TCP on Windows) with PID file.
@@ -461,9 +477,6 @@ class Daemon:
 		if self._session:
 			# Finalize any in-progress video recording before tearing down the browser,
 			# otherwise the MP4 is truncated since the ffmpeg writer is never closed.
-			# No timeout: stop_recording() already offloads the blocking encoder close
-			# to an executor; a hard timeout here risks os._exit(0) firing before the
-			# writer has flushed, producing the very truncation this hook prevents.
 			bs = self._session.browser_session
 			watchdog = getattr(bs, '_recording_watchdog', None)
 			if watchdog is not None and getattr(watchdog, 'is_recording', False):
@@ -474,18 +487,19 @@ class Daemon:
 				except Exception as e:
 					logger.warning(f'Error finalizing recording during shutdown: {e}')
 
-			try:
-				# Only kill the browser if the daemon launched it.
-				# For external connections (--connect, --cdp-url, cloud), just disconnect.
-				# Timeout ensures daemon exits even if CDP calls hang on a dead connection
-				if self.cdp_url or self.use_cloud:
-					await asyncio.wait_for(bs.stop(), timeout=10.0)
+			# Use RuntimeSessionController for unified session close with timeout
+			controller = RuntimeSessionController(browser_session=bs)
+			close_result = await controller.close_session(
+				timeout=10.0,
+				force=False,
+				cloud=self.use_cloud,
+				cdp_url=bool(self.cdp_url),
+			)
+			if not close_result.success:
+				if close_result.timed_out:
+					logger.warning('Browser cleanup timed out after 10s, forcing exit')
 				else:
-					await asyncio.wait_for(bs.kill(), timeout=10.0)
-			except TimeoutError:
-				logger.warning('Browser cleanup timed out after 10s, forcing exit')
-			except Exception as e:
-				logger.warning(f'Error closing session: {e}')
+					logger.warning(f'Error closing session: {close_result.error}')
 			self._session = None
 
 		# Delete PID and auth token files last, right before exit.

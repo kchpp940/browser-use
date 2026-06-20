@@ -65,9 +65,6 @@ class RuntimeSessionController:
 		agent: Agent | None = None,
 		browser_session: BrowserSession | None = None,
 	):
-		if agent is None and browser_session is None:
-			raise ValueError('RuntimeSessionController requires either agent or browser_session')
-
 		self.agent = agent
 		self.browser_session = browser_session or (agent.browser_session if agent else None)
 

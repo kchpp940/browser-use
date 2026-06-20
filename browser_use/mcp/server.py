@@ -90,9 +90,10 @@ _configure_mcp_server_logging()
 logging.disable(logging.CRITICAL)
 
 # Import browser_use modules
-from browser_use import ActionModel, Agent
+from browser_use import ActionModel, Agent, RuntimeSessionController
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
+from browser_use.controller.runtime_session import LifecycleCallbacks, TaskResult
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.tools.service import Tools
@@ -695,7 +696,7 @@ class BrowserUseServer:
 		# Create browser profile using config
 		profile = BrowserProfile(**profile_config)
 
-		# Create and run agent
+		# Create agent
 		agent = Agent(
 			task=task,
 			llm=llm,
@@ -703,9 +704,26 @@ class BrowserUseServer:
 			use_vision=use_vision,
 		)
 
-		try:
-			history = await agent.run(max_steps=max_steps)
+		# Use RuntimeSessionController explicitly for unified lifecycle management
+		controller = RuntimeSessionController(agent=agent)
 
+		async def _on_start() -> None:
+			logger.debug(f'Agent task starting via controller: {task[:50]}...')
+
+		async def _on_error(e: Exception) -> None:
+			logger.error(f'Agent task failed via controller: {e}')
+
+		callbacks = LifecycleCallbacks(on_start=_on_start, on_error=_on_error)
+
+		result: TaskResult = await controller._run_with_lifecycle(
+			controller.run_agent_task(max_steps=max_steps),
+			timeout=None,
+			task_name=f'MCP agent task "{task[:40]}..."',
+			callbacks=callbacks,
+		)
+
+		if result.success and result.result is not None:
+			history = result.result
 			# Format results
 			results = []
 			results.append(f'Task completed in {len(history.history)} steps')
@@ -731,28 +749,38 @@ class BrowserUseServer:
 
 			return '\n'.join(results)
 
-		except Exception as e:
-			logger.error(f'Agent task failed: {e}', exc_info=True)
-			return f'Agent task failed: {str(e)}'
+		if result.cancelled:
+			return f'Agent task was cancelled'
+
+		if result.timed_out:
+			return f'Agent task timed out'
+
+		return f'Agent task failed: {result.error or "Unknown error"}'
 
 	async def _navigate(self, url: str, new_tab: bool = False) -> str:
 		"""Navigate to a URL."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
-		# Update session activity
 		self._update_session_activity(self.browser_session.id)
 
 		from browser_use.browser.events import NavigateToUrlEvent
 
-		if new_tab:
-			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=True))
-			await event
-			return f'Opened new tab with URL: {url}'
-		else:
-			event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url))
-			await event
-			return f'Navigated to: {url}'
+		async def _do_navigate() -> str:
+			if new_tab:
+				event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=True))
+				await event
+				return f'Opened new tab with URL: {url}'
+			else:
+				event = self.browser_session.event_bus.dispatch(NavigateToUrlEvent(url=url))
+				await event
+				return f'Navigated to: {url}'
+
+		return await self._run_browser_command(
+			_do_navigate(),
+			task_name=f'navigate {url[:50]}',
+			timeout=30.0,
+		)
 
 	async def _click(
 		self,
@@ -1024,40 +1052,74 @@ class BrowserUseServer:
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
+		self._update_session_activity(self.browser_session.id)
+
 		from browser_use.browser.events import ScrollEvent
 
-		# Scroll by a standard amount (500 pixels)
-		event = self.browser_session.event_bus.dispatch(
-			ScrollEvent(
-				direction=direction,  # type: ignore
-				amount=500,
+		async def _do_scroll() -> str:
+			event = self.browser_session.event_bus.dispatch(
+				ScrollEvent(
+					direction=direction,
+					amount=500,
+				)
 			)
+			await event
+			return f'Scrolled {direction}'
+
+		return await self._run_browser_command(
+			_do_scroll(),
+			task_name=f'scroll_{direction}',
+			timeout=15.0,
 		)
-		await event
-		return f'Scrolled {direction}'
 
 	async def _go_back(self) -> str:
 		"""Go back in browser history."""
 		if not self.browser_session:
 			return 'Error: No browser session active'
 
+		self._update_session_activity(self.browser_session.id)
+
 		from browser_use.browser.events import GoBackEvent
 
-		event = self.browser_session.event_bus.dispatch(GoBackEvent())
-		await event
-		return 'Navigated back'
+		async def _do_go_back() -> str:
+			event = self.browser_session.event_bus.dispatch(GoBackEvent())
+			await event
+			return 'Navigated back'
+
+		return await self._run_browser_command(
+			_do_go_back(),
+			task_name='go_back',
+			timeout=15.0,
+		)
 
 	async def _close_browser(self) -> str:
 		"""Close the browser session."""
-		if self.browser_session:
-			from browser_use.browser.events import BrowserStopEvent
+		if not self.browser_session:
+			return 'No browser session to close'
 
+		from browser_use.browser.events import BrowserStopEvent
+
+		async def _do_close() -> str:
 			event = self.browser_session.event_bus.dispatch(BrowserStopEvent())
 			await event
+			return 'Browser closed'
+
+		result = await self._run_browser_command(
+			_do_close(),
+			task_name='close_browser',
+			timeout=10.0,
+		)
+
+		# Clear references even if close had issues
+		if isinstance(result, str) and not result.startswith('Error:'):
 			self.browser_session = None
 			self.tools = None
-			return 'Browser closed'
-		return 'No browser session to close'
+		elif result.startswith('Error:'):
+			# Force-clear on error too to avoid stale references
+			self.browser_session = None
+			self.tools = None
+
+		return result if isinstance(result, str) else 'Browser closed'
 
 	async def _list_tabs(self) -> str:
 		"""List all open tabs."""
@@ -1145,24 +1207,32 @@ class BrowserUseServer:
 		session_data = self.active_sessions[session_id]
 		session = session_data['session']
 
-		try:
-			# Close the session
-			if hasattr(session, 'kill'):
-				await session.kill()
-			elif hasattr(session, 'close'):
-				await session.close()
+		# Use RuntimeSessionController for unified session close with timeout and exception normalization
+		controller = RuntimeSessionController(browser_session=session)
+		use_cdp = bool(getattr(session, 'cdp_url', None))
+		use_cloud = bool(getattr(session, '_cloud_browser_client', None))
 
-			# Remove from tracking
-			del self.active_sessions[session_id]
+		close_result = await controller.close_session(
+			timeout=10.0,
+			force=False,
+			cloud=use_cloud,
+			cdp_url=use_cdp,
+		)
 
-			# If this was the current session, clear it
-			if self.browser_session and self.browser_session.id == session_id:
-				self.browser_session = None
-				self.tools = None
+		# Remove from tracking regardless of close success
+		del self.active_sessions[session_id]
 
+		# If this was the current session, clear it
+		if self.browser_session and self.browser_session.id == session_id:
+			self.browser_session = None
+			self.tools = None
+
+		if close_result.success:
 			return f'Successfully closed session {session_id}'
-		except Exception as e:
-			return f'Error closing session {session_id}: {str(e)}'
+		elif close_result.timed_out:
+			return f'Warning: Session {session_id} close timed out'
+		else:
+			return f'Error closing session {session_id}: {close_result.error or "Unknown error"}'
 
 	async def _close_all_sessions(self) -> str:
 		"""Close all active browser sessions."""
@@ -1173,14 +1243,11 @@ class BrowserUseServer:
 		errors = []
 
 		for session_id in list(self.active_sessions.keys()):
-			try:
-				result = await self._close_session(session_id)
-				if 'Successfully closed' in result:
-					closed_count += 1
-				else:
-					errors.append(f'{session_id}: {result}')
-			except Exception as e:
-				errors.append(f'{session_id}: {str(e)}')
+			result = await self._close_session(session_id)
+			if 'Successfully closed' in result:
+				closed_count += 1
+			elif result.startswith('Error') or result.startswith('Warning'):
+				errors.append(f'{session_id}: {result}')
 
 		# Clear current session references
 		self.browser_session = None
@@ -1191,6 +1258,36 @@ class BrowserUseServer:
 			result += f'. Errors: {"; ".join(errors)}'
 
 		return result
+
+	async def _run_browser_command(
+		self,
+		coro,
+		*,
+		task_name: str = 'browser_command',
+		timeout: float = 30.0,
+		default_error: str = 'Command failed',
+	):
+		"""Helper to wrap any direct browser command with controller lifecycle.
+
+		Returns the successful result, or an error string starting with 'Error:'.
+		"""
+		if not self.browser_session:
+			return 'Error: No browser session active'
+
+		self._update_session_activity(self.browser_session.id)
+
+		controller = RuntimeSessionController(browser_session=self.browser_session)
+		result = await controller.run_browser_session_task(
+			coro,
+			timeout=timeout,
+			task_name=task_name,
+		)
+
+		if result.success:
+			return result.result
+		if result.timed_out:
+			return f'Error: {task_name} timed out after {timeout}s'
+		return f'Error: {result.error or default_error}'
 
 	async def _cleanup_expired_sessions(self) -> None:
 		"""Background task to clean up expired sessions."""
