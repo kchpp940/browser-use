@@ -22,9 +22,11 @@ import logging
 import os
 import socket
 import time
+from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
-from typing import Any, AsyncIterator, Iterator
+from typing import Any
+
+from pydantic import BaseModel
 
 from browser_use.config import CONFIG, is_running_in_docker
 from browser_use.utils import get_browser_use_version, singleton
@@ -163,8 +165,7 @@ class _RuntimeContext:
 # ── Sink configuration ─────────────────────────────────────────────────────
 
 
-@dataclass
-class SinkConfig:
+class SinkConfig(BaseModel):
 	"""Which sinks a RuntimeLogger instance will deliver to."""
 
 	console: bool = True
@@ -289,7 +290,7 @@ class RuntimeLogger:
 	# ── Duck-typed telemetry bridge (accessed by entry layers) ────────
 
 	@property
-	def _telemetry(self) -> '_TelemetryBridge':
+	def _telemetry(self) -> _TelemetryBridge:
 		"""Backwards-compat alias: entry layers set _telemetry.telemetry_client.
 
 		We expose a tiny bridge object with a ``telemetry_client`` setter
@@ -729,7 +730,7 @@ class RuntimeLogger:
 		logger_name = f'browser_use.rt.{event.source.value}'
 		py_logger = logging.getLogger(logger_name)
 		# Build extra dict for structured loggers
-		extra = {
+		extra: dict[str, Any] = {
 			'runtime_event_id': event.event_id,
 			'runtime_event_type': event.event_type.value,
 			'runtime_source': event.source.value,
@@ -758,11 +759,12 @@ class RuntimeLogger:
 				from bubus import EventBus
 
 				self._event_bus = EventBus()
-			# Publish both a generic event (all RuntimeEvents) and the
-			# source+type-specific channel so subscribers can filter
-			self._event_bus.publish_sync('runtime_event', event.model_dump(mode='json'))
-			channel = f'rt:{event.source.value}:{event.event_type.value}'
-			self._event_bus.publish_sync(channel, event.model_dump(mode='json'))
+			# Use RuntimeEventBusBridge to wrap RuntimeEvent in a
+			# bubus.BaseEvent-compatible object for dispatch.
+			from .views import RuntimeEventBusBridge
+
+			bridge = RuntimeEventBusBridge.wrap(event)
+			self._event_bus.dispatch(bridge)  # type: ignore[arg-type]
 		except Exception as exc:  # pragma: no cover - defensive
 			logger.debug('bubus EventBus dispatch failed: %s', exc)
 
@@ -774,7 +776,7 @@ class RuntimeLogger:
 			if self._telemetry_service is None:
 				from browser_use.telemetry.service import ProductTelemetry
 
-				self._telemetry_service = ProductTelemetry()
+				self._telemetry_service = ProductTelemetry()  # type: ignore[call-arg]
 
 			# Bridge: create a BaseTelemetryEvent-compatible wrapper
 			# using the RuntimeEvent's to_telemetry_properties() output
@@ -850,3 +852,24 @@ class _RuntimeTelemetryWrapper:
 	def __init__(self, name: str, properties: dict[str, Any]) -> None:
 		self.name = name
 		self.properties = properties
+
+
+class _TelemetryBridge:
+	"""
+	Tiny backwards-compat bridge: entry layers write
+	``runtime_logger._telemetry.telemetry_client = product_telemetry``,
+	we translate that into ``runtime_logger._telemetry_service``.
+	"""
+
+	__slots__ = ('_logger',)
+
+	def __init__(self, logger: Any) -> None:
+		self._logger = logger
+
+	@property
+	def telemetry_client(self) -> Any:
+		return self._logger._telemetry_service
+
+	@telemetry_client.setter
+	def telemetry_client(self, value: Any) -> None:
+		self._logger._telemetry_service = value

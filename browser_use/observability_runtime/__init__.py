@@ -20,32 +20,29 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-# ── Lazy imports (follow the pattern used in browser_use/__init__.py) ──────
+from browser_use.observability_runtime.service import SinkConfig
+
+# ── Direct imports for lightweight types (enums, Pydantic models) ─────────
+# These are pure type definitions with zero initialization cost. Importing
+# them directly gives pyright full visibility and avoids "expected 0
+# positional arguments" errors on SinkConfig() etc.
+from browser_use.observability_runtime.views import (
+	ErrorInfo,
+	EventSeverity,
+	EventSource,
+	EventType,
+	OutputFile,
+	RuntimeEvent,
+	TokenUsage,
+)
 
 if TYPE_CHECKING:
-	from browser_use.observability_runtime.service import RuntimeLogger, SinkConfig
-	from browser_use.observability_runtime.views import (
-		ErrorInfo,
-		EventSeverity,
-		EventSource,
-		EventType,
-		OutputFile,
-		RuntimeEvent,
-		TokenUsage,
-	)
+	from browser_use.observability_runtime.service import RuntimeLogger
+
+# ── Lazy import only for RuntimeLogger (has initialization cost) ───────────
 
 _LAZY_IMPORTS = {
-	# Core data models
-	'RuntimeEvent': ('browser_use.observability_runtime.views', 'RuntimeEvent'),
-	'EventSource': ('browser_use.observability_runtime.views', 'EventSource'),
-	'EventType': ('browser_use.observability_runtime.views', 'EventType'),
-	'EventSeverity': ('browser_use.observability_runtime.views', 'EventSeverity'),
-	'ErrorInfo': ('browser_use.observability_runtime.views', 'ErrorInfo'),
-	'OutputFile': ('browser_use.observability_runtime.views', 'OutputFile'),
-	'TokenUsage': ('browser_use.observability_runtime.views', 'TokenUsage'),
-	# Logger service
 	'RuntimeLogger': ('browser_use.observability_runtime.service', 'RuntimeLogger'),
-	'SinkConfig': ('browser_use.observability_runtime.service', 'SinkConfig'),
 }
 
 
@@ -65,4 +62,14 @@ def __getattr__(name: str):
 	raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
-__all__ = list(_LAZY_IMPORTS.keys())
+__all__ = (
+	'RuntimeEvent',
+	'RuntimeLogger',
+	'SinkConfig',
+	'EventSource',
+	'EventType',
+	'EventSeverity',
+	'ErrorInfo',
+	'OutputFile',
+	'TokenUsage',
+)

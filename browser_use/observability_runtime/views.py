@@ -132,7 +132,7 @@ class EventSeverity(str, Enum):
 	CRITICAL = 'critical'
 
 	@classmethod
-	def from_logging_level(cls, level: int) -> 'EventSeverity':
+	def from_logging_level(cls, level: int) -> EventSeverity:
 		if level >= logging.CRITICAL:
 			return cls.CRITICAL
 		if level >= logging.ERROR:
@@ -176,7 +176,7 @@ class ErrorInfo(BaseModel):
 	error_module: str | None = Field(default=None, description='Module where the exception was defined')
 
 	@classmethod
-	def from_exception(cls, exc: BaseException, include_stack: bool = True) -> 'ErrorInfo':
+	def from_exception(cls, exc: BaseException, include_stack: bool = True) -> ErrorInfo:
 		tb_str = None
 		if include_stack and exc.__traceback__:
 			tb_str = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
@@ -297,7 +297,7 @@ class RuntimeEvent(BaseModel):
 		severity: EventSeverity = EventSeverity.ERROR,
 		include_stack: bool = True,
 		**kwargs: Any,
-	) -> 'RuntimeEvent':
+	) -> RuntimeEvent:
 		"""Create a RuntimeEvent wrapping an exception."""
 		return cls(
 			source=source,
@@ -373,3 +373,44 @@ class RuntimeEvent(BaseModel):
 			if isinstance(v, (str, int, float, bool, type(None))):
 				props[f'data_{k}'] = v
 		return props
+
+
+# ── Bubus EventBus bridge ──────────────────────────────────────────────────
+
+try:
+	from bubus import BaseEvent  # type: ignore
+except Exception:  # pragma: no cover
+	BaseEvent = None  # type: ignore
+
+
+if BaseEvent is not None:
+
+	class RuntimeEventBusBridge(BaseEvent):  # type: ignore[misc,valid-type]
+		"""
+		Bubus BaseEvent subclass that wraps a RuntimeEvent for dispatch
+		through an existing bubus EventBus.
+
+		This exists because bubus.EventBus.dispatch() requires events
+		that inherit from bubus.BaseEvent (with event_id, event_created_at,
+		event_type, event_schema fields). RuntimeEventBusBridge inherits
+		from bubus.BaseEvent and carries a RuntimeEvent as its payload.
+
+		Subscribers filter by ``event_type == 'RuntimeEventBusBridge'``
+		and access the wrapped event via ``event.runtime_event``.
+		"""
+
+		runtime_event: RuntimeEvent
+
+		@classmethod
+		def wrap(cls, event: RuntimeEvent) -> RuntimeEventBusBridge:
+			"""Create a bridge event wrapping a RuntimeEvent."""
+			return cls(runtime_event=event)  # type: ignore[return-value]
+
+else:  # pragma: no cover - bubus is a core dependency
+
+	class RuntimeEventBusBridge:  # type: ignore[no-redef]
+		"""Fallback stub when bubus is not available."""
+
+		@classmethod
+		def wrap(cls, event: RuntimeEvent) -> RuntimeEventBusBridge:
+			return cls()

@@ -689,16 +689,20 @@ class BrowserSession(BaseModel):
 		BaseWatchdog.attach_handler_to_session(self, CloseTabEvent, self.on_CloseTabEvent)
 
 		# Unified RuntimeLogger - observability runtime (browser layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.BROWSER)
+		self.runtime_logger = RuntimeLogger(source=EventSource.BROWSER)  # type: ignore[call-arg]
+		_has_cloud = bool(
+			getattr(self, 'cloud_profile_id', None)
+			or (self.browser_profile is not None and getattr(self.browser_profile, 'cloud_profile_id', None))
+		)
 		self.runtime_logger.set_sinks(
-			SinkConfig(
+			SinkConfig(  # type: ignore[reportCallIssue]
 				console=True,
 				event_bus=True,
 				telemetry=True,
-				cloud=bool(self.cloud_profile_id or (self.browser_profile and self.browser_profile.cloud_profile_id)),
+				cloud=_has_cloud,
 			)
 		)
-		self.runtime_logger._event_bus = self.event_bus
+		self.runtime_logger._event_bus = self.event_bus  # type: ignore[attr-defined]
 		self._runtime_logger_context_token = self.runtime_logger.set_context(session_id=self.id)
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='browser_session_start')

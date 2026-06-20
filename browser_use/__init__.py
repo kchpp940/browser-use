@@ -3,6 +3,21 @@ from typing import TYPE_CHECKING
 
 from browser_use.logging_config import setup_logging
 
+# ── Direct imports for observability runtime lightweight types ────────────
+# These are pure type definitions (enums, Pydantic models) with zero
+# initialization cost. Importing them directly gives pyright full type
+# visibility and avoids "expected 0 positional arguments" errors.
+from browser_use.observability_runtime import (
+	ErrorInfo,
+	EventSeverity,
+	EventSource,
+	EventType,
+	OutputFile,
+	RuntimeEvent,
+	SinkConfig,
+	TokenUsage,
+)
+
 # Only set up logging if not in MCP mode or if explicitly requested
 if os.environ.get('BROWSER_USE_SETUP_LOGGING', 'true').lower() != 'false':
 	from browser_use.config import CONFIG
@@ -109,16 +124,8 @@ _LAZY_IMPORTS = {
 	'ChatVercel': ('browser_use.llm.vercel.chat', 'ChatVercel'),
 	# LLM models module
 	'models': ('browser_use.llm.models', None),
-	# Unified observability runtime
-	'RuntimeEvent': ('browser_use.observability_runtime', 'RuntimeEvent'),
+	# Unified observability runtime (RuntimeLogger kept as lazy due to init cost)
 	'RuntimeLogger': ('browser_use.observability_runtime', 'RuntimeLogger'),
-	'SinkConfig': ('browser_use.observability_runtime', 'SinkConfig'),
-	'EventSource': ('browser_use.observability_runtime', 'EventSource'),
-	'EventType': ('browser_use.observability_runtime', 'EventType'),
-	'EventSeverity': ('browser_use.observability_runtime', 'EventSeverity'),
-	'ErrorInfo': ('browser_use.observability_runtime', 'ErrorInfo'),
-	'OutputFile': ('browser_use.observability_runtime', 'OutputFile'),
-	'TokenUsage': ('browser_use.observability_runtime', 'TokenUsage'),
 	# Sandbox execution
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
 }

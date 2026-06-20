@@ -69,9 +69,9 @@ class Daemon:
 		self._auth_token: str = ''
 
 		# Unified RuntimeLogger - observability runtime (skill_cli daemon layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.SKILL_CLI)
+		self.runtime_logger = RuntimeLogger(source=EventSource.SKILL_CLI)  # type: ignore[call-arg]
 		self.runtime_logger.set_sinks(
-			SinkConfig(console=True, event_bus=False, telemetry=True, cloud=bool(self.cloud_profile_id))
+			SinkConfig(console=True, event_bus=False, telemetry=True, cloud=bool(self.cloud_profile_id))  # type: ignore[reportCallIssue]
 		)
 		try:
 			from uuid_extensions import uuid7str

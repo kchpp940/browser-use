@@ -597,17 +597,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.eventbus = EventBus(name=f'Agent_{str(self.id)[-4:]}')
 
 		# Unified RuntimeLogger - observability runtime
-		self.runtime_logger = RuntimeLogger(source=EventSource.AGENT)
+		self.runtime_logger = RuntimeLogger(source=EventSource.AGENT)  # type: ignore[call-arg]
 		self.runtime_logger.set_sinks(
-			SinkConfig(
+			SinkConfig(  # type: ignore[reportCallIssue]
 				console=True,
 				event_bus=True,
 				telemetry=True,
 				cloud=self.browser_session is not None and bool(getattr(self.browser_session, 'cloud_profile_id', None)),
 			)
 		)
-		self.runtime_logger._telemetry.telemetry_client = self.telemetry
-		self.runtime_logger._event_bus = self.eventbus
+		self.runtime_logger._telemetry.telemetry_client = self.telemetry  # type: ignore[attr-defined]
+		self.runtime_logger._event_bus = self.eventbus  # type: ignore[attr-defined]
 
 		if self.settings.save_conversation_path:
 			self.settings.save_conversation_path = Path(self.settings.save_conversation_path).expanduser().resolve()
@@ -2593,13 +2593,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				await self._log_agent_run()
 
 				self.runtime_logger.task_start(
+					task=self.task,
+					model=self.llm.model if hasattr(self.llm, 'model') else 'unknown',
 					task_id=self.task_id,
 					session_id=self.session_id,
-					message=f'Starting agent task: {self.task[:80]}{"..." if len(self.task) > 80 else ""}',
 					data={
-						'task': self.task,
 						'max_steps': max_steps,
-						'model': self.llm.model if hasattr(self.llm, 'model') else 'unknown',
 						'source': self.source,
 					},
 				)
@@ -2758,9 +2757,11 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					message=f'Task ended: {self.task[:60]}{"..." if len(self.task) > 60 else ""}',
 					duration_ms=(time.time() - self._task_start_time) * 1000 if hasattr(self, '_task_start_time') else None,
 					tokens=TokenUsage(
-						prompt_tokens=token_summary.prompt_tokens,
-						completion_tokens=token_summary.completion_tokens,
+						input_tokens=token_summary.total_prompt_tokens,
+						output_tokens=token_summary.total_completion_tokens,
+						prompt_cached_tokens=token_summary.total_prompt_cached_tokens,
 						total_tokens=token_summary.total_tokens,
+						cost_usd=token_summary.total_cost,
 					)
 					if token_summary.total_tokens > 0
 					else None,

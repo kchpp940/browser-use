@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, Union, c
 import cloudpickle
 import httpx
 
-from browser_use.observability_runtime import EventSource, EventType, RuntimeLogger, SinkConfig
+from browser_use.observability_runtime import EventSeverity, EventSource, EventType, RuntimeLogger, SinkConfig
 from browser_use.sandbox.views import (
 	BrowserCreatedData,
 	ErrorData,
@@ -378,8 +378,8 @@ async def run(browser):
 			received_final_event = False
 
 			# Unified RuntimeLogger - observability runtime (sandbox/cloud layer)
-			sb_rt = RuntimeLogger(source=EventSource.SANDBOX)
-			sb_rt.set_sinks(SinkConfig(console=not quiet, event_bus=False, telemetry=True, cloud=True))
+			sb_rt = RuntimeLogger(source=EventSource.SANDBOX)  # type: ignore[call-arg]
+			sb_rt.set_sinks(SinkConfig(console=not quiet, event_bus=False, telemetry=True, cloud=True))  # type: ignore[reportCallIssue]
 			try:
 				from uuid_extensions import uuid7str
 
@@ -387,8 +387,9 @@ async def run(browser):
 			except Exception:
 				_sb_run_id = None
 			_rt_token = sb_rt.set_context(task_id=_sb_run_id)
-			sb_rt.emit(
+			sb_rt.log(
 				event_type=EventType.CLOUD_EXECUTION_START,
+				severity=EventSeverity.INFO,
 				message=f'Starting sandbox execution: {func.__name__}',
 				data={
 					'function_name': func.__name__,

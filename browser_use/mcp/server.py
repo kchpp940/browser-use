@@ -203,9 +203,9 @@ class BrowserUseServer:
 		self._start_time = time.time()
 
 		# Unified RuntimeLogger - observability runtime (MCP server layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.MCP_SERVER)
-		self.runtime_logger.set_sinks(SinkConfig(console=True, event_bus=False, telemetry=True, cloud=False))
-		self.runtime_logger._telemetry.telemetry_client = self._telemetry
+		self.runtime_logger = RuntimeLogger(source=EventSource.MCP_SERVER)  # type: ignore[call-arg]
+		self.runtime_logger.set_sinks(SinkConfig(console=True, event_bus=False, telemetry=True, cloud=False))  # type: ignore[reportCallIssue]
+		self.runtime_logger._telemetry.telemetry_client = self._telemetry  # type: ignore[attr-defined]
 
 		# Session management
 		self.active_sessions: dict[str, dict[str, Any]] = {}  # session_id -> session info

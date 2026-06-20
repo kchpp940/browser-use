@@ -616,9 +616,9 @@ class BrowserUseApp(App):
 		# Timer for info panel updates
 		self._info_panel_timer = None
 		# Unified RuntimeLogger - observability runtime (CLI layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.CLI)
-		self.runtime_logger.set_sinks(SinkConfig(console=True, event_bus=False, telemetry=True, cloud=False))
-		self.runtime_logger._telemetry.telemetry_client = self._telemetry
+		self.runtime_logger = RuntimeLogger(source=EventSource.CLI)  # type: ignore[call-arg]
+		self.runtime_logger.set_sinks(SinkConfig(console=True, event_bus=False, telemetry=True, cloud=False))  # type: ignore[reportCallIssue]
+		self.runtime_logger._telemetry.telemetry_client = self._telemetry  # type: ignore[attr-defined]
 		try:
 			from uuid_extensions import uuid7str
 
