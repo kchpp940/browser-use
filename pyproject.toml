@@ -14,72 +14,51 @@ dependencies = [
     "aiohttp==3.13.4",
     "anyio==4.12.1",
     "bubus==1.5.6",
-    "cdp-use==1.4.5",
+    "click==8.3.1",
+    "InquirerPy==0.3.4",
+    "rich==14.3.1",
+    "google-api-core==2.29.0",
     "httpx==0.28.1",
-    "markdownify==1.2.2",
-    "pillow==12.2.0",
     "posthog==7.7.0",
     "psutil==7.2.2",
     "pydantic==2.12.5",
-    "pydantic-settings==2.12.0",
     "pyobjc==12.1; platform_system == 'darwin'",
-    "pyotp==2.9.0",
     "python-dotenv==1.2.2",
     "requests==2.33.0",
     "screeninfo==0.8.1; platform_system != 'darwin'",
     "typing-extensions==4.15.0",
     "uuid7==0.1.0",
-]
-
-[project.optional-dependencies]
-# --- CLI: Terminal UI & command-line tools ---
-cli = [
-    "click==8.3.1",
-    "InquirerPy==0.3.4",
-    "rich==14.3.1",
-    "textual==7.4.0",
-]
-
-# --- MCP: Model Context Protocol server & client ---
-mcp = [
-    "mcp==1.26.0",
-]
-
-# --- Sandbox / Cloud: Remote execution, skills, cloud browser ---
-cloud = [
-    "browser-use-sdk==3.4.2",
-    "cloudpickle==3.1.2",
-]
-sandbox = ["browser-use[cloud]"]
-
-# --- LLM Providers: per-provider SDKs (install what you use) ---
-llm-openai = [
+    "google-genai==1.65.0",
     "openai==2.16.0",
-]
-llm-anthropic = [
     "anthropic==0.76.0",
-]
-llm-google = [
-    "google-api-core==2.29.0",
+    "groq==1.0.0",
+    "ollama==0.6.1",
     "google-api-python-client==2.188.0",
     "google-auth==2.48.0",
     "google-auth-oauthlib==1.2.4",
-    "google-genai==1.65.0",
+    "mcp==1.26.0",
+    "pypdf==6.10.2",
+    "reportlab==4.4.9",
+    "cdp-use==1.4.5",
+    "pyotp==2.9.0",
+    "pillow==12.2.0",
+    "cloudpickle==3.1.2",
+    "markdownify==1.2.2",
+    "python-docx==1.2.0",
+    "browser-use-sdk==3.4.2",
 ]
-llm-groq = [
-    "groq==1.0.0",
-]
-llm-ollama = [
-    "ollama==0.6.1",
-]
-llm-aws = [
-    "boto3==1.42.37",
-]
-llm-oci = [
-    "oci==2.166.0",
-]
+# google-api-core: only used for Google LLM APIs
+# pyperclip: only used for examples that use copy/paste
+# pyobjc: only used to get screen resolution on macOS
+# screeninfo: only used to get screen resolution on Linux/Windows
+# markdownify: used for page text content extraction for passing to LLM
+# openai: datalib,voice-helpers are actually NOT NEEDED but openai produces noisy errors on exit without them TODO: fix
+# rich: used for terminal formatting and styling in CLI
+# click: used for command-line argument parsing
+# textual: used for terminal UI
 
-# --- Native (platform-optimized Chromium binary) ---
+[project.optional-dependencies]
+cli = ["textual==7.4.0"]
 core = [
     "browser-use-core==0.13.2; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "browser-use-core==0.13.2; sys_platform == 'darwin' and platform_machine == 'x86_64'",
@@ -87,42 +66,26 @@ core = [
     "browser-use-core==0.13.2; sys_platform == 'linux' and platform_machine == 'aarch64'",
     "browser-use-core==0.13.2; sys_platform == 'win32' and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",
 ]
-
-# --- File processing: PDF, DOCX ---
-files = [
-    "pypdf==6.10.2",
-    "reportlab==4.4.9",
-    "python-docx==1.2.0",
-]
-
-# --- Video recording & GIF generation ---
-video = [
-    "imageio[ffmpeg]==2.37.2",
-    "numpy==2.4.1",
-]
-
-# --- Meta-package: all major LLM providers bundled ---
-llms = [
-    "browser-use[llm-openai,llm-anthropic,llm-google,llm-groq,llm-ollama]",
-]
-
-# --- Examples & eval: for development, CI, and example scripts ---
+aws = ["boto3==1.42.37"]
+oci = ["oci==2.166.0"]
+video = ["imageio[ffmpeg]==2.37.2", "numpy==2.4.1"]
 examples = [
     "agentmail==0.0.59",
+    # botocore: only needed for Bedrock Claude boto3 examples/models/bedrock_claude.py
     "botocore==1.42.37",
     "imgcat==0.6.0",
+    # "stagehand-py>=0.3.6",
+    # "browserbase>=0.4.0",
     "langchain-openai==1.1.7",
 ]
 eval = [
     "lmnr[all]==0.7.42",
+    "anyio==4.12.1",
+    "psutil==7.2.2",
     "datamodel-code-generator==0.53.0",
 ]
-
-# --- Backward-compatible aliases ---
-aws = ["browser-use[llm-aws]"]
-oci = ["browser-use[llm-oci]"]
-cli-oci = ["browser-use[cli,llm-oci]"]
-all = ["browser-use[cli,mcp,cloud,llms,files,video,examples,aws,oci]"]
+cli-oci = ["browser-use[cli,oci]"]
+all = ["browser-use[cli,examples,aws,oci]"]
 
 # will prefer to use local source code checked out in ../../browser-use (if present) instead of pypi browser-use package
 # [tool.uv.sources]
@@ -275,5 +238,8 @@ dev-dependencies = [
     "pyright==1.1.408",
     "ty==0.0.14",
     "pytest-xdist==3.8.0",
+    "lmnr[all]==0.7.42",
+    # "pytest-playwright-asyncio>=0.7.0",  # not actually needed I think
     "pytest-timeout==2.4.0",
+    "pydantic_settings==2.12.0",
 ]

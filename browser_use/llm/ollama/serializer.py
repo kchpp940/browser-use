@@ -1,14 +1,8 @@
-from __future__ import annotations
-
 import base64
 import json
 from typing import Any, overload
 
-try:
-	from ollama._types import Image, Message
-except ImportError:
-	Image = Any  # type: ignore
-	Message = Any  # type: ignore
+from ollama._types import Image, Message
 
 from browser_use.llm.messages import (
 	AssistantMessage,

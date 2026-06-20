@@ -1,42 +1,15 @@
-from __future__ import annotations
-
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
 import httpx
-
-_OPENAI_AVAILABLE = True
-_OPENAI_IMPORT_ERROR: Exception | None = None
-
-try:
-	from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
-	from openai.types.chat.chat_completion import ChatCompletion
-	from openai.types.shared_params.response_format_json_schema import (
-		JSONSchema,
-		ResponseFormatJSONSchema,
-	)
-except ImportError as _e:
-	_OPENAI_AVAILABLE = False
-	_OPENAI_IMPORT_ERROR = _e
-	APIConnectionError = Any  # type: ignore
-	APIStatusError = Any  # type: ignore
-	AsyncOpenAI = Any  # type: ignore
-	RateLimitError = Any  # type: ignore
-	ChatCompletion = Any  # type: ignore
-	JSONSchema = Any  # type: ignore
-	ResponseFormatJSONSchema = Any  # type: ignore
-
+from openai import APIConnectionError, APIStatusError, AsyncOpenAI, RateLimitError
+from openai.types.chat.chat_completion import ChatCompletion
+from openai.types.shared_params.response_format_json_schema import (
+	JSONSchema,
+	ResponseFormatJSONSchema,
+)
 from pydantic import BaseModel
-
-
-def _require_openai_sdk(provider_name: str, extra_name: str, orig_error: Exception | None) -> None:
-	if not _OPENAI_AVAILABLE:
-		msg = (
-			f'{provider_name} requires the OpenAI SDK. '
-			f'Install it with: pip install "browser-use[{extra_name}]"'
-		)
-		raise ImportError(msg) from orig_error
 
 from browser_use.llm.base import BaseChatModel
 from browser_use.llm.exceptions import ModelProviderError, ModelRateLimitError
@@ -113,7 +86,6 @@ class ChatOpenRouter(BaseChatModel):
 		Returns:
 		    AsyncOpenAI: An instance of the AsyncOpenAI client with OpenRouter base URL.
 		"""
-		_require_openai_sdk('OpenRouter', 'llm-openai', _OPENAI_IMPORT_ERROR)
 		if not hasattr(self, '_client'):
 			client_params = self._get_client_params()
 			self._client = AsyncOpenAI(**client_params)

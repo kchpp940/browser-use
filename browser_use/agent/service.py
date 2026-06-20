@@ -66,6 +66,7 @@ from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
+from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
 from browser_use.telemetry.service import ProductTelemetry
@@ -137,6 +138,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		task: str,
 		llm: BaseChatModel | None = None,
 		# Optional parameters
+		runtime_config: RuntimeConfig | ConfigResolver | None = None,
 		browser_profile: BrowserProfile | None = None,
 		browser_session: BrowserSession | None = None,
 		browser: Browser | None = None,  # Alias for browser_session

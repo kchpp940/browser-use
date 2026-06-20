@@ -14,12 +14,7 @@ Example:
     result = await my_task()
 """
 
-from browser_use.sandbox.sandbox import (
-	CLOUDPICKLE_AVAILABLE,
-	SandboxError,
-	_require_cloudpickle,
-	sandbox,
-)
+from browser_use.sandbox.sandbox import SandboxError, sandbox
 from browser_use.sandbox.views import (
 	BrowserCreatedData,
 	ErrorData,
@@ -34,9 +29,6 @@ __all__ = [
 	# Main decorator
 	'sandbox',
 	'SandboxError',
-	# Optional dep helpers
-	'CLOUDPICKLE_AVAILABLE',
-	'_require_cloudpickle',
 	# Event types
 	'SSEEvent',
 	'SSEEventType',

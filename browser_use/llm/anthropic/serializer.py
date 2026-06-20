@@ -1,26 +1,15 @@
-from __future__ import annotations
-
 import json
-from typing import Any, overload
+from typing import overload
 
-try:
-	from anthropic.types import (
-		Base64ImageSourceParam,
-		CacheControlEphemeralParam,
-		ImageBlockParam,
-		MessageParam,
-		TextBlockParam,
-		ToolUseBlockParam,
-		URLImageSourceParam,
-	)
-except ImportError:
-	Base64ImageSourceParam = Any  # type: ignore
-	CacheControlEphemeralParam = Any  # type: ignore
-	ImageBlockParam = Any  # type: ignore
-	MessageParam = Any  # type: ignore
-	TextBlockParam = Any  # type: ignore
-	ToolUseBlockParam = Any  # type: ignore
-	URLImageSourceParam = Any  # type: ignore
+from anthropic.types import (
+	Base64ImageSourceParam,
+	CacheControlEphemeralParam,
+	ImageBlockParam,
+	MessageParam,
+	TextBlockParam,
+	ToolUseBlockParam,
+	URLImageSourceParam,
+)
 
 from browser_use.llm.messages import (
 	AssistantMessage,

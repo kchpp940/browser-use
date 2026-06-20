@@ -1,0 +1,43 @@
+"""Unified runtime configuration system for browser-use.
+
+This module provides a centralized configuration system that merges configuration
+from multiple sources with a well-defined priority order:
+
+Priority (highest to lowest):
+    1. Explicit parameters (passed directly to functions)
+    2. CLI arguments
+    3. Environment variables
+    4. Configuration file (config.json)
+    5. Entry-point defaults (lowest priority)
+
+All entry points (Python API, CLI, MCP server, sandbox/cloud) should use
+ConfigResolver to read configuration, ensuring consistent defaults and
+priority across the entire codebase.
+"""
+
+from browser_use.runtime_config.models import (
+	AgentConfig,
+	BrowserConfig,
+	CloudConfig,
+	FilesystemConfig,
+	LLMConfig,
+	LoggingConfig,
+	RuntimeConfig,
+	SecurityConfig,
+	TelemetryConfig,
+)
+from browser_use.runtime_config.resolver import ConfigResolver, ConfigSource
+
+__all__ = [
+	'RuntimeConfig',
+	'ConfigResolver',
+	'ConfigSource',
+	'LLMConfig',
+	'BrowserConfig',
+	'AgentConfig',
+	'LoggingConfig',
+	'SecurityConfig',
+	'FilesystemConfig',
+	'CloudConfig',
+	'TelemetryConfig',
+]

@@ -1,31 +1,17 @@
-from __future__ import annotations
+from typing import overload
 
-from typing import Any, overload
-
-try:
-	from openai.types.chat import (
-		ChatCompletionAssistantMessageParam,
-		ChatCompletionContentPartImageParam,
-		ChatCompletionContentPartRefusalParam,
-		ChatCompletionContentPartTextParam,
-		ChatCompletionMessageFunctionToolCallParam,
-		ChatCompletionMessageParam,
-		ChatCompletionSystemMessageParam,
-		ChatCompletionUserMessageParam,
-	)
-	from openai.types.chat.chat_completion_content_part_image_param import ImageURL
-	from openai.types.chat.chat_completion_message_function_tool_call_param import Function
-except ImportError:
-	ChatCompletionAssistantMessageParam = Any  # type: ignore
-	ChatCompletionContentPartImageParam = Any  # type: ignore
-	ChatCompletionContentPartRefusalParam = Any  # type: ignore
-	ChatCompletionContentPartTextParam = Any  # type: ignore
-	ChatCompletionMessageFunctionToolCallParam = Any  # type: ignore
-	ChatCompletionMessageParam = Any  # type: ignore
-	ChatCompletionSystemMessageParam = Any  # type: ignore
-	ChatCompletionUserMessageParam = Any  # type: ignore
-	ImageURL = Any  # type: ignore
-	Function = Any  # type: ignore
+from openai.types.chat import (
+	ChatCompletionAssistantMessageParam,
+	ChatCompletionContentPartImageParam,
+	ChatCompletionContentPartRefusalParam,
+	ChatCompletionContentPartTextParam,
+	ChatCompletionMessageFunctionToolCallParam,
+	ChatCompletionMessageParam,
+	ChatCompletionSystemMessageParam,
+	ChatCompletionUserMessageParam,
+)
+from openai.types.chat.chat_completion_content_part_image_param import ImageURL
+from openai.types.chat.chat_completion_message_function_tool_call_param import Function
 
 from browser_use.llm.messages import (
 	AssistantMessage,

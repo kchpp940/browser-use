@@ -1,55 +1,21 @@
-from __future__ import annotations
-
 import logging
 from dataclasses import dataclass
 from typing import Any, Literal, TypeVar, overload
 
-try:
-	from groq import (
-		APIError,
-		APIResponseValidationError,
-		APIStatusError,
-		AsyncGroq,
-		NotGiven,
-		RateLimitError,
-		Timeout,
-	)
-	from groq.types.chat import ChatCompletion, ChatCompletionToolChoiceOptionParam, ChatCompletionToolParam
-	from groq.types.chat.completion_create_params import (
-		ResponseFormatResponseFormatJsonSchema,
-		ResponseFormatResponseFormatJsonSchemaJsonSchema,
-	)
-	_GROQ_AVAILABLE = True
-	_GROQ_IMPORT_ERROR = None
-except ImportError as _e:
-	_GROQ_AVAILABLE = False
-	_GROQ_IMPORT_ERROR = _e
-	APIError = Any  # type: ignore
-	APIResponseValidationError = Any  # type: ignore
-	APIStatusError = Any  # type: ignore
-	AsyncGroq = Any  # type: ignore
-	class _Sentinel:
-		pass
-	_NOT_GIVEN = _Sentinel()
-	def _sentinel_factory():
-		return _NOT_GIVEN
-	NotGiven = _sentinel_factory
-	RateLimitError = Any  # type: ignore
-	Timeout = Any  # type: ignore
-	ChatCompletion = Any  # type: ignore
-	ChatCompletionToolChoiceOptionParam = Any  # type: ignore
-	ChatCompletionToolParam = Any  # type: ignore
-	ResponseFormatResponseFormatJsonSchema = Any  # type: ignore
-	ResponseFormatResponseFormatJsonSchemaJsonSchema = Any  # type: ignore
-
-
-def _require_groq_sdk(orig_error=None):
-	if not _GROQ_AVAILABLE:
-		raise ImportError(
-			'The Groq provider SDK is not available. Install with: pip install "browser-use[llm-groq]"'
-		) from (orig_error or _GROQ_IMPORT_ERROR)
-
-
+from groq import (
+	APIError,
+	APIResponseValidationError,
+	APIStatusError,
+	AsyncGroq,
+	NotGiven,
+	RateLimitError,
+	Timeout,
+)
+from groq.types.chat import ChatCompletion, ChatCompletionToolChoiceOptionParam, ChatCompletionToolParam
+from groq.types.chat.completion_create_params import (
+	ResponseFormatResponseFormatJsonSchema,
+	ResponseFormatResponseFormatJsonSchemaJsonSchema,
+)
 from httpx import URL
 from pydantic import BaseModel
 
@@ -108,7 +74,6 @@ class ChatGroq(BaseChatModel):
 	max_retries: int = 10  # Increase default retries for automation reliability
 
 	def get_client(self) -> AsyncGroq:
-		_require_groq_sdk()
 		return AsyncGroq(api_key=self.api_key, base_url=self.base_url, timeout=self.timeout, max_retries=self.max_retries)
 
 	@property

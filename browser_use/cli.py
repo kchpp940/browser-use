@@ -148,6 +148,10 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from browser_use.llm.anthropic.chat import ChatAnthropic
+from browser_use.llm.google.chat import ChatGoogle
+from browser_use.llm.openai.chat import ChatOpenAI
+
 load_dotenv()
 
 from browser_use import Agent, Controller
@@ -361,22 +365,16 @@ def get_llm(config: dict[str, Any]):
 			if not api_key and not CONFIG.OPENAI_API_KEY:
 				print('⚠️  OpenAI API key not found. Please update your config or set OPENAI_API_KEY environment variable.')
 				sys.exit(1)
-			from browser_use.llm.openai.chat import ChatOpenAI
-
 			return ChatOpenAI(model=model_name, temperature=temperature, api_key=api_key or CONFIG.OPENAI_API_KEY)
 		elif model_name.startswith('claude'):
 			if not CONFIG.ANTHROPIC_API_KEY:
 				print('⚠️  Anthropic API key not found. Please update your config or set ANTHROPIC_API_KEY environment variable.')
 				sys.exit(1)
-			from browser_use.llm.anthropic.chat import ChatAnthropic
-
 			return ChatAnthropic(model=model_name, temperature=temperature)
 		elif model_name.startswith('gemini'):
 			if not CONFIG.GOOGLE_API_KEY:
 				print('⚠️  Google API key not found. Please update your config or set GOOGLE_API_KEY environment variable.')
 				sys.exit(1)
-			from browser_use.llm.google.chat import ChatGoogle
-
 			return ChatGoogle(model=model_name, temperature=temperature)
 		elif model_name.startswith('oci'):
 			# OCI models require additional configuration
@@ -387,16 +385,10 @@ def get_llm(config: dict[str, Any]):
 
 	# Auto-detect based on available API keys
 	if api_key or CONFIG.OPENAI_API_KEY:
-		from browser_use.llm.openai.chat import ChatOpenAI
-
 		return ChatOpenAI(model='gpt-5-mini', temperature=temperature, api_key=api_key or CONFIG.OPENAI_API_KEY)
 	elif CONFIG.ANTHROPIC_API_KEY:
-		from browser_use.llm.anthropic.chat import ChatAnthropic
-
 		return ChatAnthropic(model='claude-4-sonnet', temperature=temperature)
 	elif CONFIG.GOOGLE_API_KEY:
-		from browser_use.llm.google.chat import ChatGoogle
-
 		return ChatGoogle(model='gemini-2.5-pro', temperature=temperature)
 	else:
 		print(

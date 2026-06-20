@@ -21,7 +21,6 @@ Example usage:
 
     # Now use with Agent as normal - MCP tools are available as actions
 """
-from __future__ import annotations
 
 import asyncio
 import logging
@@ -38,32 +37,11 @@ from browser_use.utils import create_task_with_error_handling, get_browser_use_v
 
 logger = logging.getLogger(__name__)
 
-# --- Optional MCP SDK import ---
-try:
-	from mcp import ClientSession, StdioServerParameters, types
-	from mcp.client.stdio import stdio_client
+# Import MCP SDK
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
 
-	MCP_AVAILABLE = True
-except ImportError as _e:
-	ClientSession = None  # type: ignore
-	StdioServerParameters = None  # type: ignore
-	types = None  # type: ignore
-	stdio_client = None  # type: ignore
-	MCP_AVAILABLE = False
-	_MCP_MISSING = _e
-
-
-def _require_mcp():
-	"""Raise a friendly ImportError if mcp SDK (browser-use[mcp]) is not installed."""
-	if not MCP_AVAILABLE:
-		msg = (
-			'MCP (Model Context Protocol) support is not available. '
-			'Install the required dependencies with: `pip install "browser-use[mcp]"` '
-			'or `uv pip install "browser-use[mcp]"`.'
-		)
-		if _MCP_MISSING is not None:
-			msg += f'\nOriginal error: {_MCP_MISSING}'
-		raise ImportError(msg)
+MCP_AVAILABLE = True
 
 
 class MCPClient:
@@ -79,13 +57,11 @@ class MCPClient:
 		"""Initialize MCP client.
 
 		Args:
-		    server_name: Name of the MCP server (for logging and identification)
-		    command: Command to start the MCP server (e.g., "npx", "python")
-		    args: Arguments for the command (e.g., ["@playwright/mcp@latest"])
-		    env: Environment variables for the server process
+			server_name: Name of the MCP server (for logging and identification)
+			command: Command to start the MCP server (e.g., "npx", "python")
+			args: Arguments for the command (e.g., ["@playwright/mcp@latest"])
+			env: Environment variables for the server process
 		"""
-		_require_mcp()
-
 		self.server_name = server_name
 		self.command = command
 		self.args = args or []

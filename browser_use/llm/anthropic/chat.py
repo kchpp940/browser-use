@@ -1,56 +1,21 @@
-from __future__ import annotations
-
 import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, TypeVar, overload
 
 import httpx
-
-try:
-	from anthropic import (
-		APIConnectionError,
-		APIStatusError,
-		AsyncAnthropic,
-		NotGiven,
-		RateLimitError,
-		omit,
-	)
-	from anthropic.types import CacheControlEphemeralParam, Message, ToolParam
-	from anthropic.types.model_param import ModelParam
-	from anthropic.types.text_block import TextBlock
-	from anthropic.types.tool_choice_tool_param import ToolChoiceToolParam
-	_ANTHROPIC_AVAILABLE = True
-	_ANTHROPIC_IMPORT_ERROR = None
-except ImportError as _e:
-	_ANTHROPIC_AVAILABLE = False
-	_ANTHROPIC_IMPORT_ERROR = _e
-	APIConnectionError = Any  # type: ignore
-	APIStatusError = Any  # type: ignore
-	AsyncAnthropic = Any  # type: ignore
-	class _Sentinel:
-		pass
-	_NOT_GIVEN = _Sentinel()
-	def _sentinel_factory():
-		return _NOT_GIVEN
-	NotGiven = _sentinel_factory
-	omit = _sentinel_factory
-	RateLimitError = Any  # type: ignore
-	CacheControlEphemeralParam = Any  # type: ignore
-	Message = Any  # type: ignore
-	ToolParam = Any  # type: ignore
-	ModelParam = Any  # type: ignore
-	TextBlock = Any  # type: ignore
-	ToolChoiceToolParam = Any  # type: ignore
-
-
-def _require_anthropic_sdk(orig_error=None):
-	if not _ANTHROPIC_AVAILABLE:
-		raise ImportError(
-			'The Anthropic Claude provider SDK is not available. Install with: pip install "browser-use[llm-anthropic]"'
-		) from (orig_error or _ANTHROPIC_IMPORT_ERROR)
-
-
+from anthropic import (
+	APIConnectionError,
+	APIStatusError,
+	AsyncAnthropic,
+	NotGiven,
+	RateLimitError,
+	omit,
+)
+from anthropic.types import CacheControlEphemeralParam, Message, ToolParam
+from anthropic.types.model_param import ModelParam
+from anthropic.types.text_block import TextBlock
+from anthropic.types.tool_choice_tool_param import ToolChoiceToolParam
 from httpx import Timeout
 from pydantic import BaseModel
 
@@ -205,7 +170,6 @@ class ChatAnthropic(BaseChatModel):
 		Returns:
 			AsyncAnthropic: An instance of the AsyncAnthropic client.
 		"""
-		_require_anthropic_sdk()
 		client_params = self._get_client_params()
 		return AsyncAnthropic(**client_params)
 

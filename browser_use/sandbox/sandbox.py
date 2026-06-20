@@ -12,28 +12,8 @@ from collections.abc import Callable, Coroutine
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, Union, cast, get_args, get_origin
 
+import cloudpickle
 import httpx
-
-try:
-	import cloudpickle
-
-	CLOUDPICKLE_AVAILABLE = True
-except ImportError as _e:
-	cloudpickle = None  # type: ignore
-	CLOUDPICKLE_AVAILABLE = False
-	_CLOUDPICKLE_MISSING = _e
-
-
-def _require_cloudpickle():
-	"""Raise a friendly ImportError if cloudpickle (browser-use[cloud]) is not installed."""
-	if not CLOUDPICKLE_AVAILABLE:
-		msg = (
-			'The `@sandbox` decorator requires the `cloud` extra dependencies. '
-			'Install them with: `pip install "browser-use[cloud]"` or `uv pip install "browser-use[cloud]"`.'
-		)
-		if _CLOUDPICKLE_MISSING is not None:
-			msg += f'\nOriginal error: {_CLOUDPICKLE_MISSING}'
-		raise ImportError(msg)
 
 from browser_use.sandbox.views import (
 	BrowserCreatedData,
@@ -304,9 +284,6 @@ def sandbox(
 
 		@wraps(func)
 		async def wrapper(*args, **kwargs) -> T:
-			# 0. Ensure cloudpickle (sandbox/cloud dep) is available
-			_require_cloudpickle()
-
 			# 1. Get API key
 			api_key = BROWSER_USE_API_KEY or os.getenv('BROWSER_USE_API_KEY')
 			if not api_key:

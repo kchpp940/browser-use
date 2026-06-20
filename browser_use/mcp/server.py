@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-# ChatAWSBedrock and ChatOpenAI are imported lazily via browser_use.llm when needed
+from browser_use.llm import ChatAWSBedrock
 
 # Configure logging for MCP mode - redirect to stderr but preserve critical diagnostics
 logging.basicConfig(
@@ -90,16 +90,12 @@ _configure_mcp_server_logging()
 logging.disable(logging.CRITICAL)
 
 # Import browser_use modules
-from typing import TYPE_CHECKING
-
 from browser_use import ActionModel, Agent
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
+from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.tools.service import Tools
-
-if TYPE_CHECKING:
-	from browser_use.llm.openai.chat import ChatOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -149,12 +145,8 @@ try:
 	mcp_logger.setLevel(logging.ERROR)
 	mcp_logger.propagate = False
 except ImportError:
-	print(
-		'ERROR: MCP (Model Context Protocol) support is not available.\n'
-		'Install the required dependencies with: `pip install "browser-use[mcp]"` '
-		'or `uv pip install "browser-use[mcp]"`.',
-		file=sys.stderr,
-	)
+	MCP_AVAILABLE = False
+	logger.error('MCP SDK not installed. Install with: pip install mcp')
 	sys.exit(1)
 
 from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
@@ -623,8 +615,6 @@ class BrowserUseServer:
 		self.tools = Tools()
 
 		# Initialize LLM from config
-		from browser_use.llm.openai.chat import ChatOpenAI
-
 		llm_config = get_default_llm(self.config)
 		base_url = llm_config.get('base_url', None)
 		kwargs = {}
@@ -663,8 +653,6 @@ class BrowserUseServer:
 
 		# Get Bedrock-specific config
 		if model_provider and model_provider.lower() == 'bedrock':
-			from browser_use.llm import ChatAWSBedrock
-
 			llm_model = llm_config.get('model') or os.getenv('MODEL') or 'us.anthropic.claude-sonnet-4-20250514-v1:0'
 			aws_region = llm_config.get('region') or os.getenv('REGION')
 			if not aws_region:
@@ -676,8 +664,6 @@ class BrowserUseServer:
 				aws_sso_auth=aws_sso_auth,
 			)
 		else:
-			from browser_use.llm.openai.chat import ChatOpenAI
-
 			api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
 			if not api_key:
 				return 'Error: OPENAI_API_KEY not set in config or environment'
