@@ -92,7 +92,7 @@ logging.disable(logging.CRITICAL)
 # Import browser_use modules
 from browser_use import ActionModel, Agent
 from browser_use.browser import BrowserProfile, BrowserSession
-from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
+from browser_use.config import load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.runtime_config import ConfigResolver, RuntimeConfig
@@ -598,7 +598,6 @@ class BrowserUseServer:
 
 		# ===== Build unified ConfigResolver for MCP server =====
 		resolver = ConfigResolver()
-		# Add MCP-specific defaults (lower priority than env/file)
 		resolver.add_defaults(
 			{
 				'browser_downloads_path': str(Path.home() / 'Downloads' / 'browser-use-mcp'),
@@ -611,14 +610,8 @@ class BrowserUseServer:
 			},
 			flat=True,
 		)
-		# Get legacy config and add as explicit overrides for backward compat
-		legacy_profile_config = get_default_profile(self.config)
-		if legacy_profile_config:
-			resolver.add_explicit({'browser': legacy_profile_config})
-		# Tool parameter overrides (highest priority)
 		if allowed_domains is not None:
 			resolver.add_explicit({'browser_allowed_domains': allowed_domains}, flat=True)
-		# Any additional kwargs that are valid BrowserProfile fields
 		if kwargs:
 			resolver.add_explicit({'browser': kwargs})
 		mcp_runtime_config = resolver.resolve()
@@ -637,14 +630,10 @@ class BrowserUseServer:
 		# Create tools for direct actions
 		self.tools = Tools()
 
-		# Initialize LLM from unified runtime_config
-		# Fall back to legacy config for backward compatibility
-		llm_config = get_default_llm(self.config)
-		# Use unified config values first, fall back to legacy
-		model_name = mcp_runtime_config.llm.model or llm_config.get('model', 'gpt-o4-mini')
-		api_key = mcp_runtime_config.llm.openai_api_key or llm_config.get('api_key')
-		temperature = llm_config.get('temperature', 0.7)
-		base_url = llm_config.get('base_url', None)
+		model_name = mcp_runtime_config.llm.model or 'gpt-o4-mini'
+		api_key = mcp_runtime_config.llm.openai_api_key or mcp_runtime_config.llm.api_key
+		temperature = mcp_runtime_config.llm.temperature if mcp_runtime_config.llm.temperature is not None else 0.7
+		base_url = mcp_runtime_config.llm.api_base
 
 		llm_kwargs = {}
 		if base_url:
@@ -658,11 +647,7 @@ class BrowserUseServer:
 				**llm_kwargs,
 			)
 
-		# Initialize FileSystem for extraction actions - from unified config or legacy
-		file_system_path = (
-			mcp_runtime_config.filesystem.file_system_path
-			or legacy_profile_config.get('file_system_path', '~/.browser-use-mcp')
-		)
+		file_system_path = mcp_runtime_config.filesystem.file_system_path or '~/.browser-use-mcp'
 		self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())
 
 		logger.debug('Browser session initialized')
@@ -680,14 +665,7 @@ class BrowserUseServer:
 
 		# ===== Build unified ConfigResolver for this agent call =====
 		resolver = ConfigResolver()
-		# MCP defaults (lowest priority)
 		resolver.add_defaults({'agent_max_steps': 100}, flat=True)
-		# Add legacy config for backward compat
-		legacy_llm_config = get_default_llm(self.config)
-		legacy_profile_config = get_default_profile(self.config)
-		if legacy_profile_config:
-			resolver.add_explicit({'browser': legacy_profile_config})
-		# Tool call parameter overrides (highest priority)
 		if model:
 			resolver.add_explicit({'llm_model': model}, flat=True)
 		if max_steps != 100:
@@ -696,34 +674,32 @@ class BrowserUseServer:
 			resolver.add_explicit({'browser_allowed_domains': allowed_domains}, flat=True)
 		agent_runtime_config = resolver.resolve()
 
-		# Get LLM provider
-		model_provider = legacy_llm_config.get('model_provider') or os.getenv('MODEL_PROVIDER')
+		model_provider = agent_runtime_config.llm.provider or os.getenv('MODEL_PROVIDER')
 
-		# Get Bedrock-specific config
 		if model_provider and model_provider.lower() == 'bedrock':
 			llm_model = agent_runtime_config.llm.model or os.getenv('MODEL') or 'us.anthropic.claude-sonnet-4-20250514-v1:0'
-			aws_region = legacy_llm_config.get('region') or os.getenv('REGION') or 'us-east-1'
-			aws_sso_auth = legacy_llm_config.get('aws_sso_auth', False)
+			aws_region = agent_runtime_config.llm.region or os.getenv('REGION') or 'us-east-1'
+			aws_sso_auth = agent_runtime_config.llm.aws_sso_auth
 			llm = ChatAWSBedrock(
 				model=llm_model,
 				aws_region=aws_region,
 				aws_sso_auth=aws_sso_auth,
 			)
 		else:
-			api_key = agent_runtime_config.llm.openai_api_key or legacy_llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
+			api_key = agent_runtime_config.llm.openai_api_key or agent_runtime_config.llm.api_key or os.getenv('OPENAI_API_KEY')
 			if not api_key:
 				return 'Error: BROWSER_USE_OPENAI_API_KEY or OPENAI_API_KEY not set in config or environment'
 
 			llm_model = agent_runtime_config.llm.model or 'gpt-4o'
 
-			base_url = legacy_llm_config.get('base_url', None)
+			base_url = agent_runtime_config.llm.api_base
 			llm_kwargs = {}
 			if base_url:
 				llm_kwargs['base_url'] = base_url
 			llm = ChatOpenAI(
 				model=llm_model,
 				api_key=api_key,
-				temperature=legacy_llm_config.get('temperature', 0.7),
+				temperature=agent_runtime_config.llm.temperature if agent_runtime_config.llm.temperature is not None else 0.7,
 				**llm_kwargs,
 			)
 

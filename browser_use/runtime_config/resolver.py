@@ -157,6 +157,8 @@ class EnvConfigSource(ConfigSource):
 		'NOVITA_API_KEY': ('llm', 'novita_api_key'),
 		'AZURE_OPENAI_ENDPOINT': ('llm', 'azure_endpoint'),
 		'AZURE_OPENAI_KEY': ('llm', 'azure_api_key'),
+		'LLM_REGION': ('llm', 'region'),
+		'LLM_AWS_SSO_AUTH': ('llm', 'aws_sso_auth'),
 		# Browser - general
 		'HEADLESS': ('browser', 'headless'),
 		'WINDOW_WIDTH': ('browser', 'window_width'),
@@ -554,6 +556,9 @@ class FileConfigSource(ConfigSource):
 			'temperature': 'temperature',
 			'max_tokens': 'max_tokens',
 			'provider': 'provider',
+			'base_url': 'api_base',
+			'region': 'region',
+			'aws_sso_auth': 'aws_sso_auth',
 		}
 
 		for src_key, dst_key in field_mapping.items():

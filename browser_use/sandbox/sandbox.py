@@ -274,14 +274,31 @@ def sandbox(
 	def decorator(
 		func: Callable[Concatenate['BrowserSession', P], Coroutine[Any, Any, T]],
 	) -> Callable[P, Coroutine[Any, Any, T]]:
-		# Resolve runtime configuration
-		if runtime_config is None:
-			resolver = ConfigResolver()
-			_resolved_config: RuntimeConfig = resolver.resolve()
-		elif isinstance(runtime_config, ConfigResolver):
-			_resolved_config = runtime_config.resolve()
-		else:
-			_resolved_config = runtime_config
+		# Resolve runtime configuration — decorator params become explicit overrides
+		_resolver: ConfigResolver = ConfigResolver()
+		# Add decorator params as explicit (priority 100) if they are not default values
+		explicit_overrides: dict[str, Any] = {}
+		if BROWSER_USE_API_KEY:
+			explicit_overrides['cloud_api_key'] = BROWSER_USE_API_KEY
+		if cloud_profile_id:
+			explicit_overrides['browser_cloud_profile_id'] = cloud_profile_id
+		if cloud_proxy_country_code:
+			explicit_overrides['browser_cloud_proxy_country_code'] = cloud_proxy_country_code
+		if cloud_timeout:
+			explicit_overrides['browser_cloud_timeout'] = cloud_timeout
+		if server_url:
+			explicit_overrides['cloud_api_url'] = server_url
+		if log_level != 'INFO':
+			explicit_overrides['logging_level'] = log_level.lower()
+		if explicit_overrides:
+			_resolver.add_explicit(explicit_overrides, flat=True)
+		# Merge with user-provided runtime_config if any
+		if isinstance(runtime_config, ConfigResolver):
+			for source in runtime_config._sources:
+				_resolver.add_source(source)
+		elif isinstance(runtime_config, RuntimeConfig):
+			_resolver.add_explicit(runtime_config.model_dump(exclude_none=True))
+		_resolved_config: RuntimeConfig = _resolver.resolve()
 
 		# Validate function has browser parameter
 		sig = inspect.signature(func)
@@ -296,24 +313,21 @@ def sandbox(
 
 		@wraps(func)
 		async def wrapper(*args, **kwargs) -> T:
-			# 1. Get API key - from explicit param, runtime_config, or env var
-			api_key = BROWSER_USE_API_KEY or _resolved_config.cloud.api_key or os.getenv('BROWSER_USE_API_KEY')
+			# 1. Get API key from resolved config chain
+			api_key = _resolved_config.cloud.api_key or os.getenv('BROWSER_USE_API_KEY')
 			if not api_key:
 				raise SandboxError('BROWSER_USE_API_KEY is required')
 
-			# 2. Resolve cloud parameters with runtime_config fallback (highest priority first)
-			_resolved_cloud_profile_id = cloud_profile_id or _resolved_config.browser.cloud_profile_id
-			_resolved_cloud_proxy = cloud_proxy_country_code or _resolved_config.browser.cloud_proxy_country_code
-			_resolved_cloud_timeout = cloud_timeout or _resolved_config.browser.cloud_timeout
+			# 2. Cloud parameters all come from resolved config (decorator params already at priority 100)
+			_resolved_cloud_profile_id = _resolved_config.browser.cloud_profile_id
+			_resolved_cloud_proxy = _resolved_config.browser.cloud_proxy_country_code
+			_resolved_cloud_timeout = _resolved_config.browser.cloud_timeout
 
-			# 3. Resolve logging level from runtime_config
-			_resolved_log_level = log_level
-			if _resolved_log_level == 'INFO':  # Only use runtime_config if not explicitly set
-				if _resolved_config.logging.level:
-					_resolved_log_level = _resolved_config.logging.level.upper()
+			# 3. Logging level from resolved config
+			_resolved_log_level = _resolved_config.logging.level.upper()
 
-			# 4. Resolve server URL from runtime_config
-			_resolved_server_url = server_url or _resolved_config.cloud.api_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
+			# 4. Server URL from resolved config
+			_resolved_server_url = _resolved_config.cloud.api_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
 
 			# 5. Extract all parameters (explicit + closure)
 			all_params = _extract_all_params(func, args, kwargs)

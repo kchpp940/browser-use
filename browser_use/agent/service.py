@@ -64,7 +64,6 @@ from browser_use.agent.views import (
 from browser_use.browser.events import _get_timeout
 from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
-from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
@@ -233,9 +232,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			if width < 100 or height < 100:
 				raise ValueError('llm_screenshot_size dimensions must be at least 100 pixels')
 			self.logger.info(f'🖼️  LLM screenshot resizing enabled: {width}x{height}')
-		# Resolve LLM: try runtime_config first, then legacy CONFIG fallback
 		if llm is None:
-			# Check if runtime_config has a default LLM model specified
 			if self.runtime_config.llm.model:
 				from browser_use.llm.models import get_llm_by_name
 
@@ -244,18 +241,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				except Exception:
 					pass
 
-			# Fall back to legacy CONFIG
+			if llm is None and self.runtime_config.llm.default_llm:
+				from browser_use.llm.models import get_llm_by_name
+
+				llm = get_llm_by_name(self.runtime_config.llm.default_llm)
+
 			if llm is None:
-				default_llm_name = CONFIG.DEFAULT_LLM
-				if default_llm_name:
-					from browser_use.llm.models import get_llm_by_name
+				from browser_use import ChatBrowserUse
 
-					llm = get_llm_by_name(default_llm_name)
-				else:
-					# No default LLM specified, use the original default
-					from browser_use import ChatBrowserUse
-
-					llm = ChatBrowserUse()
+				llm = ChatBrowserUse()
 
 		# set flashmode = True if llm is ChatBrowserUse
 		if llm.provider == 'browser-use':
@@ -2110,7 +2104,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.logger.debug(f'🤖 Browser-Use Library Version {self.version} ({self.source})')
 
 		# Check for latest version and log upgrade message if needed
-		if CONFIG.BROWSER_USE_VERSION_CHECK:
+		if self.runtime_config.telemetry.version_check:
 			latest_version = await check_latest_browser_use_version()
 			if latest_version and latest_version != self.version:
 				self.logger.info(
@@ -4022,7 +4016,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		"""
 
 		# Skip verification if already done
-		if getattr(self.llm, '_verified_api_keys', None) is True or CONFIG.SKIP_LLM_API_KEY_VERIFICATION:
+		if getattr(self.llm, '_verified_api_keys', None) is True or self.runtime_config.llm.skip_api_key_verification:
 			setattr(self.llm, '_verified_api_keys', True)
 			return True
 

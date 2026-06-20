@@ -104,6 +104,9 @@ class LLMConfig(BaseModel):
 	azure_endpoint: str = Field(default='', description='Azure OpenAI endpoint')
 	azure_api_key: str = Field(default='', description='Azure OpenAI API key')
 
+	region: str | None = Field(default=None, description='AWS region for Bedrock')
+	aws_sso_auth: bool = Field(default=False, description='Use AWS SSO auth for Bedrock')
+
 	@property
 	def resolved_api_key(self) -> str | None:
 		"""Get the resolved API key based on provider or fallback."""

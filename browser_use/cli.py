@@ -234,38 +234,34 @@ TEXTUAL_BORDER_STYLES = {'logo': 'blue', 'info': 'blue', 'input': 'orange3', 'wo
 
 
 def get_default_config() -> dict[str, Any]:
-	"""Return default configuration dictionary using the new config system."""
-	# Load config from the new config system
-	config_data = CONFIG.load_config()
-
-	# Extract browser profile, llm, and agent configs
-	browser_profile = config_data.get('browser_profile', {})
-	llm_config = config_data.get('llm', {})
-	agent_config = config_data.get('agent', {})
+	"""Return default configuration dictionary using ConfigResolver."""
+	resolver = ConfigResolver()
+	resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
+	runtime_config = resolver.resolve()
 
 	return {
 		'model': {
-			'name': llm_config.get('model'),
-			'temperature': llm_config.get('temperature', 0.0),
+			'name': runtime_config.llm.model,
+			'temperature': runtime_config.llm.temperature if runtime_config.llm.temperature is not None else 0.0,
 			'api_keys': {
-				'OPENAI_API_KEY': llm_config.get('api_key', CONFIG.OPENAI_API_KEY),
-				'ANTHROPIC_API_KEY': CONFIG.ANTHROPIC_API_KEY,
-				'GOOGLE_API_KEY': CONFIG.GOOGLE_API_KEY,
-				'DEEPSEEK_API_KEY': CONFIG.DEEPSEEK_API_KEY,
-				'GROK_API_KEY': CONFIG.GROK_API_KEY,
+				'OPENAI_API_KEY': runtime_config.llm.openai_api_key or CONFIG.OPENAI_API_KEY,
+				'ANTHROPIC_API_KEY': runtime_config.llm.anthropic_api_key or CONFIG.ANTHROPIC_API_KEY,
+				'GOOGLE_API_KEY': runtime_config.llm.google_api_key or CONFIG.GOOGLE_API_KEY,
+				'DEEPSEEK_API_KEY': runtime_config.llm.deepseek_api_key or CONFIG.DEEPSEEK_API_KEY,
+				'GROK_API_KEY': runtime_config.llm.grok_api_key or CONFIG.GROK_API_KEY,
 			},
 		},
-		'agent': agent_config,
+		'agent': runtime_config.agent.model_dump(exclude_defaults=True),
 		'browser': {
-			'headless': browser_profile.get('headless', True),
-			'keep_alive': browser_profile.get('keep_alive', True),
-			'ignore_https_errors': browser_profile.get('ignore_https_errors', False),
-			'user_data_dir': browser_profile.get('user_data_dir'),
-			'allowed_domains': browser_profile.get('allowed_domains'),
-			'wait_between_actions': browser_profile.get('wait_between_actions'),
-			'is_mobile': browser_profile.get('is_mobile'),
-			'device_scale_factor': browser_profile.get('device_scale_factor'),
-			'disable_security': browser_profile.get('disable_security'),
+			'headless': runtime_config.browser.headless,
+			'keep_alive': runtime_config.browser.keep_alive,
+			'ignore_https_errors': runtime_config.browser.disable_security,
+			'user_data_dir': runtime_config.browser.user_data_dir,
+			'allowed_domains': runtime_config.browser.allowed_domains,
+			'wait_between_actions': runtime_config.browser.wait_between_actions,
+			'is_mobile': None,
+			'device_scale_factor': None,
+			'disable_security': runtime_config.browser.disable_security,
 		},
 		'command_history': [],
 	}
@@ -396,7 +392,8 @@ def setup_readline_history(history: list[str]) -> None:
 def get_llm(config: dict[str, Any]):
 	"""Get the language model based on config and available API keys.
 
-	Kept for backward compatibility. Prefer get_llm_from_runtime_config().
+	.. deprecated::
+		Kept for backward compatibility only. Prefer get_llm_from_runtime_config().
 	"""
 	model_config = config.get('model', {})
 	model_name = model_config.get('name')
@@ -1719,18 +1716,7 @@ async def textual_interface(config: dict[str, Any]):
 
 	logger.debug('Setting up Browser, Controller, and LLM...')
 
-	# ===== Use unified ConfigResolver instead of legacy config dict =====
-	# The config dict contains old-style config; extract runtime_config from it
-	# For the TUI path, the main entry point already resolved the config via
-	# ConfigResolver; we use that config dict for backward compat but also
-	# build a fresh ConfigResolver to ensure env vars / file are respected.
 	resolver = ConfigResolver()
-	# Add legacy config dict as explicit overrides (highest priority for the TUI)
-	if 'browser' in config:
-		resolver.add_explicit({'browser': config['browser']})
-	if 'model' in config and config['model'].get('name'):
-		resolver.add_explicit({'llm_model': config['model']['name']}, flat=True)
-	# Add CLI-specific default: user_data_dir
 	resolver.add_defaults({'browser_user_data_dir': str(USER_DATA_DIR)}, flat=True)
 	runtime_config = resolver.resolve()
 
@@ -2207,35 +2193,19 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 		print(f'Error building configuration: {str(e)}')
 		sys.exit(1)
 
-	# Load user configuration (legacy path, for command history only)
-	logger.debug('Loading user configuration (legacy)...')
+	# Load command history (legacy config dict is only used for command_history now)
+	logger.debug('Loading command history...')
+	command_history: list[str] = []
 	try:
-		config = load_user_config()
-		logger.debug(f'User configuration loaded from {CONFIG.BROWSER_USE_CONFIG_FILE}')
+		history_file = CONFIG.BROWSER_USE_CONFIG_DIR / 'command_history.json'
+		if history_file.exists():
+			with open(history_file) as f:
+				command_history = json.load(f)
+		logger.debug('Command history loaded')
 	except Exception as e:
-		logger.error(f'Error loading user configuration: {str(e)}', exc_info=True)
-		print(f'Error loading configuration: {str(e)}')
-		sys.exit(1)
+		logger.error(f'Error loading command history: {str(e)}', exc_info=True)
 
-	# Update config with command-line arguments (for backward compat of legacy config dict)
-	logger.debug('Updating legacy configuration with command line arguments...')
-	try:
-		config = update_config_with_click_args(config, ctx)
-		logger.debug('Legacy configuration updated')
-	except Exception as e:
-		logger.error(f'Error updating legacy config with command line args: {str(e)}', exc_info=True)
-		print(f'Error updating configuration: {str(e)}')
-		sys.exit(1)
-
-	# Save updated config (command history only)
-	logger.debug('Saving user configuration (command history)...')
-	try:
-		save_user_config(config)
-		logger.debug('Configuration saved')
-	except Exception as e:
-		logger.error(f'Error saving user configuration: {str(e)}', exc_info=True)
-		print(f'Error saving configuration: {str(e)}')
-		sys.exit(1)
+	config: dict[str, Any] = {'command_history': command_history}
 
 	# Setup handlers for console output before entering Textual UI
 	logger.debug('Setting up handlers for Textual UI...')
