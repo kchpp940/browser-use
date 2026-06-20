@@ -539,7 +539,7 @@ async def run(browser):
 
 			callbacks = LifecycleCallbacks(on_error=_convert_and_handle_error)
 
-			stream_result: TaskResult = await controller._run_with_lifecycle(
+			stream_result: TaskResult = await controller.run_with_lifecycle(
 				_execute_sandbox_stream(),
 				timeout=None,  # httpx already has 1800s timeout
 				task_name=f'sandbox_execution_{func.__name__}',
