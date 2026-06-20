@@ -5,7 +5,17 @@ This module handles the conversion between browser-use message formats
 and the OCI Raw API message format using proper OCI SDK models.
 """
 
-from oci.generative_ai_inference.models import ImageContent, ImageUrl, Message, TextContent
+from __future__ import annotations
+
+from typing import Any
+
+try:
+	from oci.generative_ai_inference.models import ImageContent, ImageUrl, Message, TextContent
+except ImportError:
+	ImageContent = Any  # type: ignore
+	ImageUrl = Any  # type: ignore
+	Message = Any  # type: ignore
+	TextContent = Any  # type: ignore
 
 from browser_use.llm.messages import (
 	AssistantMessage,

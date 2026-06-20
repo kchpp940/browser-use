@@ -1,9 +1,15 @@
+from __future__ import annotations
+
 import json
 import logging
 import re
-from typing import TypeVar
+from typing import Any, TypeVar
 
-from groq import APIStatusError
+try:
+	from groq import APIStatusError
+except ImportError:
+	APIStatusError = Any  # type: ignore
+
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)

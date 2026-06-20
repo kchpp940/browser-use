@@ -1,16 +1,29 @@
-from typing import overload
+from __future__ import annotations
 
-from groq.types.chat import (
-	ChatCompletionAssistantMessageParam,
-	ChatCompletionContentPartImageParam,
-	ChatCompletionContentPartTextParam,
-	ChatCompletionMessageParam,
-	ChatCompletionMessageToolCallParam,
-	ChatCompletionSystemMessageParam,
-	ChatCompletionUserMessageParam,
-)
-from groq.types.chat.chat_completion_content_part_image_param import ImageURL
-from groq.types.chat.chat_completion_message_tool_call_param import Function
+from typing import Any, overload
+
+try:
+	from groq.types.chat import (
+		ChatCompletionAssistantMessageParam,
+		ChatCompletionContentPartImageParam,
+		ChatCompletionContentPartTextParam,
+		ChatCompletionMessageParam,
+		ChatCompletionMessageToolCallParam,
+		ChatCompletionSystemMessageParam,
+		ChatCompletionUserMessageParam,
+	)
+	from groq.types.chat.chat_completion_content_part_image_param import ImageURL
+	from groq.types.chat.chat_completion_message_tool_call_param import Function
+except ImportError:
+	ChatCompletionAssistantMessageParam = Any  # type: ignore
+	ChatCompletionContentPartImageParam = Any  # type: ignore
+	ChatCompletionContentPartTextParam = Any  # type: ignore
+	ChatCompletionMessageParam = Any  # type: ignore
+	ChatCompletionMessageToolCallParam = Any  # type: ignore
+	ChatCompletionSystemMessageParam = Any  # type: ignore
+	ChatCompletionUserMessageParam = Any  # type: ignore
+	ImageURL = Any  # type: ignore
+	Function = Any  # type: ignore
 
 from browser_use.llm.messages import (
 	AssistantMessage,
