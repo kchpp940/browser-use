@@ -66,9 +66,9 @@ from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
 from browser_use.config import CONFIG
 from browser_use.dom.views import DOMInteractedElement, MatchLevel
-from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
+from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 from browser_use.telemetry.service import ProductTelemetry
 from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.tools.registry.views import ActionModel

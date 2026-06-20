@@ -327,7 +327,7 @@ class RuntimeConfig(BaseModel):
 		return result
 
 	@classmethod
-	def from_flat_dict(cls, data: dict[str, Any]) -> 'RuntimeConfig':
+	def from_flat_dict(cls, data: dict[str, Any]) -> RuntimeConfig:
 		"""Create RuntimeConfig from a flat dictionary.
 
 		Keys should be in 'group_field' format (e.g., 'logging_level').

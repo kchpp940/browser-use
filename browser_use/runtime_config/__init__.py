@@ -26,7 +26,7 @@ from browser_use.runtime_config.models import (
 	SecurityConfig,
 	TelemetryConfig,
 )
-from browser_use.runtime_config.resolver import ConfigResolver, ConfigSource
+from browser_use.runtime_config.resolver import ConfigResolver, ConfigSource, get_default_resolver, get_runtime_config
 from browser_use.runtime_config.utils import (
 	browser_config_to_profile_dict,
 	create_browser_profile_from_config,
@@ -37,6 +37,8 @@ __all__ = [
 	'RuntimeConfig',
 	'ConfigResolver',
 	'ConfigSource',
+	'get_runtime_config',
+	'get_default_resolver',
 	'LLMConfig',
 	'BrowserConfig',
 	'AgentConfig',

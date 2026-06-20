@@ -95,8 +95,8 @@ from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.openai.chat import ChatOpenAI
-from browser_use.tools.service import Tools
 from browser_use.runtime_config import ConfigResolver, RuntimeConfig
+from browser_use.tools.service import Tools
 
 logger = logging.getLogger(__name__)
 

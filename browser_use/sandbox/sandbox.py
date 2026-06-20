@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, Union, c
 import cloudpickle
 import httpx
 
+from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 from browser_use.sandbox.views import (
 	BrowserCreatedData,
 	ErrorData,
@@ -24,7 +25,6 @@ from browser_use.sandbox.views import (
 	SSEEvent,
 	SSEEventType,
 )
-from browser_use.runtime_config import ConfigResolver, RuntimeConfig
 
 if TYPE_CHECKING:
 	from browser_use.browser import BrowserSession
@@ -274,6 +274,15 @@ def sandbox(
 	def decorator(
 		func: Callable[Concatenate['BrowserSession', P], Coroutine[Any, Any, T]],
 	) -> Callable[P, Coroutine[Any, Any, T]]:
+		# Resolve runtime configuration
+		if runtime_config is None:
+			resolver = ConfigResolver()
+			_resolved_config: RuntimeConfig = resolver.resolve()
+		elif isinstance(runtime_config, ConfigResolver):
+			_resolved_config = runtime_config.resolve()
+		else:
+			_resolved_config = runtime_config
+
 		# Validate function has browser parameter
 		sig = inspect.signature(func)
 		if 'browser' not in sig.parameters:
@@ -287,12 +296,17 @@ def sandbox(
 
 		@wraps(func)
 		async def wrapper(*args, **kwargs) -> T:
-			# 1. Get API key
-			api_key = BROWSER_USE_API_KEY or os.getenv('BROWSER_USE_API_KEY')
+			# 1. Get API key - from explicit param, runtime_config, or env var
+			api_key = BROWSER_USE_API_KEY or _resolved_config.cloud.api_key or os.getenv('BROWSER_USE_API_KEY')
 			if not api_key:
 				raise SandboxError('BROWSER_USE_API_KEY is required')
 
-			# 2. Extract all parameters (explicit + closure)
+			# 2. Resolve cloud parameters with runtime_config fallback
+			_resolved_cloud_profile_id = cloud_profile_id or _resolved_config.browser.cloud_profile_id
+			_resolved_cloud_proxy = cloud_proxy_country_code or _resolved_config.browser.cloud_proxy_country_code
+			_resolved_cloud_timeout = cloud_timeout or _resolved_config.browser.cloud_timeout
+
+			# 3. Extract all parameters (explicit + closure)
 			all_params = _extract_all_params(func, args, kwargs)
 
 			# 3. Get function source without decorator and only needed imports
@@ -359,12 +373,12 @@ async def run(browser):
 			payload['env'] = combined_env
 
 			# Add cloud parameters if provided
-			if cloud_profile_id is not None:
-				payload['cloud_profile_id'] = cloud_profile_id
-			if cloud_proxy_country_code is not None:
-				payload['cloud_proxy_country_code'] = cloud_proxy_country_code
-			if cloud_timeout is not None:
-				payload['cloud_timeout'] = cloud_timeout
+			if _resolved_cloud_profile_id is not None:
+				payload['cloud_profile_id'] = _resolved_cloud_profile_id
+			if _resolved_cloud_proxy is not None:
+				payload['cloud_proxy_country_code'] = _resolved_cloud_proxy
+			if _resolved_cloud_timeout is not None:
+				payload['cloud_timeout'] = _resolved_cloud_timeout
 
 			url = server_url or 'https://sandbox.api.browser-use.com/sandbox-stream'
 

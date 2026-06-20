@@ -93,8 +93,14 @@ class DictConfigSource(ConfigSource):
 		top_level: dict[str, Any] = {}
 
 		known_groups = {
-			'logging', 'telemetry', 'cloud', 'llm', 'browser',
-			'agent', 'security', 'filesystem',
+			'logging',
+			'telemetry',
+			'cloud',
+			'llm',
+			'browser',
+			'agent',
+			'security',
+			'filesystem',
 		}
 
 		for key, value in flat.items():
@@ -122,26 +128,23 @@ class EnvConfigSource(ConfigSource):
 	a standardized naming convention.
 	"""
 
-	# Mapping from env var suffixes to (group, field) tuples
-	ENV_MAPPING: dict[str, tuple[str, str]] = {
+	# Mapping from env var suffixes to (group, field) tuples or (top_level_field,) tuples
+	ENV_MAPPING: dict[str, tuple[str, ...]] = {
 		# Logging
 		'LOGGING_LEVEL': ('logging', 'level'),
 		'CDP_LOGGING_LEVEL': ('logging', 'cdp_level'),
 		'DEBUG_LOG_FILE': ('logging', 'debug_log_file'),
 		'INFO_LOG_FILE': ('logging', 'info_log_file'),
 		'SETUP_LOGGING': ('logging', 'setup_logging'),
-
 		# Telemetry
 		'ANONYMIZED_TELEMETRY': ('telemetry', 'anonymized_telemetry'),
 		'CLOUD_SYNC': ('telemetry', 'cloud_sync'),
 		'VERSION_CHECK': ('telemetry', 'version_check'),
-
 		# Cloud
 		'CLOUD_API_URL': ('cloud', 'api_url'),
 		'CLOUD_UI_URL': ('cloud', 'ui_url'),
 		'CLOUD_API_KEY': ('cloud', 'api_key'),
 		'MODEL_PRICING_URL': ('cloud', 'model_pricing_url'),
-
 		# LLM
 		'DEFAULT_LLM': ('llm', 'default_llm'),
 		'SKIP_LLM_API_KEY_VERIFICATION': ('llm', 'skip_api_key_verification'),
@@ -154,7 +157,6 @@ class EnvConfigSource(ConfigSource):
 		'NOVITA_API_KEY': ('llm', 'novita_api_key'),
 		'AZURE_OPENAI_ENDPOINT': ('llm', 'azure_endpoint'),
 		'AZURE_OPENAI_KEY': ('llm', 'azure_api_key'),
-
 		# Browser - general
 		'HEADLESS': ('browser', 'headless'),
 		'WINDOW_WIDTH': ('browser', 'window_width'),
@@ -166,18 +168,15 @@ class EnvConfigSource(ConfigSource):
 		'EXECUTABLE_PATH': ('browser', 'executable_path'),
 		'KEEP_ALIVE': ('browser', 'keep_alive'),
 		'DOWNLOADS_PATH': ('browser', 'downloads_path'),
-
 		# Browser - cloud
 		'USE_CLOUD': ('browser', 'use_cloud'),
 		'CLOUD_PROFILE_ID': ('browser', 'cloud_profile_id'),
 		'CLOUD_PROXY_COUNTRY_CODE': ('browser', 'cloud_proxy_country_code'),
 		'CLOUD_TIMEOUT': ('browser', 'cloud_timeout'),
-
 		# Browser - domains
 		'ALLOWED_DOMAINS': ('browser', 'allowed_domains'),
 		'PROHIBITED_DOMAINS': ('browser', 'prohibited_domains'),
 		'BLOCK_IP_ADDRESSES': ('browser', 'block_ip_addresses'),
-
 		# Browser - proxy
 		'PROXY_URL': ('browser', 'proxy_server'),
 		'PROXY_SERVER': ('browser', 'proxy_server'),
@@ -185,24 +184,20 @@ class EnvConfigSource(ConfigSource):
 		'PROXY_BYPASS': ('browser', 'proxy_bypass'),
 		'PROXY_USERNAME': ('browser', 'proxy_username'),
 		'PROXY_PASSWORD': ('browser', 'proxy_password'),
-
 		# Browser - features
 		'DISABLE_EXTENSIONS': ('browser', 'enable_default_extensions'),
 		'HIGHLIGHT_ELEMENTS': ('browser', 'highlight_elements'),
 		'PAINT_ORDER_FILTERING': ('browser', 'paint_order_filtering'),
 		'CROSS_ORIGIN_IFRAMES': ('browser', 'cross_origin_iframes'),
 		'DEMO_MODE': ('browser', 'demo_mode'),
-
 		# Browser - recordings
 		'RECORD_VIDEO_DIR': ('browser', 'record_video_dir'),
 		'RECORD_HAR_PATH': ('browser', 'record_har_path'),
 		'TRACES_DIR': ('browser', 'traces_dir'),
-
 		# Browser - timing
 		'MINIMUM_WAIT_PAGE_LOAD_TIME': ('browser', 'minimum_wait_page_load_time'),
 		'WAIT_FOR_NETWORK_IDLE_PAGE_LOAD_TIME': ('browser', 'wait_for_network_idle_page_load_time'),
 		'WAIT_BETWEEN_ACTIONS': ('browser', 'wait_between_actions'),
-
 		# Agent
 		'MAX_STEPS': ('agent', 'max_steps'),
 		'MAX_ACTIONS_PER_STEP': ('agent', 'max_actions_per_step'),
@@ -220,16 +215,13 @@ class EnvConfigSource(ConfigSource):
 		'MAX_HISTORY_ITEMS': ('agent', 'max_history_items'),
 		'LOOP_DETECTION_ENABLED': ('agent', 'loop_detection_enabled'),
 		'ENABLE_PLANNING': ('agent', 'enable_planning'),
-
 		# Security
 		'SECURITY_ALLOWED_DOMAINS': ('security', 'allowed_domains'),
 		'SECURITY_PROHIBITED_DOMAINS': ('security', 'prohibited_domains'),
-
 		# Filesystem
 		'CONFIG_DIR': ('filesystem', 'config_dir'),
 		'CACHE_DIR': ('filesystem', 'cache_dir'),
 		'FILE_SYSTEM_PATH': ('filesystem', 'file_system_path'),
-
 		# Top-level
 		'CONFIG_PATH': ('config_path',),
 		'IN_DOCKER': ('in_docker',),
@@ -293,21 +285,39 @@ class EnvConfigSource(ConfigSource):
 
 		# Handle boolean fields
 		boolean_fields = {
-			'headless', 'use_cloud', 'block_ip_addresses',
-			'enable_default_extensions', 'keep_alive',
-			'highlight_elements', 'paint_order_filtering',
-			'cross_origin_iframes', 'demo_mode',
-			'disable_security', 'deterministic_rendering',
-			'devtools', 'chromium_sandbox',
-			'auto_download_pdfs', 'is_local',
-			'use_thinking', 'flash_mode', 'calculate_cost',
-			'directly_open_url', 'display_files_in_done_text',
-			'final_response_after_failure', 'enable_planning',
-			'loop_detection_enabled', 'use_judge',
-			'include_tool_call_examples', 'include_recent_events',
-			'message_compaction', 'anonymized_telemetry',
-			'cloud_sync', 'version_check', 'setup_logging',
-			'in_docker', 'is_in_evals',
+			'headless',
+			'use_cloud',
+			'block_ip_addresses',
+			'enable_default_extensions',
+			'keep_alive',
+			'highlight_elements',
+			'paint_order_filtering',
+			'cross_origin_iframes',
+			'demo_mode',
+			'disable_security',
+			'deterministic_rendering',
+			'devtools',
+			'chromium_sandbox',
+			'auto_download_pdfs',
+			'is_local',
+			'use_thinking',
+			'flash_mode',
+			'calculate_cost',
+			'directly_open_url',
+			'display_files_in_done_text',
+			'final_response_after_failure',
+			'enable_planning',
+			'loop_detection_enabled',
+			'use_judge',
+			'include_tool_call_examples',
+			'include_recent_events',
+			'message_compaction',
+			'anonymized_telemetry',
+			'cloud_sync',
+			'version_check',
+			'setup_logging',
+			'in_docker',
+			'is_in_evals',
 			'skip_api_key_verification',
 		}
 
@@ -321,8 +331,10 @@ class EnvConfigSource(ConfigSource):
 
 		# Handle list fields (comma-separated)
 		list_fields = {
-			'allowed_domains', 'prohibited_domains',
-			'include_attributes', 'available_file_paths',
+			'allowed_domains',
+			'prohibited_domains',
+			'include_attributes',
+			'available_file_paths',
 			'permissions',
 		}
 
@@ -333,12 +345,20 @@ class EnvConfigSource(ConfigSource):
 
 		# Handle int fields
 		int_fields = {
-			'max_steps', 'max_actions_per_step', 'max_failures',
-			'llm_timeout', 'step_timeout', 'max_history_items',
-			'loop_detection_window', 'planning_replan_on_stall',
-			'planning_exploration_limit', 'max_clickable_elements_length',
-			'max_tokens', 'cloud_timeout',
-			'window_width', 'window_height',
+			'max_steps',
+			'max_actions_per_step',
+			'max_failures',
+			'llm_timeout',
+			'step_timeout',
+			'max_history_items',
+			'loop_detection_window',
+			'planning_replan_on_stall',
+			'planning_exploration_limit',
+			'max_clickable_elements_length',
+			'max_tokens',
+			'cloud_timeout',
+			'window_width',
+			'window_height',
 		}
 
 		if field_name in int_fields:
@@ -591,7 +611,7 @@ class ConfigResolver:
 		if include_env:
 			self._sources.append(EnvConfigSource())
 
-	def add_source(self, source: ConfigSource) -> 'ConfigResolver':
+	def add_source(self, source: ConfigSource) -> ConfigResolver:
 		"""Add a configuration source.
 
 		Args:
@@ -603,7 +623,7 @@ class ConfigResolver:
 		self._sources.append(source)
 		return self
 
-	def add_explicit(self, data: dict[str, Any], flat: bool = False) -> 'ConfigResolver':
+	def add_explicit(self, data: dict[str, Any], flat: bool = False) -> ConfigResolver:
 		"""Add explicit parameters (highest priority).
 
 		Args:
@@ -616,7 +636,7 @@ class ConfigResolver:
 		self._sources.append(DictConfigSource(data, priority=100, flat=flat))
 		return self
 
-	def add_cli(self, data: dict[str, Any], flat: bool = False) -> 'ConfigResolver':
+	def add_cli(self, data: dict[str, Any], flat: bool = False) -> ConfigResolver:
 		"""Add CLI arguments (priority: 90).
 
 		Args:
@@ -629,7 +649,7 @@ class ConfigResolver:
 		self._sources.append(DictConfigSource(data, priority=90, flat=flat))
 		return self
 
-	def add_env(self, prefix: str = 'BROWSER_USE_') -> 'ConfigResolver':
+	def add_env(self, prefix: str = 'BROWSER_USE_') -> ConfigResolver:
 		"""Add environment variable source.
 
 		Args:
@@ -641,7 +661,7 @@ class ConfigResolver:
 		self._sources.append(EnvConfigSource(prefix=prefix, priority=80))
 		return self
 
-	def add_file(self, config_path: str | Path | None = None) -> 'ConfigResolver':
+	def add_file(self, config_path: str | Path | None = None) -> ConfigResolver:
 		"""Add configuration file source.
 
 		Args:
@@ -653,7 +673,7 @@ class ConfigResolver:
 		self._sources.append(FileConfigSource(config_path=config_path, priority=70))
 		return self
 
-	def add_defaults(self, data: dict[str, Any], flat: bool = False) -> 'ConfigResolver':
+	def add_defaults(self, data: dict[str, Any], flat: bool = False) -> ConfigResolver:
 		"""Add custom defaults (lowest priority, below model defaults in practice).
 
 		Args:
