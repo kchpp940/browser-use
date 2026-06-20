@@ -715,7 +715,7 @@ class BrowserUseServer:
 
 		callbacks = LifecycleCallbacks(on_start=_on_start, on_error=_on_error)
 
-		result: TaskResult = await controller._run_with_lifecycle(
+		result: TaskResult = await controller.run_with_lifecycle(
 			controller.run_agent_task(max_steps=max_steps),
 			timeout=None,
 			task_name=f'MCP agent task "{task[:40]}..."',

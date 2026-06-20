@@ -1099,7 +1099,7 @@ class BrowserUseApp(App):
 			)
 
 			# Run agent via controller with unified lifecycle
-			await controller._run_with_lifecycle(
+			await controller.run_with_lifecycle(
 				controller.run_agent_task(),
 				timeout=None,
 				task_name=f'CLI agent task "{task[:40]}..."',

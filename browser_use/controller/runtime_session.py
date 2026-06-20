@@ -191,6 +191,38 @@ class RuntimeSessionController:
 				except Exception:
 					logger.exception('on_cleanup callback raised')
 
+	async def run_with_lifecycle(
+		self,
+		coro: Coroutine[Any, Any, T],
+		*,
+		timeout: float | None = None,
+		task_name: str = 'task',
+		callbacks: LifecycleCallbacks[T] | None = None,
+	) -> TaskResult[T]:
+		"""Public wrapper for _run_with_lifecycle.
+
+		Wrap any coroutine with unified timeout, cancellation, exception, and cleanup.
+
+		This is the recommended public API for entry points that need to execute
+		async work with a bounded lifetime. All entry points should route through
+		here instead of writing their own try/except/finally blocks.
+
+		Args:
+		    coro: The coroutine to execute.
+		    timeout: Optional timeout in seconds. None means no timeout.
+		    task_name: Human-readable name used in log messages.
+		    callbacks: Optional lifecycle hooks (on_start, on_success, on_error, on_cleanup).
+
+		Returns:
+		    TaskResult with normalized success/error/timeout state.
+		"""
+		return await self._run_with_lifecycle(
+			coro,
+			timeout=timeout,
+			task_name=task_name,
+			callbacks=callbacks,
+		)
+
 	# ------------------------------------------------------------------
 	# Agent task execution — full autonomous agent lifecycle
 	# ------------------------------------------------------------------
