@@ -8,11 +8,28 @@ from bubus import BaseEvent
 from pydantic import Field, field_validator
 from uuid_extensions import uuid7str
 
+from browser_use.observability_runtime import (
+	ErrorInfo,
+	EventSeverity,
+	EventSource,
+	EventType,
+	OutputFile,
+	RuntimeEvent,
+)
+
 MAX_STRING_LENGTH = 500000  # 100K chars ~ 25k tokens should be enough
 MAX_URL_LENGTH = 100000
 MAX_TASK_LENGTH = 100000
 MAX_COMMENT_LENGTH = 2000
 MAX_FILE_CONTENT_SIZE = 50 * 1024 * 1024  # 50MB
+
+
+def _ensure_utc(dt: datetime | None) -> datetime | None:
+	if dt is None:
+		return None
+	if dt.tzinfo is None:
+		return dt.replace(tzinfo=timezone.utc)
+	return dt.astimezone(timezone.utc)
 
 
 class UpdateAgentTaskEvent(BaseEvent):
@@ -57,6 +74,40 @@ class UpdateAgentTaskEvent(BaseEvent):
 			# user_feedback_type and user_comment would be set by the API/frontend
 			# gif_url would be set after GIF generation if needed
 		)
+
+	def to_runtime_event(self) -> RuntimeEvent:
+		"""Convert this cloud event to a unified RuntimeEvent.
+
+		All canonical linking fields (task_id / session_id / step / error /
+		output_files / source) come from a single adapter — no hand-built
+		payloads in the cloud sync path.
+		"""
+		error_info: ErrorInfo | None = None
+		if self.done_output and self.stopped and not self.paused:
+			error_info = ErrorInfo(error_type='TaskStopped', error_message='Task was stopped')
+
+		return RuntimeEvent(
+			source=EventSource.AGENT,
+			event_type=EventType.TASK_END,
+			severity=EventSeverity.ERROR if error_info else EventSeverity.INFO,
+			task_id=self.id,
+			message='Agent task update',
+			error=error_info,
+			data={
+				'stopped': self.stopped,
+				'paused': self.paused,
+				'done_output': self.done_output,
+				'agent_state': self.agent_state,
+				'user_feedback_type': self.user_feedback_type,
+				'user_comment': self.user_comment,
+				'gif_url': self.gif_url,
+			},
+			timestamp=_ensure_utc(self.finished_at) or datetime.now(timezone.utc),
+		)
+
+	def to_cloud_event_dict(self) -> dict:
+		"""Serialize to a cloud-compatible payload via RuntimeEvent adapter."""
+		return self.to_runtime_event().to_cloud_event_dict()
 
 
 class CreateAgentOutputFileEvent(BaseEvent):
@@ -112,6 +163,33 @@ class CreateAgentOutputFileEvent(BaseEvent):
 			file_content=gif_content,  # Base64 encoded
 			content_type='image/gif',
 		)
+
+	def to_runtime_event(self) -> RuntimeEvent:
+		"""Convert to a unified RuntimeEvent with output_files via adapter."""
+		return RuntimeEvent(
+			source=EventSource.AGENT,
+			event_type=EventType.OUTPUT_FILE,
+			severity=EventSeverity.INFO,
+			task_id=self.task_id,
+			message=f'Output file: {self.file_name}',
+			output_files=[
+				OutputFile(
+					name=self.file_name,
+					path=None,
+					size_bytes=None,
+					mime_type=self.content_type,
+				)
+			],
+			data={
+				'file_name': self.file_name,
+				'content_type': self.content_type,
+			},
+			timestamp=_ensure_utc(self.created_at) or datetime.now(timezone.utc),
+		)
+
+	def to_cloud_event_dict(self) -> dict:
+		"""Serialize to a cloud-compatible payload via RuntimeEvent adapter."""
+		return self.to_runtime_event().to_cloud_event_dict()
 
 
 class CreateAgentStepEvent(BaseEvent):
@@ -183,6 +261,30 @@ class CreateAgentStepEvent(BaseEvent):
 			screenshot_url=screenshot_url,
 		)
 
+	def to_runtime_event(self) -> RuntimeEvent:
+		"""Convert to a unified RuntimeEvent with step via adapter."""
+		return RuntimeEvent(
+			source=EventSource.AGENT,
+			event_type=EventType.STEP_END,
+			severity=EventSeverity.INFO,
+			task_id=self.agent_task_id,
+			step=self.step,
+			message=f'Step {self.step}: {self.next_goal}',
+			data={
+				'evaluation_previous_goal': self.evaluation_previous_goal,
+				'memory': self.memory,
+				'next_goal': self.next_goal,
+				'actions': self.actions,
+				'url': self.url,
+				'screenshot_url': self.screenshot_url,
+			},
+			timestamp=_ensure_utc(self.created_at) or datetime.now(timezone.utc),
+		)
+
+	def to_cloud_event_dict(self) -> dict:
+		"""Serialize to a cloud-compatible payload via RuntimeEvent adapter."""
+		return self.to_runtime_event().to_cloud_event_dict()
+
 
 class CreateAgentTaskEvent(BaseEvent):
 	# Model fields
@@ -225,6 +327,41 @@ class CreateAgentTaskEvent(BaseEvent):
 			user_comment=None,
 			gif_url=None,
 		)
+
+	def to_runtime_event(self) -> RuntimeEvent:
+		"""Convert to a unified RuntimeEvent with task_id/session_id via adapter."""
+		error_info: ErrorInfo | None = None
+		if self.done_output and self.stopped:
+			error_info = ErrorInfo(error_type='TaskStopped', error_message='Task was stopped')
+
+		return RuntimeEvent(
+			source=EventSource.AGENT,
+			event_type=EventType.TASK_START if not self.finished_at else EventType.TASK_END,
+			severity=EventSeverity.ERROR if error_info else EventSeverity.INFO,
+			task_id=self.id,
+			session_id=self.agent_session_id,
+			message=self.task,
+			error=error_info,
+			data={
+				'llm_model': self.llm_model,
+				'stopped': self.stopped,
+				'paused': self.paused,
+				'agent_state': self.agent_state,
+				'scheduled_task_id': self.scheduled_task_id,
+				'done_output': self.done_output,
+				'user_feedback_type': self.user_feedback_type,
+				'user_comment': self.user_comment,
+				'gif_url': self.gif_url,
+			},
+			timestamp=_ensure_utc(self.started_at) or datetime.now(timezone.utc),
+			duration_ms=(
+				(self.finished_at - self.started_at).total_seconds() * 1000.0 if self.finished_at and self.started_at else None
+			),
+		)
+
+	def to_cloud_event_dict(self) -> dict:
+		"""Serialize to a cloud-compatible payload via RuntimeEvent adapter."""
+		return self.to_runtime_event().to_cloud_event_dict()
 
 
 class CreateAgentSessionEvent(BaseEvent):
@@ -271,6 +408,29 @@ class CreateAgentSessionEvent(BaseEvent):
 			},
 		)
 
+	def to_runtime_event(self) -> RuntimeEvent:
+		"""Convert to a unified RuntimeEvent with session_id via adapter."""
+		return RuntimeEvent(
+			source=EventSource.BROWSER,
+			event_type=EventType.SESSION_START,
+			severity=EventSeverity.INFO,
+			session_id=self.browser_session_id,
+			message='Browser session started',
+			data={
+				'browser_session_live_url': self.browser_session_live_url,
+				'browser_session_cdp_url': self.browser_session_cdp_url,
+				'browser_session_stopped': self.browser_session_stopped,
+				'is_source_api': self.is_source_api,
+				'browser_state': self.browser_state,
+				'browser_session_data': self.browser_session_data,
+			},
+			timestamp=datetime.now(timezone.utc),
+		)
+
+	def to_cloud_event_dict(self) -> dict:
+		"""Serialize to a cloud-compatible payload via RuntimeEvent adapter."""
+		return self.to_runtime_event().to_cloud_event_dict()
+
 
 class UpdateAgentSessionEvent(BaseEvent):
 	"""Event to update an existing agent session"""
@@ -282,3 +442,23 @@ class UpdateAgentSessionEvent(BaseEvent):
 	browser_session_stopped: bool | None = None
 	browser_session_stopped_at: datetime | None = None
 	end_reason: str | None = Field(None, max_length=100)  # Why the session ended
+
+	def to_runtime_event(self) -> RuntimeEvent:
+		"""Convert to a unified RuntimeEvent with session_id via adapter."""
+		return RuntimeEvent(
+			source=EventSource.BROWSER,
+			event_type=EventType.SESSION_END if self.browser_session_stopped else EventType.SESSION_UPDATE,
+			severity=EventSeverity.INFO,
+			session_id=self.id,
+			message=f'Session update: {self.end_reason or "updated"}',
+			error=ErrorInfo(error_type=self.end_reason, error_message=self.end_reason) if self.end_reason else None,
+			data={
+				'browser_session_stopped': self.browser_session_stopped,
+				'end_reason': self.end_reason,
+			},
+			timestamp=_ensure_utc(self.browser_session_stopped_at) or datetime.now(timezone.utc),
+		)
+
+	def to_cloud_event_dict(self) -> dict:
+		"""Serialize to a cloud-compatible payload via RuntimeEvent adapter."""
+		return self.to_runtime_event().to_cloud_event_dict()
