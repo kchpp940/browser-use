@@ -336,6 +336,49 @@ class RuntimeEvent(BaseModel):
 
 		return ' '.join(p for p in parts if p)
 
+	def to_console_extra_dict(self) -> dict[str, Any]:
+		"""Build the ``extra=`` dict for Python ``logging.Logger.log()``.
+
+		All six canonical linking / identity fields come through a single
+		adapter so every console output uses the same key names.
+		"""
+		extra: dict[str, Any] = {
+			'runtime_event_id': self.event_id,
+			'runtime_event_type': self.event_type.value,
+			'runtime_source': self.source.value,
+		}
+		if self.task_id:
+			extra['task_id'] = self.task_id
+		if self.session_id:
+			extra['session_id'] = self.session_id
+		if self.step is not None:
+			extra['step'] = self.step
+		return extra
+
+	def to_telemetry_event_name(self) -> str:
+		"""Map this event to a stable, coarse-grained PostHog event name.
+
+		The PostHog schema intentionally uses a small number of categories
+		(agent_task / agent_step / agent_action / error / llm / mcp_tool /
+		sandbox) rather than mirroring the full ``EventType`` enum.
+		"""
+		source_prefix = self.source.value
+		if self.event_type in {EventType.TASK_START, EventType.TASK_END}:
+			return f'{source_prefix}_task'
+		if self.event_type in {EventType.STEP_START, EventType.STEP_END}:
+			return f'{source_prefix}_step'
+		if self.event_type in {EventType.AGENT_ACTION, EventType.AGENT_ACTION_RESULT}:
+			return f'{source_prefix}_action'
+		if self.event_type in {EventType.EXCEPTION, EventType.ERROR}:
+			return f'{source_prefix}_error'
+		if self.event_type in {EventType.LLM_CALL, EventType.LLM_RESULT}:
+			return f'{source_prefix}_llm'
+		if self.event_type in {EventType.MCP_TOOL_CALL, EventType.MCP_TOOL_RESULT}:
+			return f'{source_prefix}_mcp_tool'
+		if self.event_type in {EventType.SANDBOX_START, EventType.SANDBOX_END}:
+			return f'{source_prefix}_sandbox'
+		return f'{source_prefix}_event'
+
 	def to_telemetry_properties(self) -> dict[str, Any]:
 		"""Convert to a flat dict suitable for PostHog / telemetry ingestion."""
 		props: dict[str, Any] = {
@@ -368,11 +411,52 @@ class RuntimeEvent(BaseModel):
 			props['version'] = self.version
 		if self.is_docker is not None:
 			props['is_docker'] = self.is_docker
-		# Merge event-specific data (flat-prefixed to avoid collisions)
 		for k, v in self.data.items():
 			if isinstance(v, (str, int, float, bool, type(None))):
 				props[f'data_{k}'] = v
 		return props
+
+	def to_cloud_event_dict(self) -> dict[str, Any]:
+		"""Serialize this RuntimeEvent to a cloud-sync compatible payload.
+
+		The cloud sync endpoint accepts the same canonical linking fields
+		(task_id / session_id / step / error / output_files / source) as
+		every other sink; callers should never hand-build payloads.
+		"""
+		payload: dict[str, Any] = {
+			'event_id': self.event_id,
+			'timestamp': self.timestamp.isoformat(),
+			'source': self.source.value,
+			'event_type': self.event_type.value,
+			'severity': self.severity.value,
+			'message': self.message,
+			'data': self.data,
+		}
+		if self.task_id:
+			payload['task_id'] = self.task_id
+		if self.session_id:
+			payload['session_id'] = self.session_id
+		if self.step is not None:
+			payload['step'] = self.step
+		if self.action_index is not None:
+			payload['action_index'] = self.action_index
+		if self.duration_ms is not None:
+			payload['duration_ms'] = self.duration_ms
+		if self.error:
+			payload['error'] = self.error.model_dump(mode='json', exclude_none=True)
+		if self.output_files:
+			payload['output_files'] = [f.model_dump(mode='json', exclude_none=True) for f in self.output_files]
+		if self.tokens:
+			payload['tokens'] = self.tokens.model_dump(mode='json', exclude_none=True)
+		if self.version:
+			payload['version'] = self.version
+		if self.hostname:
+			payload['hostname'] = self.hostname
+		if self.pid is not None:
+			payload['pid'] = self.pid
+		if self.is_docker is not None:
+			payload['is_docker'] = self.is_docker
+		return payload
 
 
 # ── Bubus EventBus bridge ──────────────────────────────────────────────────

@@ -27,7 +27,13 @@ class CloudSync:
 		self.enabled = CONFIG.BROWSER_USE_CLOUD_SYNC
 
 	async def handle_event(self, event: BaseEvent) -> None:
-		"""Handle an event by sending it to the cloud"""
+		"""Handle an event by sending it to the cloud (legacy bubus.BaseEvent path).
+
+		Prefer :meth:`handle_runtime_event` for new code — it accepts a
+		:class:`browser_use.observability_runtime.RuntimeEvent` whose
+		canonical fields (task_id / session_id / step / error /
+		output_files / source) are already consistently populated.
+		"""
 		try:
 			# If cloud sync is disabled, don't handle any events
 			if not self.enabled:
@@ -53,6 +59,90 @@ class CloudSync:
 
 		except Exception as e:
 			logger.error(f'Failed to handle {event.event_type} event: {type(e).__name__}: {e}', exc_info=True)
+
+	async def handle_runtime_event(self, event: object) -> None:
+		"""Send a :class:`RuntimeEvent` to the Browser Use cloud sync endpoint.
+
+		This is the preferred entry point. All canonical linking fields
+		(task_id / session_id / step / error / output_files / source) are
+		read *exclusively* from ``event.to_cloud_event_dict()`` — no
+		hand-built payloads, no per-event-type branching.
+		"""
+		from browser_use.observability_runtime import RuntimeEvent
+
+		if not isinstance(event, RuntimeEvent):
+			logger.debug('handle_runtime_event called with non-RuntimeEvent: %s', type(event).__name__)
+			return
+		if not self.enabled:
+			return
+
+		try:
+			if event.session_id:
+				self.session_id = event.session_id
+
+			should_send = self.auth_client.is_authenticated or self.allow_session_events_for_auth or self.auth_flow_active
+			if not should_send:
+				logger.debug(
+					'Skipping RuntimeEvent %s - user not authenticated and no auth in progress',
+					event.event_type.value,
+				)
+				return
+
+			payload = event.to_cloud_event_dict()
+			await self._send_runtime_payload(payload)
+		except Exception as e:
+			logger.error(
+				'Failed to handle RuntimeEvent %s: %s: %s',
+				getattr(event, 'event_type', '?'),
+				type(e).__name__,
+				e,
+				exc_info=True,
+			)
+
+	async def _send_runtime_payload(self, payload: dict) -> None:
+		"""POST a single RuntimeEvent-derived payload to the cloud.
+
+		Authentication headers + user_id/device_id injection are applied
+		here so they are consistent with the legacy :meth:`_send_event`
+		path.
+		"""
+		try:
+			if self.auth_client and self.auth_client.is_authenticated:
+				current_user_id = payload.get('user_id')
+				if current_user_id != TEMP_USER_ID:
+					payload['user_id'] = str(self.auth_client.user_id)
+			else:
+				if not payload.get('user_id'):
+					payload['user_id'] = TEMP_USER_ID
+
+			headers: dict[str, str] = {}
+			if self.auth_client:
+				headers.update(self.auth_client.get_headers())
+			if self.auth_client and self.auth_client.device_id:
+				payload['device_id'] = self.auth_client.device_id
+
+			async with httpx.AsyncClient() as client:
+				response = await client.post(
+					f'{self.base_url.rstrip("/")}/api/v1/events',
+					json={'events': [payload]},
+					headers=headers,
+					timeout=10.0,
+				)
+				if response.status_code >= 400:
+					logger.debug(
+						'Failed to send runtime event: POST %s %s - %s',
+						response.request.url,
+						response.status_code,
+						response.text,
+					)
+		except httpx.TimeoutException:
+			logger.debug('Runtime event send timed out after 10 seconds')
+		except httpx.ConnectError:
+			pass
+		except httpx.HTTPError as e:
+			logger.debug('HTTP error sending runtime event: %s: %s', type(e).__name__, e)
+		except Exception as e:
+			logger.debug('Unexpected error sending runtime event: %s: %s', type(e).__name__, e)
 
 	async def _send_event(self, event: BaseEvent) -> None:
 		"""Send event to cloud API"""

@@ -169,6 +169,7 @@ _REQUIRED_FIELDS_BY_SOURCE: dict[EventSource, tuple[str, ...]] = {
 	EventSource.BROWSER: ('session_id', 'source'),
 	EventSource.CLI: ('task_id', 'source'),
 	EventSource.MCP_SERVER: ('source',),
+	EventSource.MCP_CLIENT: ('source',),
 	EventSource.SANDBOX: ('task_id', 'source'),
 	EventSource.SKILL_CLI: ('task_id', 'session_id', 'source'),
 }
@@ -185,6 +186,7 @@ _SOURCE_ALLOWS_ERROR: frozenset[EventSource] = frozenset(
 		EventSource.BROWSER,
 		EventSource.CLI,
 		EventSource.MCP_SERVER,
+		EventSource.MCP_CLIENT,
 		EventSource.SANDBOX,
 		EventSource.SKILL_CLI,
 	}
@@ -841,42 +843,32 @@ class RuntimeLogger:
 		return ordering[actual] >= ordering[minimum]
 
 	def _sink_console(self, event: RuntimeEvent) -> None:
-		"""Deliver event via standard Python logging."""
-		# Use the event's source as the logger name so users can filter
+		"""Deliver event via standard Python logging.
+
+		Uses the single ``RuntimeEvent.to_console_extra_dict()`` adapter
+		for structured fields (runtime_event_id, task_id, session_id,
+		step, ...) so every console line has identical keys.
+		"""
 		logger_name = f'browser_use.rt.{event.source.value}'
 		py_logger = logging.getLogger(logger_name)
-		# Build extra dict for structured loggers
-		extra: dict[str, Any] = {
-			'runtime_event_id': event.event_id,
-			'runtime_event_type': event.event_type.value,
-			'runtime_source': event.source.value,
-		}
-		if event.task_id:
-			extra['task_id'] = event.task_id
-		if event.session_id:
-			extra['session_id'] = event.session_id
-		if event.step is not None:
-			extra['step'] = event.step
+		extra = event.to_console_extra_dict()
 		line = event.to_console_line()
-		py_logger.log(event.severity.to_logging_level(), line, extra=extra)
-		# Also log traceback separately if present
+		level = event.severity.to_logging_level()
+		py_logger.log(level, line, extra=extra)
 		if event.error and event.error.error_stack:
-			py_logger.log(
-				event.severity.to_logging_level(),
-				'Traceback:\n%s',
-				event.error.error_stack,
-				extra=extra,
-			)
+			py_logger.log(level, 'Traceback:\n%s', event.error.error_stack, extra=extra)
 
 	def _sink_event_bus(self, event: RuntimeEvent) -> None:
-		"""Deliver event via bubus EventBus (in-process pub/sub)."""
+		"""Deliver event via bubus EventBus (in-process pub/sub).
+
+		The bubus bridge object wraps the RuntimeEvent verbatim — no
+		hand-built field mapping here.
+		"""
 		try:
 			if self._event_bus is None:
 				from bubus import EventBus
 
 				self._event_bus = EventBus()
-			# Use RuntimeEventBusBridge to wrap RuntimeEvent in a
-			# bubus.BaseEvent-compatible object for dispatch.
 			from .views import RuntimeEventBusBridge
 
 			bridge = RuntimeEventBusBridge.wrap(event)
@@ -885,7 +877,12 @@ class RuntimeLogger:
 			logger.debug('bubus EventBus dispatch failed: %s', exc)
 
 	def _sink_telemetry(self, event: RuntimeEvent) -> None:
-		"""Deliver event to PostHog via ProductTelemetry."""
+		"""Deliver event to PostHog via ProductTelemetry.
+
+		Both the event name and the properties dict come from
+		``RuntimeEvent`` adapter methods. The entry layer never hand-builds
+		``AgentTelemetryEvent`` / ``CLITelemetryEvent`` / etc.
+		"""
 		if not CONFIG.ANONYMIZED_TELEMETRY:
 			return
 		try:
@@ -894,42 +891,23 @@ class RuntimeLogger:
 
 				self._telemetry_service = ProductTelemetry()
 
-			# Bridge: create a BaseTelemetryEvent-compatible wrapper
-			# using the RuntimeEvent's to_telemetry_properties() output
+			name = event.to_telemetry_event_name()
 			props = event.to_telemetry_properties()
-			wrapper = _RuntimeTelemetryWrapper(name=self._telemetry_event_name(event), properties=props)
+			wrapper = _RuntimeTelemetryWrapper(name=name, properties=props)
 			self._telemetry_service.capture(wrapper)  # type: ignore[arg-type]
 		except Exception as exc:  # pragma: no cover - defensive
 			logger.debug('Telemetry dispatch failed: %s', exc)
 
-	@staticmethod
-	def _telemetry_event_name(event: RuntimeEvent) -> str:
-		"""Map a RuntimeEvent to a stable PostHog event name."""
-		# A smaller set of categories than the full EventType enum
-		# keeps the PostHog schema manageable.
-		source_prefix = event.source.value
-		if event.event_type in {EventType.TASK_START, EventType.TASK_END}:
-			return f'{source_prefix}_task'
-		if event.event_type in {EventType.STEP_START, EventType.STEP_END}:
-			return f'{source_prefix}_step'
-		if event.event_type in {EventType.AGENT_ACTION, EventType.AGENT_ACTION_RESULT}:
-			return f'{source_prefix}_action'
-		if event.event_type in {EventType.EXCEPTION, EventType.ERROR}:
-			return f'{source_prefix}_error'
-		if event.event_type in {EventType.LLM_CALL, EventType.LLM_RESULT}:
-			return f'{source_prefix}_llm'
-		if event.event_type in {EventType.MCP_TOOL_CALL, EventType.MCP_TOOL_RESULT}:
-			return f'{source_prefix}_mcp_tool'
-		if event.event_type in {EventType.SANDBOX_START, EventType.SANDBOX_END}:
-			return f'{source_prefix}_sandbox'
-		return f'{source_prefix}_event'
-
 	def _sink_cloud(self, event: RuntimeEvent) -> None:
-		"""Deliver event to browser-use cloud sync (if client attached)."""
+		"""Deliver event to browser-use cloud sync (if client attached).
+
+		Delegates to ``CloudSync.handle_runtime_event(RuntimeEvent)``,
+		which serializes via ``event.to_cloud_event_dict()``. No
+		hand-built payload lives in this sink.
+		"""
 		if self._cloud_sync_client is None:
 			return
 		try:
-			# Only sync high-signal events to cloud (not every debug line)
 			if event.severity in {EventSeverity.DEBUG, EventSeverity.INFO} and event.event_type not in {
 				EventType.STEP_START,
 				EventType.STEP_END,
@@ -943,9 +921,6 @@ class RuntimeLogger:
 				return
 
 			sync_client = self._cloud_sync_client
-			# The cloud sync interface uses a per-event-type dispatch.
-			# We delegate to a small helper method on the sync client
-			# if it supports it, otherwise no-op.
 			handler = getattr(sync_client, 'handle_runtime_event', None)
 			if callable(handler):
 				handler(event)

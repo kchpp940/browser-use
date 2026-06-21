@@ -149,9 +149,9 @@ except ImportError:
 	logger.error('MCP SDK not installed. Install with: pip install mcp')
 	sys.exit(1)
 
-from browser_use.observability_runtime import EventSource, EventType, RuntimeLogger, create_sink_config
-from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
-from browser_use.utils import create_task_with_error_handling, get_browser_use_version
+from browser_use.observability_runtime import EventSeverity, EventSource, EventType, RuntimeLogger, create_sink_config
+from browser_use.telemetry import ProductTelemetry
+from browser_use.utils import create_task_with_error_handling
 
 
 def get_parent_process_cmdline() -> str | None:
@@ -483,16 +483,17 @@ class BrowserUseServer:
 				self.runtime_logger.exception(e, message=f'MCP tool call failed: {name}')
 				return [types.TextContent(type='text', text=f'Error: {str(e)}')]
 			finally:
-				# Capture telemetry for tool calls
 				duration = time.time() - start_time
-				self._telemetry.capture(
-					MCPServerTelemetryEvent(
-						version=get_browser_use_version(),
-						action='tool_call',
-						tool_name=name,
-						duration_seconds=duration,
-						error_message=error_msg,
-					)
+				self.runtime_logger.log(
+					message=f'MCP tool: {name}',
+					event_type=EventType.MCP_TOOL_CALL,
+					severity=EventSeverity.DEBUG if error_msg is None else EventSeverity.ERROR,
+					duration_ms=duration * 1000.0,
+					data={
+						'action': 'tool_call',
+						'tool_name': name,
+						'error_message': error_msg,
+					},
 				)
 
 	async def _execute_tool(
@@ -1273,25 +1274,29 @@ async def main(session_timeout_minutes: int = 10):
 		sys.exit(1)
 
 	server = BrowserUseServer(session_timeout_minutes=session_timeout_minutes)
-	server._telemetry.capture(
-		MCPServerTelemetryEvent(
-			version=get_browser_use_version(),
-			action='start',
-			parent_process_cmdline=get_parent_process_cmdline(),
-		)
+	server.runtime_logger.log(
+		message='MCP server started',
+		event_type=EventType.MCP_SERVER_START,
+		data={
+			'action': 'start',
+			'parent_process_cmdline': get_parent_process_cmdline(),
+		},
 	)
 
 	try:
 		await server.run()
 	finally:
 		duration = time.time() - server._start_time
-		server._telemetry.capture(
-			MCPServerTelemetryEvent(
-				version=get_browser_use_version(),
-				action='stop',
-				duration_seconds=duration,
-				parent_process_cmdline=get_parent_process_cmdline(),
-			)
+		server.runtime_logger.log(
+			message='MCP server stopped',
+			event_type=EventType.MCP_SERVER_STOP,
+			severity=EventSeverity.INFO,
+			duration_ms=duration * 1000.0,
+			data={
+				'action': 'stop',
+				'duration_seconds': duration,
+				'parent_process_cmdline': get_parent_process_cmdline(),
+			},
 		)
 		server._telemetry.flush()
 

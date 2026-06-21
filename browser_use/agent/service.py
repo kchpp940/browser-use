@@ -69,13 +69,14 @@ from browser_use.dom.views import DOMInteractedElement, MatchLevel
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.observability import observe, observe_debug
 from browser_use.observability_runtime import (
+	EventSeverity,
 	EventSource,
+	EventType,
 	RuntimeLogger,
 	TokenUsage,
 	create_sink_config,
 )
 from browser_use.telemetry.service import ProductTelemetry
-from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.tools.registry.views import ActionModel
 from browser_use.tools.service import Tools
 from browser_use.utils import (
@@ -2240,29 +2241,26 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			self.logger.info('   Open a short issue on GitHub: https://github.com/browser-use/browser-use/issues')
 
 	def _log_agent_event(self, max_steps: int, agent_run_error: str | None = None) -> None:
-		"""Sent the agent event for this run to telemetry"""
+		"""Sent the agent event for this run to telemetry via RuntimeLogger.
+
+		All canonical fields (task_id / session_id / step / error /
+		output_files / source) flow through RuntimeEvent adapters — no
+		hand-built ``AgentTelemetryEvent`` payloads here.
+		"""
 
 		token_summary = self.token_cost_service.get_usage_tokens_for_model(self.llm.model)
 
-		# Prepare action_history data correctly
 		action_history_data = []
 		for item in self.history.history:
 			if item.model_output and item.model_output.action:
-				# Convert each ActionModel in the step to its dictionary representation
-				step_actions = [
-					action.model_dump(exclude_unset=True)
-					for action in item.model_output.action
-					if action  # Ensure action is not None if list allows it
-				]
+				step_actions = [action.model_dump(exclude_unset=True) for action in item.model_output.action if action]
 				action_history_data.append(step_actions)
 			else:
-				# Append None or [] if a step had no actions or no model output
 				action_history_data.append(None)
 
 		final_res = self.history.final_result()
 		final_result_str = json.dumps(final_res) if final_res is not None else None
 
-		# Extract judgement data if available
 		judgement_data = self.history.judgement()
 		judge_verdict = judgement_data.get('verdict') if judgement_data else None
 		judge_reasoning = judgement_data.get('reasoning') if judgement_data else None
@@ -2270,38 +2268,42 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		judge_reached_captcha = judgement_data.get('reached_captcha') if judgement_data else None
 		judge_impossible_task = judgement_data.get('impossible_task') if judgement_data else None
 
-		self.telemetry.capture(
-			AgentTelemetryEvent(
-				task=self.task,
-				model=self.llm.model,
-				model_provider=self.llm.provider,
-				max_steps=max_steps,
-				max_actions_per_step=self.settings.max_actions_per_step,
-				use_vision=self.settings.use_vision,
-				version=self.version,
-				source=self.source,
-				cdp_url=urlparse(self.browser_session.cdp_url).hostname
-				if self.browser_session and self.browser_session.cdp_url
-				else None,
-				agent_type=None,  # Regular Agent (not code-use)
-				action_errors=self.history.errors(),
-				action_history=action_history_data,
-				urls_visited=self.history.urls(),
-				steps=self.state.n_steps,
-				total_input_tokens=token_summary.prompt_tokens,
-				total_output_tokens=token_summary.completion_tokens,
+		self.runtime_logger.log(
+			message='Agent task summary',
+			event_type=EventType.TASK_END,
+			severity=EventSeverity.ERROR if agent_run_error is not None else EventSeverity.INFO,
+			duration_ms=self.history.total_duration_seconds() * 1000.0 if self.history.total_duration_seconds() else None,
+			tokens=TokenUsage(
+				input_tokens=token_summary.prompt_tokens,
+				output_tokens=token_summary.completion_tokens,
 				prompt_cached_tokens=token_summary.prompt_cached_tokens,
 				total_tokens=token_summary.total_tokens,
-				total_duration_seconds=self.history.total_duration_seconds(),
-				success=self.history.is_successful(),
-				final_result_response=final_result_str,
-				error_message=agent_run_error,
-				judge_verdict=judge_verdict,
-				judge_reasoning=judge_reasoning,
-				judge_failure_reason=judge_failure_reason,
-				judge_reached_captcha=judge_reached_captcha,
-				judge_impossible_task=judge_impossible_task,
-			)
+			),
+			data={
+				'task': self.task,
+				'model': self.llm.model,
+				'model_provider': self.llm.provider,
+				'max_steps': max_steps,
+				'max_actions_per_step': self.settings.max_actions_per_step,
+				'use_vision': self.settings.use_vision,
+				'source': self.source,
+				'cdp_url_host': urlparse(self.browser_session.cdp_url).hostname
+				if self.browser_session and self.browser_session.cdp_url
+				else None,
+				'agent_type': None,
+				'action_errors': self.history.errors(),
+				'action_history': action_history_data,
+				'urls_visited': self.history.urls(),
+				'steps': self.state.n_steps,
+				'success': self.history.is_successful(),
+				'final_result_response': final_result_str,
+				'error_message': agent_run_error,
+				'judge_verdict': judge_verdict,
+				'judge_reasoning': judge_reasoning,
+				'judge_failure_reason': judge_failure_reason,
+				'judge_reached_captcha': judge_reached_captcha,
+				'judge_impossible_task': judge_impossible_task,
+			},
 		)
 
 	async def take_step(self, step_info: AgentStepInfo | None = None) -> tuple[bool, bool]:
