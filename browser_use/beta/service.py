@@ -4434,7 +4434,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.enable_signal_handler = enable_signal_handler
 		self.telemetry = ProductTelemetry()
 		self.runtime_logger = RuntimeLogger(source=EventSource.AGENT)
-		self.runtime_logger.set_sinks(create_sink_config(console=False, event_bus=False, telemetry=True, cloud=False))
+		self.runtime_logger.set_sinks(
+			create_sink_config(console=False, event_bus=False, telemetry=True, cloud=False)
+		)
 		self.runtime_logger._telemetry.telemetry_client = self.telemetry
 		self.eventbus = EventBus(name=_eventbus_name(self.id))
 		self._eventbus_stopped = False

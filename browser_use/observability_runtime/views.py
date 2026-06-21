@@ -45,6 +45,7 @@ class EventType(str, Enum):
 
 	# Lifecycle events
 	SESSION_START = 'session_start'
+	SESSION_UPDATE = 'session_update'
 	SESSION_END = 'session_end'
 	TASK_START = 'task_start'
 	TASK_END = 'task_end'
@@ -110,6 +111,9 @@ class EventType(str, Enum):
 	LLM_RESULT = 'llm_result'
 	TOOL_EXECUTE = 'tool_execute'
 	TOOL_RESULT = 'tool_result'
+
+	# Output artifacts
+	OUTPUT_FILE = 'output_file'
 
 	# Error events
 	ERROR = 'error'

@@ -566,6 +566,9 @@ class BrowserSession(BaseModel):
 
 	_logger: Any = PrivateAttr(default=None)
 
+	_runtime_logger: Any = PrivateAttr(default=None)
+	_runtime_logger_context_token: Any = PrivateAttr(default=None)
+
 	@property
 	def logger(self) -> Any:
 		"""Get instance-specific logger with session ID in the name"""
@@ -573,6 +576,11 @@ class BrowserSession(BaseModel):
 		# if self._logger is None or not self._cdp_client_root:
 		# 	self._logger = logging.getLogger(f'browser_use.{self}')
 		return logging.getLogger(f'browser_use.{self}')
+
+	@property
+	def runtime_logger(self) -> RuntimeLogger:
+		"""Get the RuntimeLogger for this session (lazy on first access if not yet initialized)."""
+		return self._runtime_logger
 
 	@cached_property
 	def _id_for_logs(self) -> str:
@@ -689,12 +697,12 @@ class BrowserSession(BaseModel):
 		BaseWatchdog.attach_handler_to_session(self, CloseTabEvent, self.on_CloseTabEvent)
 
 		# Unified RuntimeLogger - observability runtime (browser layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.BROWSER)
+		self._runtime_logger = RuntimeLogger(source=EventSource.BROWSER)
 		_has_cloud = bool(
 			getattr(self, 'cloud_profile_id', None)
 			or (self.browser_profile is not None and getattr(self.browser_profile, 'cloud_profile_id', None))
 		)
-		self.runtime_logger.set_sinks(
+		self._runtime_logger.set_sinks(
 			create_sink_config(
 				console=True,
 				event_bus=True,
@@ -702,8 +710,8 @@ class BrowserSession(BaseModel):
 				cloud=_has_cloud,
 			)
 		)
-		self.runtime_logger._event_bus = self.event_bus
-		self._runtime_logger_context_token = self.runtime_logger.set_context(session_id=self.id)
+		self._runtime_logger._event_bus = self.event_bus
+		self._runtime_logger_context_token = self._runtime_logger.set_context(session_id=self.id)
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='browser_session_start')
 	async def start(self) -> None:

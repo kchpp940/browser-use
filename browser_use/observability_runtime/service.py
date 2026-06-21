@@ -337,6 +337,7 @@ class RuntimeLogger:
 
 	def set_sinks(
 		self,
+		config: 'SinkConfig | None' = None,
 		*,
 		console: bool | None = None,
 		event_bus: bool | None = None,
@@ -348,9 +349,25 @@ class RuntimeLogger:
 		"""
 		Choose which sinks this logger emits to.
 
+		Can be called with a SinkConfig object (produced by ``create_sink_config``)
+		and/or with individual keyword overrides.
+
 		Called ONLY by the entry layer (Agent / CLI / MCP / ...).
 		Business logic code should NEVER call this.
 		"""
+		if config is not None:
+			if console is None:
+				console = config.console
+			if event_bus is None:
+				event_bus = config.event_bus
+			if telemetry is None:
+				telemetry = config.telemetry
+			if cloud is None:
+				cloud = config.cloud
+			if min_console_severity is None:
+				min_console_severity = config.min_console_severity
+			if min_telemetry_severity is None:
+				min_telemetry_severity = config.min_telemetry_severity
 		if console is not None:
 			self._sink_config.console = console
 		if event_bus is not None:

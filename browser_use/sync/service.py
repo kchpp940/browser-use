@@ -3,6 +3,7 @@ Cloud sync service for sending events to the Browser Use cloud.
 """
 
 import logging
+from typing import cast
 
 import httpx
 from bubus import BaseEvent
@@ -29,32 +30,39 @@ class CloudSync:
 	async def handle_event(self, event: BaseEvent) -> None:
 		"""Handle an event by sending it to the cloud (legacy bubus.BaseEvent path).
 
-		Prefer :meth:`handle_runtime_event` for new code — it accepts a
-		:class:`browser_use.observability_runtime.RuntimeEvent` whose
-		canonical fields (task_id / session_id / step / error /
-		output_files / source) are already consistently populated.
+		Backwards-compatible entry point. If the event exposes a
+		``to_cloud_event_dict()`` method (all :mod:`browser_use.agent.cloud_events`
+		classes do), the payload is built via the unified
+		:class:`~browser_use.observability_runtime.RuntimeEvent` adapter —
+		no hand-built payloads, no per-event-type branching. Otherwise falls
+		back to serializing the :class:`BaseEvent` directly.
 		"""
 		try:
-			# If cloud sync is disabled, don't handle any events
 			if not self.enabled:
 				return
 
-			# Extract session ID from CreateAgentSessionEvent
 			if event.event_type == 'CreateAgentSessionEvent' and hasattr(event, 'id'):
 				self.session_id = str(event.id)  # type: ignore
 
-			# Send events based on authentication status and context
+			adapter_fn = getattr(event, 'to_cloud_event_dict', None)
+			if callable(adapter_fn):
+				if self.auth_client.is_authenticated or self.allow_session_events_for_auth or self.auth_flow_active:
+					payload = cast(dict, adapter_fn())
+					await self._send_runtime_payload(payload)
+				else:
+					logger.debug(
+						'Skipping event %s via RuntimeEvent adapter - user not authenticated and no auth in progress',
+						event.event_type,
+					)
+				return
+
 			if self.auth_client.is_authenticated:
-				# User is authenticated - send all events
 				await self._send_event(event)
 			elif self.allow_session_events_for_auth:
-				# Special case: allow ALL events during auth flow
 				await self._send_event(event)
-				# Mark auth flow as active when we see a session event
 				if event.event_type == 'CreateAgentSessionEvent':
 					self.auth_flow_active = True
 			else:
-				# User is not authenticated and no auth in progress - don't send anything
 				logger.debug(f'Skipping event {event.event_type} - user not authenticated')
 
 		except Exception as e:

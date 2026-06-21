@@ -174,10 +174,9 @@ class CreateAgentOutputFileEvent(BaseEvent):
 			message=f'Output file: {self.file_name}',
 			output_files=[
 				OutputFile(
-					name=self.file_name,
-					path=None,
-					size_bytes=None,
-					mime_type=self.content_type,
+					path=f'task://{self.task_id}/{self.file_name}' if self.task_id else f'task://{self.file_name}',
+					file_name=self.file_name,
+					content_type=self.content_type,
 				)
 			],
 			data={

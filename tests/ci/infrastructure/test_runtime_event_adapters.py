@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from browser_use.observability_runtime import (
 	ErrorInfo,
 	EventSeverity,
@@ -208,3 +210,214 @@ class TestValidateEventConsistency:
 		event = _make_full_event()
 		violations = validate_event_consistency(event)
 		assert not any('output_files' in v for v in violations)
+
+
+class TestLegacyCloudEventsAdapter:
+	def test_create_agent_task_event_has_runtime_adapter(self):
+		from browser_use.agent.cloud_events import CreateAgentTaskEvent
+
+		ev = CreateAgentTaskEvent(  # type: ignore[reportCallIssue]
+			id='task-001',
+			user_id='u1',
+			agent_session_id='session-abc',
+			task='do the thing',
+			llm_model='gpt-4.1-mini',
+		)
+		assert hasattr(ev, 'to_runtime_event')
+		assert hasattr(ev, 'to_cloud_event_dict')
+
+		re = ev.to_runtime_event()
+		assert re.source.value == 'agent'
+		assert re.event_type.value == 'task_start'
+		assert re.task_id == 'task-001'
+		assert re.session_id == 'session-abc'
+		assert re.message == 'do the thing'
+
+		d = ev.to_cloud_event_dict()
+		assert d['task_id'] == 'task-001'
+		assert d['session_id'] == 'session-abc'
+		assert d['source'] == 'agent'
+
+	def test_create_agent_step_event_has_step_field(self):
+		from browser_use.agent.cloud_events import CreateAgentStepEvent
+
+		ev = CreateAgentStepEvent(  # type: ignore[reportCallIssue]
+			user_id='u1',
+			agent_task_id='task-001',
+			step=7,
+			evaluation_previous_goal='pg',
+			memory='mem',
+			next_goal='ng',
+			actions=[],
+			url='https://example.com',
+		)
+		re = ev.to_runtime_event()
+		assert re.event_type.value == 'step_end'
+		assert re.task_id == 'task-001'
+		assert re.step == 7
+		assert re.data['next_goal'] == 'ng'
+		assert re.data['url'] == 'https://example.com'
+
+		d = ev.to_cloud_event_dict()
+		assert d['step'] == 7
+		assert d['task_id'] == 'task-001'
+
+	def test_update_agent_task_event_has_error_when_stopped(self):
+		from browser_use.agent.cloud_events import UpdateAgentTaskEvent
+
+		ev = UpdateAgentTaskEvent(  # type: ignore[reportCallIssue]
+			id='task-001',
+			user_id='u1',
+			stopped=True,
+			paused=False,
+			done_output='stopped with result',
+		)
+		re = ev.to_runtime_event()
+		assert re.event_type.value == 'task_end'
+		assert re.task_id == 'task-001'
+		assert re.error is not None
+		assert re.error.error_type == 'TaskStopped'
+
+		d = ev.to_cloud_event_dict()
+		assert d['error']['error_type'] == 'TaskStopped'
+		assert 'source' in d
+		assert d['source'] == 'agent'
+
+	def test_create_agent_output_file_event_has_output_files(self):
+		from browser_use.agent.cloud_events import CreateAgentOutputFileEvent
+
+		ev = CreateAgentOutputFileEvent(  # type: ignore[reportCallIssue]
+			user_id='u1',
+			task_id='task-001',
+			file_name='screenshot.png',
+			content_type='image/png',
+		)
+		re = ev.to_runtime_event()
+		assert re.event_type.value == 'output_file'
+		assert re.task_id == 'task-001'
+		assert re.output_files is not None
+		assert len(re.output_files) == 1
+		assert re.output_files[0].file_name == 'screenshot.png'
+		assert re.output_files[0].content_type == 'image/png'
+
+		d = ev.to_cloud_event_dict()
+		assert d['source'] == 'agent'
+		assert d['task_id'] == 'task-001'
+		assert 'output_files' in d
+		assert len(d['output_files']) == 1
+
+	def test_create_agent_session_event_has_session_id(self):
+		from browser_use.agent.cloud_events import CreateAgentSessionEvent
+
+		ev = CreateAgentSessionEvent(  # type: ignore[reportCallIssue]
+			user_id='u1',
+			browser_session_id='browser-sess-123',
+			browser_session_live_url='https://live.example.com',
+			browser_session_cdp_url='http://localhost:9222',
+		)
+		re = ev.to_runtime_event()
+		assert re.source.value == 'browser'
+		assert re.event_type.value == 'session_start'
+		assert re.session_id == 'browser-sess-123'
+
+		d = ev.to_cloud_event_dict()
+		assert d['source'] == 'browser'
+		assert d['session_id'] == 'browser-sess-123'
+
+	def test_update_agent_session_event_end_reason_becomes_error(self):
+		from browser_use.agent.cloud_events import UpdateAgentSessionEvent
+
+		ev = UpdateAgentSessionEvent(  # type: ignore[reportCallIssue]
+			id='sess-abc',
+			user_id='u1',
+			browser_session_stopped=True,
+			end_reason='SessionTimeout',
+		)
+		re = ev.to_runtime_event()
+		assert re.source.value == 'browser'
+		assert re.event_type.value == 'session_end'
+		assert re.session_id == 'sess-abc'
+		assert re.error is not None
+		assert re.error.error_type == 'SessionTimeout'
+
+		d = ev.to_cloud_event_dict()
+		assert d['session_id'] == 'sess-abc'
+		assert d['source'] == 'browser'
+		assert d['error']['error_type'] == 'SessionTimeout'
+
+
+class TestCloudSyncHandleEventAdapter:
+	@pytest.mark.asyncio
+	async def test_handle_event_dispatches_to_runtime_adapter_when_available(self):
+		from unittest.mock import AsyncMock, patch
+
+		from browser_use.agent.cloud_events import CreateAgentTaskEvent
+		from browser_use.sync.service import CloudSync
+
+		class _FakeAuth:
+			is_authenticated = True
+
+			def get_headers(self):
+				return {'X-Test': '1'}
+
+			device_id = 'dev-001'
+			user_id = 'user-001'
+
+		sync = object.__new__(CloudSync)
+		sync.base_url = 'https://cloud.example.com'
+		sync.enabled = True
+		sync.session_id = 'sess-capt'
+		sync.auth_client = _FakeAuth()  # type: ignore[assignment]
+		sync.allow_session_events_for_auth = False
+		sync.auth_flow_active = False
+
+		ev = CreateAgentTaskEvent(  # type: ignore[reportCallIssue]
+			id='task-t9',
+			user_id='u1',
+			agent_session_id='sess-789',
+			task='hello',
+			llm_model='test',
+		)
+
+		posted: list[tuple[str, dict]] = []
+
+		class _FakeResp:
+			status_code = 200
+			text = 'ok'
+
+		class _FakeClient:
+			def __init__(self, **kw):
+				self.kw = kw
+
+			async def __aenter__(self):
+				return self
+
+			async def __aexit__(self, *a):
+				return False
+
+			def post(self, url, **kw):
+				am = AsyncMock(return_value=_FakeResp())
+				posted.append((url, kw))
+				return am()
+
+		with patch('browser_use.sync.service.httpx') as mock_httpx:
+			mock_httpx.AsyncClient = _FakeClient
+			mock_httpx.TimeoutException = type('TimeoutException', (Exception,), {})
+			mock_httpx.ConnectError = type('ConnectError', (Exception,), {})
+			mock_httpx.HTTPError = type('HTTPError', (Exception,), {})
+
+			await sync.handle_event(ev)
+
+		assert len(posted) >= 1, 'should POST via _send_runtime_payload path'
+		_url, kw = posted[0]
+		assert 'events' in kw['json']
+		events = kw['json']['events']
+		assert len(events) == 1
+		payload = events[0]
+		assert payload['source'] == 'agent'
+		assert payload['task_id'] == 'task-t9'
+		assert payload['session_id'] == 'sess-789'
+		assert 'event_type' in payload
+		assert payload['event_type'] == 'task_start'
+		assert 'device_id' in payload
+		assert 'step' not in payload or payload['step'] is None  # no step for task start
