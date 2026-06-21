@@ -55,8 +55,7 @@ from browser_use.browser.events import (
 from browser_use.browser.profile import BrowserProfile, ProxySettings
 from browser_use.browser.views import BrowserStateSummary, TabInfo
 from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, TargetInfo
-from browser_use.observability import observe_debug
-from browser_use.observability_runtime import EventSource, OutputFile, RuntimeLogger, create_sink_config
+from browser_use.observability import EventSeverity, EventSource, EventType, observe_debug, runtime_logger
 from browser_use.utils import _log_pretty_url, create_task_with_error_handling, is_new_tab_page
 
 if TYPE_CHECKING:
@@ -566,9 +565,6 @@ class BrowserSession(BaseModel):
 
 	_logger: Any = PrivateAttr(default=None)
 
-	_runtime_logger: Any = PrivateAttr(default=None)
-	_runtime_logger_context_token: Any = PrivateAttr(default=None)
-
 	@property
 	def logger(self) -> Any:
 		"""Get instance-specific logger with session ID in the name"""
@@ -576,11 +572,6 @@ class BrowserSession(BaseModel):
 		# if self._logger is None or not self._cdp_client_root:
 		# 	self._logger = logging.getLogger(f'browser_use.{self}')
 		return logging.getLogger(f'browser_use.{self}')
-
-	@property
-	def runtime_logger(self) -> RuntimeLogger:
-		"""Get the RuntimeLogger for this session (lazy on first access if not yet initialized)."""
-		return self._runtime_logger
 
 	@cached_property
 	def _id_for_logs(self) -> str:
@@ -696,26 +687,32 @@ class BrowserSession(BaseModel):
 		BaseWatchdog.attach_handler_to_session(self, FileDownloadedEvent, self.on_FileDownloadedEvent)
 		BaseWatchdog.attach_handler_to_session(self, CloseTabEvent, self.on_CloseTabEvent)
 
-		# Unified RuntimeLogger - observability runtime (browser layer)
-		self._runtime_logger = RuntimeLogger(source=EventSource.BROWSER)
-		_has_cloud = bool(
-			getattr(self, 'cloud_profile_id', None)
-			or (self.browser_profile is not None and getattr(self.browser_profile, 'cloud_profile_id', None))
-		)
-		self._runtime_logger.set_sinks(
-			create_sink_config(
-				console=True,
-				event_bus=True,
-				telemetry=True,
-				cloud=_has_cloud,
-			)
-		)
-		self._runtime_logger._event_bus = self.event_bus
-		self._runtime_logger_context_token = self._runtime_logger.set_context(session_id=self.id)
-
 	@observe_debug(ignore_input=True, ignore_output=True, name='browser_session_start')
 	async def start(self) -> None:
 		"""Start the browser session."""
+		# Configure unified RuntimeLogger with browser session context
+		# Only set browser_session_id here - task_id/session_id will be set by Agent if applicable
+		current_context = runtime_logger._get_current_context()
+		runtime_logger.set_default_context(
+			task_id=current_context.task_id,
+			session_id=current_context.session_id,
+			browser_session_id=self.id,
+			source=EventSource.BROWSER,
+		)
+
+		# Emit browser session start event
+		runtime_logger.emit(
+			event_type=EventType.BROWSER_SESSION_START,
+			source=EventSource.BROWSER,
+			message='Browser session started',
+			data={
+				'headless': self.browser_profile.headless if self.browser_profile else None,
+				'viewport': self.browser_profile.viewport if self.browser_profile else None,
+				'user_agent': self.browser_profile.user_agent if self.browser_profile else None,
+			},
+			severity=EventSeverity.INFO,
+		)
+
 		start_event = self.event_bus.dispatch(BrowserStartEvent())
 		await start_event
 		# Ensure any exceptions from the event handler are propagated
@@ -725,6 +722,15 @@ class BrowserSession(BaseModel):
 		"""Kill the browser session and reset all state."""
 		self._intentional_stop = True
 		self.logger.debug('🛑 kill() called - stopping browser with force=True and resetting state')
+
+		# Emit browser session end event
+		runtime_logger.emit(
+			event_type=EventType.BROWSER_SESSION_END,
+			source=EventSource.BROWSER,
+			message='Browser session killed',
+			data={'force': True},
+			severity=EventSeverity.INFO,
+		)
 
 		# First save storage state while CDP is still connected
 		from browser_use.browser.events import SaveStorageStateEvent
@@ -749,6 +755,15 @@ class BrowserSession(BaseModel):
 		"""
 		self._intentional_stop = True
 		self.logger.debug('⏸️  stop() called - stopping browser gracefully (force=False) and resetting state')
+
+		# Emit browser session end event
+		runtime_logger.emit(
+			event_type=EventType.BROWSER_SESSION_END,
+			source=EventSource.BROWSER,
+			message='Browser session stopped',
+			data={'force': False},
+			severity=EventSeverity.INFO,
+		)
 
 		# First save storage state while CDP is still connected
 		from browser_use.browser.events import SaveStorageStateEvent
@@ -888,7 +903,6 @@ class BrowserSession(BaseModel):
 					'Local browser failed to start. Cloud browsers require no local install and work out of the box.\n'
 					'         Try: Browser(use_cloud=True)  |  Get an API key: https://cloud.browser-use.com?utm_source=oss&utm_medium=browser_launch_failure'
 				)
-			self.runtime_logger.exception(e, message='Browser session start failed')
 			raise
 
 	async def on_NavigateToUrlEvent(self, event: NavigateToUrlEvent) -> None:
@@ -1237,16 +1251,24 @@ class BrowserSession(BaseModel):
 		if event.path and event.path not in self._downloaded_files:
 			self._downloaded_files.append(event.path)
 			self.logger.info(f'📁 Tracked download: {event.file_name} ({len(self._downloaded_files)} total downloads in session)')
+
+			# Emit file output event via unified RuntimeLogger
+			runtime_logger.emit(
+				event_type=EventType.FILE_OUTPUT,
+				source=EventSource.BROWSER,
+				message=f'File downloaded: {event.file_name}',
+				output_path=str(event.path),
+				data={
+					'file_name': event.file_name,
+					'file_size': event.size if hasattr(event, 'size') else None,
+				},
+				severity=EventSeverity.INFO,
+			)
 		else:
 			if not event.path:
 				self.logger.warning(f'FileDownloadedEvent has no path: {event}')
 			else:
 				self.logger.debug(f'File already tracked: {event.path}')
-		self.runtime_logger.info(
-			message=f'File downloaded: {event.path}',
-			data={'file_path': str(event.path)},
-			output_files=[OutputFile(path=str(event.path), size_bytes=getattr(event, 'size', None))],
-		)
 
 	def _cloud_session_id_from_cdp_url(self) -> str | None:
 		"""Derive cloud browser session ID from a Browser Use CDP URL."""
@@ -1305,7 +1327,6 @@ class BrowserSession(BaseModel):
 					details={'cdp_url': self.cdp_url, 'is_local': self.is_local},
 				)
 			)
-			self.runtime_logger.exception(e, message='Browser session stop failed')
 
 	# region - ========== CDP-based replacements for browser_context operations ==========
 	@property
@@ -2357,6 +2378,15 @@ class BrowserSession(BaseModel):
 			url: URL to navigate to
 			new_tab: Whether to open in a new tab
 		"""
+		# Emit navigation event via unified RuntimeLogger
+		runtime_logger.emit(
+			event_type=EventType.BROWSER_NAVIGATION,
+			source=EventSource.BROWSER,
+			message=f'Navigating to {url}',
+			data={'url': url, 'new_tab': new_tab},
+			severity=EventSeverity.INFO,
+		)
+
 		from browser_use.browser.events import NavigateToUrlEvent
 
 		event = self.event_bus.dispatch(NavigateToUrlEvent(url=url, new_tab=new_tab))

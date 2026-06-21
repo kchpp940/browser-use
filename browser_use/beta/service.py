@@ -61,16 +61,9 @@ from browser_use.llm.base import BaseChatModel
 from browser_use.llm.messages import BaseMessage, ContentPartImageParam, ContentPartTextParam
 from browser_use.llm.views import ChatInvokeUsage
 from browser_use.observability import observe
-from browser_use.observability_runtime import (
-	EventSeverity,
-	EventSource,
-	EventType,
-	RuntimeLogger,
-	TokenUsage,
-	create_sink_config,
-)
 from browser_use.screenshots.service import ScreenshotService
 from browser_use.telemetry.service import ProductTelemetry
+from browser_use.telemetry.views import AgentTelemetryEvent
 from browser_use.tokens.custom_pricing import CUSTOM_MODEL_PRICING
 from browser_use.tokens.service import TokenCost
 from browser_use.tokens.views import ModelUsageStats, UsageSummary
@@ -4433,11 +4426,6 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			_register_llm_for_usage(self.token_cost_service, self.settings.message_compaction.compaction_llm)
 		self.enable_signal_handler = enable_signal_handler
 		self.telemetry = ProductTelemetry()
-		self.runtime_logger = RuntimeLogger(source=EventSource.AGENT)
-		self.runtime_logger.set_sinks(
-			create_sink_config(console=False, event_bus=False, telemetry=True, cloud=False)
-		)
-		self.runtime_logger._telemetry.telemetry_client = self.telemetry
 		self.eventbus = EventBus(name=_eventbus_name(self.id))
 		self._eventbus_stopped = False
 		self.available_file_paths = available_file_paths or []
@@ -4742,12 +4730,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.logger.info(judge_log)
 
 	def _log_agent_event(self, max_steps: int, agent_run_error: str | None = None) -> None:
-		"""Emit Browser Use telemetry for a Rust-backed run via RuntimeLogger.
-
-		All canonical fields (task_id / session_id / step / error /
-		output_files / source) flow through RuntimeEvent adapters — no
-		hand-built ``AgentTelemetryEvent`` payloads here.
-		"""
+		"""Emit Browser Use telemetry for a Rust-backed run."""
 		usage = self.history.usage
 		if usage is None:
 			total_input_tokens = 0
@@ -4775,35 +4758,31 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		model = getattr(self.llm, 'model', None) or self.model
 		provider = getattr(self.llm, 'provider', None) or 'rust-terminal'
 
-		self.runtime_logger.log(
-			message='Agent task summary (rust)',
-			event_type=EventType.TASK_END,
-			severity=EventSeverity.ERROR if agent_run_error is not None else EventSeverity.INFO,
-			duration_ms=self.history.total_duration_seconds() * 1000.0 if self.history.total_duration_seconds() else None,
-			tokens=TokenUsage(
-				input_tokens=total_input_tokens,
-				output_tokens=total_output_tokens,
+		self.telemetry.capture(
+			AgentTelemetryEvent(
+				task=self.task,
+				model=model,
+				model_provider=provider,
+				max_steps=max_steps,
+				max_actions_per_step=self.settings.max_actions_per_step,
+				use_vision=self.settings.use_vision,
+				version=self.version or '',
+				source=self.source,
+				cdp_url=urlparse(cdp_url).hostname if cdp_url else None,
+				agent_type='rust_core',
+				action_errors=self.history.errors(),
+				action_history=action_history_data,
+				urls_visited=[url for url in self.history.urls() if url],
+				steps=self.history.number_of_steps(),
+				total_input_tokens=total_input_tokens,
+				total_output_tokens=total_output_tokens,
 				prompt_cached_tokens=prompt_cached_tokens,
 				total_tokens=total_tokens,
-			),
-			data={
-				'task': self.task,
-				'model': model,
-				'model_provider': provider,
-				'max_steps': max_steps,
-				'max_actions_per_step': self.settings.max_actions_per_step,
-				'use_vision': self.settings.use_vision,
-				'source': self.source,
-				'cdp_url_host': urlparse(cdp_url).hostname if cdp_url else None,
-				'agent_type': 'rust_core',
-				'action_errors': self.history.errors(),
-				'action_history': action_history_data,
-				'urls_visited': [url for url in self.history.urls() if url],
-				'steps': self.history.number_of_steps(),
-				'success': self.history.is_successful(),
-				'final_result_response': final_result_str,
-				'error_message': agent_run_error,
-			},
+				total_duration_seconds=self.history.total_duration_seconds(),
+				success=self.history.is_successful(),
+				final_result_response=final_result_str,
+				error_message=agent_run_error,
+			)
 		)
 
 	def _record_run_telemetry(self, max_steps: int, agent_run_error: str | None = None) -> None:

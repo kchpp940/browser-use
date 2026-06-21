@@ -95,6 +95,7 @@ from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.openai.chat import ChatOpenAI
+from browser_use.observability import EventSeverity, EventSource, EventType, runtime_logger
 from browser_use.tools.service import Tools
 
 logger = logging.getLogger(__name__)
@@ -149,9 +150,8 @@ except ImportError:
 	logger.error('MCP SDK not installed. Install with: pip install mcp')
 	sys.exit(1)
 
-from browser_use.observability_runtime import EventSeverity, EventSource, EventType, RuntimeLogger, create_sink_config
 from browser_use.telemetry import ProductTelemetry
-from browser_use.utils import create_task_with_error_handling
+from browser_use.utils import create_task_with_error_handling, get_browser_use_version
 
 
 def get_parent_process_cmdline() -> str | None:
@@ -202,15 +202,15 @@ class BrowserUseServer:
 		self._telemetry = ProductTelemetry()
 		self._start_time = time.time()
 
-		# Unified RuntimeLogger - observability runtime (MCP server layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.MCP_SERVER)
-		self.runtime_logger.set_sinks(create_sink_config(console=True, event_bus=False, telemetry=True, cloud=False))
-		self.runtime_logger._telemetry.telemetry_client = self._telemetry
-
 		# Session management
 		self.active_sessions: dict[str, dict[str, Any]] = {}  # session_id -> session info
 		self.session_timeout_minutes = session_timeout_minutes
 		self._cleanup_task: Any = None
+
+		# Configure unified RuntimeLogger with MCP context
+		runtime_logger.set_default_context(
+			source=EventSource.MCP,
+		)
 
 		# Setup handlers
 		self._setup_handlers()
@@ -469,31 +469,28 @@ class BrowserUseServer:
 			error_msg = None
 			try:
 				result = await self._execute_tool(name, arguments or {})
-				self.runtime_logger.log(
-					event_type=EventType.MCP_TOOL_CALL,
-					message=f'MCP tool called: {name}',
-					data={'tool_name': name, 'arguments': arguments},
-				)
 				if isinstance(result, list):
 					return result
 				return [types.TextContent(type='text', text=result)]
 			except Exception as e:
 				error_msg = str(e)
 				logger.error(f'Tool execution failed: {e}', exc_info=True)
-				self.runtime_logger.exception(e, message=f'MCP tool call failed: {name}')
 				return [types.TextContent(type='text', text=f'Error: {str(e)}')]
 			finally:
+				# Emit MCP tool call event via unified RuntimeLogger
 				duration = time.time() - start_time
-				self.runtime_logger.log(
-					message=f'MCP tool: {name}',
-					event_type=EventType.MCP_TOOL_CALL,
-					severity=EventSeverity.DEBUG if error_msg is None else EventSeverity.ERROR,
-					duration_ms=duration * 1000.0,
+				runtime_logger.emit(
+					event_type=EventType.MCP_TOOL_CALL_END,
+					source=EventSource.MCP,
+					message=f'MCP tool call: {name}' if not error_msg else f'MCP tool call failed: {name}',
+					duration_ms=duration * 1000,
+					error_type='ToolExecutionError' if error_msg else None,
+					error_message=error_msg if error_msg else None,
 					data={
-						'action': 'tool_call',
 						'tool_name': name,
-						'error_message': error_msg,
+						'version': get_browser_use_version(),
 					},
+					severity=EventSeverity.INFO if not error_msg else EventSeverity.ERROR,
 				)
 
 	async def _execute_tool(
@@ -1120,7 +1117,6 @@ class BrowserUseServer:
 			'last_activity': time.time(),
 			'url': getattr(session, 'current_url', None),
 		}
-		self.runtime_logger.set_context(session_id=session.id)
 
 	def _update_session_activity(self, session_id: str) -> None:
 		"""Update the last activity time for a session."""
@@ -1274,30 +1270,37 @@ async def main(session_timeout_minutes: int = 10):
 		sys.exit(1)
 
 	server = BrowserUseServer(session_timeout_minutes=session_timeout_minutes)
-	server.runtime_logger.log(
-		message='MCP server started',
+
+	# Emit MCP server start event via unified RuntimeLogger
+	runtime_logger.emit(
 		event_type=EventType.MCP_SERVER_START,
+		source=EventSource.MCP,
+		message='MCP server started',
 		data={
-			'action': 'start',
+			'version': get_browser_use_version(),
 			'parent_process_cmdline': get_parent_process_cmdline(),
 		},
+		severity=EventSeverity.INFO,
 	)
 
 	try:
 		await server.run()
 	finally:
 		duration = time.time() - server._start_time
-		server.runtime_logger.log(
-			message='MCP server stopped',
+
+		# Emit MCP server stop event via unified RuntimeLogger
+		runtime_logger.emit(
 			event_type=EventType.MCP_SERVER_STOP,
-			severity=EventSeverity.INFO,
-			duration_ms=duration * 1000.0,
+			source=EventSource.MCP,
+			message='MCP server stopped',
+			duration_ms=duration * 1000,
 			data={
-				'action': 'stop',
-				'duration_seconds': duration,
+				'version': get_browser_use_version(),
 				'parent_process_cmdline': get_parent_process_cmdline(),
 			},
+			severity=EventSeverity.INFO,
 		)
+
 		server._telemetry.flush()
 
 

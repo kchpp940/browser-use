@@ -3,21 +3,6 @@ from typing import TYPE_CHECKING
 
 from browser_use.logging_config import setup_logging
 
-# ── Direct imports for observability runtime lightweight types ────────────
-# These are pure type definitions (enums, Pydantic models) with zero
-# initialization cost. Importing them directly gives pyright full type
-# visibility and avoids "expected 0 positional arguments" errors.
-from browser_use.observability_runtime import (
-	ErrorInfo,
-	EventSeverity,
-	EventSource,
-	EventType,
-	OutputFile,
-	RuntimeEvent,
-	SinkConfig,
-	TokenUsage,
-)
-
 # Only set up logging if not in MCP mode or if explicitly requested
 if os.environ.get('BROWSER_USE_SETUP_LOGGING', 'true').lower() != 'false':
 	from browser_use.config import CONFIG
@@ -78,17 +63,6 @@ if TYPE_CHECKING:
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
 	from browser_use.llm.vercel.chat import ChatVercel
-	from browser_use.observability_runtime import (
-		ErrorInfo,
-		EventSeverity,
-		EventSource,
-		EventType,
-		OutputFile,
-		RuntimeEvent,
-		RuntimeLogger,
-		SinkConfig,
-		TokenUsage,
-	)
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
 
@@ -178,16 +152,6 @@ __all__ = [
 	'Controller',
 	# LLM models module
 	'models',
-	# Unified observability runtime
-	'RuntimeEvent',
-	'RuntimeLogger',
-	'SinkConfig',
-	'EventSource',
-	'EventType',
-	'EventSeverity',
-	'ErrorInfo',
-	'OutputFile',
-	'TokenUsage',
 	# Sandbox execution
 	'sandbox',
 ]

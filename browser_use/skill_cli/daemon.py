@@ -27,8 +27,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger('browser_use.skill_cli.daemon')
 
-from browser_use.observability_runtime import EventSource, RuntimeLogger, create_sink_config
-
 
 class Daemon:
 	"""Single-session daemon that manages a browser and handles CLI commands."""
@@ -67,22 +65,6 @@ class Daemon:
 		self._idle_watchdog_task: asyncio.Task | None = None
 		self._is_shutting_down: bool = False
 		self._auth_token: str = ''
-
-		# Unified RuntimeLogger - observability runtime (skill_cli daemon layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.SKILL_CLI)
-		self.runtime_logger.set_sinks(
-			create_sink_config(console=True, event_bus=False, telemetry=True, cloud=bool(self.cloud_profile_id))
-		)
-		try:
-			from uuid_extensions import uuid7str
-
-			_daemon_id = f'skilld-{uuid7str()}'
-		except Exception:
-			_daemon_id = None
-		self._rt_ctx = self.runtime_logger.set_context(
-			task_id=_daemon_id,
-			session_id=self.session,
-		)
 
 	def _write_state(self, phase: str) -> None:
 		"""Atomically write session state file for CLI observability."""
@@ -256,7 +238,6 @@ class Daemon:
 				response = {'id': '', 'success': False, 'error': f'Invalid JSON: {e}'}
 			except Exception as e:
 				logger.exception(f'Error handling request: {e}')
-				self.runtime_logger.exception(e, message=f'Daemon request handling failed: {e}')
 				response = {'id': '', 'success': False, 'error': str(e)}
 
 			writer.write((json.dumps(response) + '\n').encode())
@@ -269,7 +250,6 @@ class Daemon:
 			logger.debug('Connection timeout')
 		except Exception as e:
 			logger.exception(f'Connection error: {e}')
-			self.runtime_logger.exception(e, message=f'Daemon connection error: {e}')
 		finally:
 			writer.close()
 			try:
@@ -343,7 +323,6 @@ class Daemon:
 
 		except Exception as e:
 			logger.exception(f'Error dispatching {action}: {e}')
-			self.runtime_logger.exception(e, message=f'Daemon dispatch failed: {action}')
 			return {'id': req_id, 'success': False, 'error': str(e)}
 
 	async def run(self) -> None:

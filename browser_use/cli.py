@@ -158,8 +158,9 @@ from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
-from browser_use.observability_runtime import EventSeverity, EventSource, EventType, RuntimeLogger, create_sink_config
-from browser_use.telemetry import ProductTelemetry
+from browser_use.observability import EventSeverity, EventSource, EventType, runtime_logger
+from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
+from browser_use.utils import get_browser_use_version
 
 try:
 	import click
@@ -614,17 +615,11 @@ class BrowserUseApp(App):
 		self._event_bus_handler_func = None
 		# Timer for info panel updates
 		self._info_panel_timer = None
-		# Unified RuntimeLogger - observability runtime (CLI layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.CLI)
-		self.runtime_logger.set_sinks(create_sink_config(console=True, event_bus=False, telemetry=True, cloud=False))
-		self.runtime_logger._telemetry.telemetry_client = self._telemetry
-		try:
-			from uuid_extensions import uuid7str
 
-			_cli_task_id = f'cli-{uuid7str()}'
-		except Exception:
-			_cli_task_id = None
-		self._rt_ctx_token = self.runtime_logger.set_context(task_id=_cli_task_id)
+		# Configure unified RuntimeLogger with CLI context for interactive mode
+		runtime_logger.set_default_context(
+			source=EventSource.CLI,
+		)
 
 	def setup_richlog_logging(self) -> None:
 		"""Set up logging to redirect to RichLog widget instead of stdout."""
@@ -763,15 +758,14 @@ class BrowserUseApp(App):
 			# Non-critical, continue
 
 		# Capture telemetry for CLI start
-		self.runtime_logger.log(
-			message='CLI started (interactive)',
-			event_type=EventType.CLI_START,
-			data={
-				'action': 'start',
-				'mode': 'interactive',
-				'model': self.llm.model if self.llm and hasattr(self.llm, 'model') else None,
-				'model_provider': self.llm.provider if self.llm and hasattr(self.llm, 'provider') else None,
-			},
+		self._telemetry.capture(
+			CLITelemetryEvent(
+				version=get_browser_use_version(),
+				action='start',
+				mode='interactive',
+				model=self.llm.model if self.llm and hasattr(self.llm, 'model') else None,
+				model_provider=self.llm.provider if self.llm and hasattr(self.llm, 'provider') else None,
+			)
 		)
 
 		logger.debug('on_mount() completed successfully')
@@ -1045,16 +1039,18 @@ class BrowserUseApp(App):
 			error_msg = None
 
 			try:
-				# Capture telemetry for message sent
-				self.runtime_logger.log(
-					message='CLI message sent',
-					event_type=EventType.CLI_MESSAGE,
+				# Emit CLI task start event via unified RuntimeLogger
+				runtime_logger.emit(
+					event_type=EventType.CLI_TASK_START,
+					source=EventSource.CLI,
+					message=f'Starting CLI task: {task[:100]}...',
 					data={
-						'action': 'message_sent',
 						'mode': 'interactive',
 						'model': self.llm.model if self.llm and hasattr(self.llm, 'model') else None,
 						'model_provider': self.llm.provider if self.llm and hasattr(self.llm, 'provider') else None,
+						'version': get_browser_use_version(),
 					},
+					severity=EventSeverity.INFO,
 				)
 
 				# Run the agent task, redirecting output to RichLog through our handler
@@ -1063,27 +1059,27 @@ class BrowserUseApp(App):
 			except Exception as e:
 				error_msg = str(e)
 				logger.error('\nError running agent: %s', str(e))
-				self.runtime_logger.exception(e, message='CLI agent task failed')
 			finally:
 				# Clear the running flag
 				if self.agent:
 					self.agent.running = False  # type: ignore
 
-				# Capture telemetry for task completion
+				# Emit CLI task end event via unified RuntimeLogger
 				duration = time.time() - task_start_time
-				self.runtime_logger.log(
-					message='CLI task completed' if error_msg is None else 'CLI task error',
-					event_type=EventType.CLI_TASK_COMPLETE,
-					severity=EventSeverity.INFO if error_msg is None else EventSeverity.ERROR,
-					duration_ms=duration * 1000.0,
+				runtime_logger.emit(
+					event_type=EventType.CLI_TASK_END,
+					source=EventSource.CLI,
+					message='CLI task completed' if error_msg is None else f'CLI task failed: {error_msg}',
+					duration_ms=duration * 1000,
+					error_type='AgentRunError' if error_msg else None,
+					error_message=error_msg if error_msg else None,
 					data={
-						'action': 'task_completed' if error_msg is None else 'error',
 						'mode': 'interactive',
 						'model': self.llm.model if self.llm and hasattr(self.llm, 'model') else None,
 						'model_provider': self.llm.provider if self.llm and hasattr(self.llm, 'provider') else None,
-						'duration_seconds': duration,
-						'error_message': error_msg,
+						'version': get_browser_use_version(),
 					},
+					severity=EventSeverity.RESULT if error_msg is None else EventSeverity.ERROR,
 				)
 
 				logger.debug('\n✅ Task completed!')
@@ -1516,7 +1512,12 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 	# The logging is now properly configured by setup_logging()
 	# No need to manually configure handlers since setup_logging() handles it
 
-	# Initialize telemetry
+	# Configure unified RuntimeLogger with CLI context
+	runtime_logger.set_default_context(
+		source=EventSource.CLI,
+	)
+
+	# Initialize telemetry for backward compatibility
 	telemetry = ProductTelemetry()
 	start_time = time.time()
 	error_msg = None
@@ -1529,28 +1530,19 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 		# Get LLM
 		llm = get_llm(config)
 
-		# Unified RuntimeLogger for oneshot mode
-		oneshot_rt = RuntimeLogger(source=EventSource.CLI)
-		oneshot_rt.set_sinks(create_sink_config(console=False, event_bus=False, telemetry=True, cloud=False))
-		oneshot_rt._telemetry.telemetry_client = telemetry
-		try:
-			from uuid_extensions import uuid7str
-
-			oneshot_task_id = f'cli-{uuid7str()}'
-		except Exception:
-			oneshot_task_id = None
-		_oneshot_ctx = oneshot_rt.set_context(task_id=oneshot_task_id)
-
-		# Capture telemetry for CLI start in oneshot mode
-		oneshot_rt.log(
-			message='CLI started (oneshot)',
-			event_type=EventType.CLI_START,
+		# Emit CLI task start event via unified RuntimeLogger
+		# TelemetrySink will automatically convert this to CLITelemetryEvent
+		runtime_logger.emit(
+			event_type=EventType.CLI_TASK_START,
+			source=EventSource.CLI,
+			message=f'Starting CLI task: {prompt[:100]}...',
 			data={
-				'action': 'start',
 				'mode': 'oneshot',
 				'model': llm.model if hasattr(llm, 'model') else None,
 				'model_provider': llm.__class__.__name__ if llm else None,
+				'version': get_browser_use_version(),
 			},
+			severity=EventSeverity.INFO,
 		)
 
 		# Get agent settings from config
@@ -1588,37 +1580,37 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 				# Ignore errors during cleanup
 				pass
 
-		# Capture telemetry for successful completion
-		oneshot_rt.log(
-			message='CLI task completed (oneshot)',
-			event_type=EventType.CLI_TASK_COMPLETE,
-			duration_ms=(time.time() - start_time) * 1000.0,
+		# Emit CLI task end event via unified RuntimeLogger
+		runtime_logger.emit(
+			event_type=EventType.CLI_TASK_END,
+			source=EventSource.CLI,
+			message='CLI task completed successfully',
+			duration_ms=(time.time() - start_time) * 1000,
 			data={
-				'action': 'task_completed',
 				'mode': 'oneshot',
 				'model': llm.model if hasattr(llm, 'model') else None,
 				'model_provider': llm.__class__.__name__ if llm else None,
-				'duration_seconds': time.time() - start_time,
+				'version': get_browser_use_version(),
 			},
+			severity=EventSeverity.RESULT,
 		)
 
 	except Exception as e:
 		error_msg = str(e)
-		# Capture telemetry for error
-		oneshot_rt.log(
-			message='CLI task error (oneshot)',
-			event_type=EventType.CLI_TASK_COMPLETE,
-			severity=EventSeverity.ERROR,
-			duration_ms=(time.time() - start_time) * 1000.0,
+		# Emit CLI task error event via unified RuntimeLogger
+		runtime_logger.emit(
+			event_type=EventType.CLI_TASK_END,
+			source=EventSource.CLI,
+			message=f'CLI task failed: {error_msg}',
+			duration_ms=(time.time() - start_time) * 1000,
 			error=e,
 			data={
-				'action': 'error',
 				'mode': 'oneshot',
 				'model': llm.model if hasattr(llm, 'model') else None,
 				'model_provider': llm.__class__.__name__ if llm and 'llm' in locals() else None,
-				'duration_seconds': time.time() - start_time,
-				'error_message': error_msg,
+				'version': get_browser_use_version(),
 			},
+			severity=EventSeverity.ERROR,
 		)
 		if debug:
 			import traceback
@@ -2080,19 +2072,23 @@ def run_main_interface(ctx: click.Context, debug: bool = False, **kwargs):
 
 	# Check if MCP server mode is activated
 	if kwargs.get('mcp'):
-		# Capture telemetry for MCP server mode via CLI (suppress any logging from this)
+		# Configure unified RuntimeLogger for MCP server mode
+		runtime_logger.set_default_context(
+			source=EventSource.MCP,
+		)
+
+		# Emit MCP server start event via unified RuntimeLogger
+		# TelemetrySink will automatically convert this to telemetry
 		try:
-			mcp_rt = RuntimeLogger(source=EventSource.CLI)
-			mcp_rt.set_sinks(create_sink_config(console=False, event_bus=False, telemetry=True, cloud=False))
-			_tele = ProductTelemetry()
-			mcp_rt._telemetry.telemetry_client = _tele
-			mcp_rt.log(
-				message='CLI starting MCP server',
-				event_type=EventType.CLI_START,
+			runtime_logger.emit(
+				event_type=EventType.MCP_SERVER_START,
+				source=EventSource.MCP,
+				message='MCP server started via CLI',
 				data={
-					'action': 'start',
 					'mode': 'mcp_server',
+					'version': get_browser_use_version(),
 				},
+				severity=EventSeverity.INFO,
 			)
 		except Exception:
 			# Ignore telemetry errors in MCP mode to prevent any stdout contamination

@@ -30,11 +30,10 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, create_model
 
 from browser_use.agent.views import ActionResult
-from browser_use.observability_runtime import EventSeverity, EventSource, EventType, RuntimeLogger, create_sink_config
-from browser_use.telemetry import ProductTelemetry
+from browser_use.telemetry import MCPClientTelemetryEvent, ProductTelemetry
 from browser_use.tools.registry.service import Registry
 from browser_use.tools.service import Tools
-from browser_use.utils import create_task_with_error_handling
+from browser_use.utils import create_task_with_error_handling, get_browser_use_version
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +77,6 @@ class MCPClient:
 		self._disconnect_event = asyncio.Event()
 		self._telemetry = ProductTelemetry()
 
-		self.runtime_logger = RuntimeLogger(source=EventSource.MCP_CLIENT)
-		self.runtime_logger.set_sinks(create_sink_config(console=True, event_bus=False, telemetry=True, cloud=False))
-		self.runtime_logger._telemetry.telemetry_client = self._telemetry
-
 	async def connect(self) -> None:
 		"""Connect to the MCP server and discover available tools."""
 		if self._connected:
@@ -121,19 +116,16 @@ class MCPClient:
 		finally:
 			# Capture telemetry for connect action
 			duration = time.time() - start_time
-			self.runtime_logger.log(
-				message=f'MCP client connected to {self.server_name}',
-				event_type=EventType.MCP_CLIENT_CONNECT,
-				severity=EventSeverity.ERROR if error_msg else EventSeverity.INFO,
-				duration_ms=duration * 1000.0,
-				data={
-					'server_name': self.server_name,
-					'command': self.command,
-					'tools_discovered': len(self._tools),
-					'action': 'connect',
-					'duration_seconds': duration,
-					'error_message': error_msg,
-				},
+			self._telemetry.capture(
+				MCPClientTelemetryEvent(
+					server_name=self.server_name,
+					command=self.command,
+					tools_discovered=len(self._tools),
+					version=get_browser_use_version(),
+					action='connect',
+					duration_seconds=duration,
+					error_message=error_msg,
+				)
 			)
 
 	async def _run_stdio_client(self, server_params: StdioServerParameters):
@@ -204,19 +196,16 @@ class MCPClient:
 		finally:
 			# Capture telemetry for disconnect action
 			duration = time.time() - start_time
-			self.runtime_logger.log(
-				message=f'MCP client disconnected from {self.server_name}',
-				event_type=EventType.MCP_CLIENT_DISCONNECT,
-				severity=EventSeverity.ERROR if error_msg else EventSeverity.INFO,
-				duration_ms=duration * 1000.0,
-				data={
-					'server_name': self.server_name,
-					'command': self.command,
-					'tools_discovered': 0,
-					'action': 'disconnect',
-					'duration_seconds': duration,
-					'error_message': error_msg,
-				},
+			self._telemetry.capture(
+				MCPClientTelemetryEvent(
+					server_name=self.server_name,
+					command=self.command,
+					tools_discovered=0,  # Tools cleared on disconnect
+					version=get_browser_use_version(),
+					action='disconnect',
+					duration_seconds=duration,
+					error_message=error_msg,
+				)
 			)
 			self._telemetry.flush()
 
@@ -347,25 +336,20 @@ class MCPClient:
 					error_msg = f"MCP tool '{tool.name}' failed: {str(e)}"
 					logger.error(error_msg)
 					return ActionResult(error=error_msg, success=False)
-
 				finally:
 					# Capture telemetry for tool call
 					duration = time.time() - start_time
-					tool_name_local = tool.name
-					self.runtime_logger.log(
-						message=f'MCP client tool call: {tool_name_local}',
-						event_type=EventType.MCP_TOOL_CALL,
-						severity=EventSeverity.DEBUG if error_msg is None else EventSeverity.ERROR,
-						duration_ms=duration * 1000.0,
-						data={
-							'server_name': self.server_name,
-							'command': self.command,
-							'tools_discovered': len(self._tools),
-							'action': 'tool_call',
-							'tool_name': tool_name_local,
-							'duration_seconds': duration,
-							'error_message': error_msg,
-						},
+					self._telemetry.capture(
+						MCPClientTelemetryEvent(
+							server_name=self.server_name,
+							command=self.command,
+							tools_discovered=len(self._tools),
+							version=get_browser_use_version(),
+							action='tool_call',
+							tool_name=tool.name,
+							duration_seconds=duration,
+							error_message=error_msg,
+						)
 					)
 		else:
 			# No parameters - empty function signature
@@ -399,21 +383,17 @@ class MCPClient:
 				finally:
 					# Capture telemetry for tool call
 					duration = time.time() - start_time
-					tool_name_local = tool.name
-					self.runtime_logger.log(
-						message=f'MCP client tool call: {tool_name_local}',
-						event_type=EventType.MCP_TOOL_CALL,
-						severity=EventSeverity.DEBUG if error_msg is None else EventSeverity.ERROR,
-						duration_ms=duration * 1000.0,
-						data={
-							'server_name': self.server_name,
-							'command': self.command,
-							'tools_discovered': len(self._tools),
-							'action': 'tool_call',
-							'tool_name': tool_name_local,
-							'duration_seconds': duration,
-							'error_message': error_msg,
-						},
+					self._telemetry.capture(
+						MCPClientTelemetryEvent(
+							server_name=self.server_name,
+							command=self.command,
+							tools_discovered=len(self._tools),
+							version=get_browser_use_version(),
+							action='tool_call',
+							tool_name=tool.name,
+							duration_seconds=duration,
+							error_message=error_msg,
+						)
 					)
 
 		# Set function metadata for better debugging

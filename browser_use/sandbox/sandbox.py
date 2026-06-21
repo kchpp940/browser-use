@@ -15,7 +15,6 @@ from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, Union, c
 import cloudpickle
 import httpx
 
-from browser_use.observability_runtime import EventSeverity, EventSource, EventType, RuntimeLogger, create_sink_config
 from browser_use.sandbox.views import (
 	BrowserCreatedData,
 	ErrorData,
@@ -377,29 +376,6 @@ async def run(browser):
 			execution_started = False
 			received_final_event = False
 
-			# Unified RuntimeLogger - observability runtime (sandbox/cloud layer)
-			sb_rt = RuntimeLogger(source=EventSource.SANDBOX)
-			sb_rt.set_sinks(create_sink_config(console=not quiet, event_bus=False, telemetry=True, cloud=True))
-			try:
-				from uuid_extensions import uuid7str
-
-				_sb_run_id = f'sb-{uuid7str()}'
-			except Exception:
-				_sb_run_id = None
-			_rt_token = sb_rt.set_context(task_id=_sb_run_id)
-			sb_rt.log(
-				event_type=EventType.CLOUD_EXECUTION_START,
-				severity=EventSeverity.INFO,
-				message=f'Starting sandbox execution: {func.__name__}',
-				data={
-					'function_name': func.__name__,
-					'cloud_profile_id': cloud_profile_id,
-					'cloud_proxy_country_code': cloud_proxy_country_code,
-					'cloud_timeout_minutes': cloud_timeout,
-				},
-				task_id=_sb_run_id,
-			)
-
 			async with httpx.AsyncClient(timeout=1800.0) as client:
 				async with client.stream('POST', url, json=payload, headers=request_headers) as response:
 					response.raise_for_status()
@@ -500,24 +476,12 @@ async def run(browser):
 
 									if exec_response.success:
 										execution_result = exec_response.result
-										sb_rt.log(
-											event_type=EventType.CLOUD_EXECUTION_END,
-											severity=EventSeverity.INFO,
-											message=f'Sandbox execution completed: {func.__name__}',
-											data={'success': True},
-										)
 										if not quiet and execution_started:
 											width = get_terminal_width()
 											print('\n' + '─' * width)
 											print()
 									else:
 										error_msg = exec_response.error or 'Unknown error'
-										sb_rt.log(
-											event_type=EventType.CLOUD_EXECUTION_END,
-											severity=EventSeverity.ERROR,
-											message=f'Sandbox execution failed: {func.__name__}',
-											data={'success': False, 'error': error_msg},
-										)
 										raise SandboxError(f'Execution failed: {error_msg}')
 
 								elif event.type == SSEEventType.ERROR:
@@ -537,7 +501,8 @@ async def run(browser):
 								continue
 
 					except (httpx.RemoteProtocolError, httpx.ReadError, httpx.StreamClosed) as e:
-						sb_rt.exception(e, message=f'Sandbox execution failed: {func.__name__}')
+						# With deterministic handshake, these should never happen
+						# If they do, it's a real error
 						raise SandboxError(
 							f'Stream error: {e.__class__.__name__}: {e or "connection closed unexpectedly"}'
 						) from e
