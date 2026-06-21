@@ -149,7 +149,7 @@ except ImportError:
 	logger.error('MCP SDK not installed. Install with: pip install mcp')
 	sys.exit(1)
 
-from browser_use.observability_runtime import EventSource, RuntimeLogger, SinkConfig
+from browser_use.observability_runtime import EventSource, EventType, RuntimeLogger, create_sink_config
 from browser_use.telemetry import MCPServerTelemetryEvent, ProductTelemetry
 from browser_use.utils import create_task_with_error_handling, get_browser_use_version
 
@@ -203,9 +203,9 @@ class BrowserUseServer:
 		self._start_time = time.time()
 
 		# Unified RuntimeLogger - observability runtime (MCP server layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.MCP_SERVER)  # type: ignore[call-arg]
-		self.runtime_logger.set_sinks(SinkConfig(console=True, event_bus=False, telemetry=True, cloud=False))  # type: ignore[reportCallIssue]
-		self.runtime_logger._telemetry.telemetry_client = self._telemetry  # type: ignore[attr-defined]
+		self.runtime_logger = RuntimeLogger(source=EventSource.MCP_SERVER)
+		self.runtime_logger.set_sinks(create_sink_config(console=True, event_bus=False, telemetry=True, cloud=False))
+		self.runtime_logger._telemetry.telemetry_client = self._telemetry
 
 		# Session management
 		self.active_sessions: dict[str, dict[str, Any]] = {}  # session_id -> session info
@@ -469,12 +469,18 @@ class BrowserUseServer:
 			error_msg = None
 			try:
 				result = await self._execute_tool(name, arguments or {})
+				self.runtime_logger.log(
+					event_type=EventType.MCP_TOOL_CALL,
+					message=f'MCP tool called: {name}',
+					data={'tool_name': name, 'arguments': arguments},
+				)
 				if isinstance(result, list):
 					return result
 				return [types.TextContent(type='text', text=result)]
 			except Exception as e:
 				error_msg = str(e)
 				logger.error(f'Tool execution failed: {e}', exc_info=True)
+				self.runtime_logger.exception(e, message=f'MCP tool call failed: {name}')
 				return [types.TextContent(type='text', text=f'Error: {str(e)}')]
 			finally:
 				# Capture telemetry for tool calls
@@ -1113,6 +1119,7 @@ class BrowserUseServer:
 			'last_activity': time.time(),
 			'url': getattr(session, 'current_url', None),
 		}
+		self.runtime_logger.set_context(session_id=session.id)
 
 	def _update_session_activity(self, session_id: str) -> None:
 		"""Update the last activity time for a session."""

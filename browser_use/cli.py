@@ -158,7 +158,7 @@ from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.logging_config import addLoggingLevel
-from browser_use.observability_runtime import EventSource, RuntimeLogger, SinkConfig
+from browser_use.observability_runtime import EventSource, RuntimeLogger, create_sink_config
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
 
@@ -616,9 +616,9 @@ class BrowserUseApp(App):
 		# Timer for info panel updates
 		self._info_panel_timer = None
 		# Unified RuntimeLogger - observability runtime (CLI layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.CLI)  # type: ignore[call-arg]
-		self.runtime_logger.set_sinks(SinkConfig(console=True, event_bus=False, telemetry=True, cloud=False))  # type: ignore[reportCallIssue]
-		self.runtime_logger._telemetry.telemetry_client = self._telemetry  # type: ignore[attr-defined]
+		self.runtime_logger = RuntimeLogger(source=EventSource.CLI)
+		self.runtime_logger.set_sinks(create_sink_config(console=True, event_bus=False, telemetry=True, cloud=False))
+		self.runtime_logger._telemetry.telemetry_client = self._telemetry
 		try:
 			from uuid_extensions import uuid7str
 
@@ -1062,6 +1062,7 @@ class BrowserUseApp(App):
 			except Exception as e:
 				error_msg = str(e)
 				logger.error('\nError running agent: %s', str(e))
+				self.runtime_logger.exception(e, message='CLI agent task failed')
 			finally:
 				# Clear the running flag
 				if self.agent:

@@ -27,7 +27,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger('browser_use.skill_cli.daemon')
 
-from browser_use.observability_runtime import EventSource, RuntimeLogger, SinkConfig
+from browser_use.observability_runtime import EventSource, RuntimeLogger, create_sink_config
 
 
 class Daemon:
@@ -69,9 +69,9 @@ class Daemon:
 		self._auth_token: str = ''
 
 		# Unified RuntimeLogger - observability runtime (skill_cli daemon layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.SKILL_CLI)  # type: ignore[call-arg]
+		self.runtime_logger = RuntimeLogger(source=EventSource.SKILL_CLI)
 		self.runtime_logger.set_sinks(
-			SinkConfig(console=True, event_bus=False, telemetry=True, cloud=bool(self.cloud_profile_id))  # type: ignore[reportCallIssue]
+			create_sink_config(console=True, event_bus=False, telemetry=True, cloud=bool(self.cloud_profile_id))
 		)
 		try:
 			from uuid_extensions import uuid7str
@@ -256,6 +256,7 @@ class Daemon:
 				response = {'id': '', 'success': False, 'error': f'Invalid JSON: {e}'}
 			except Exception as e:
 				logger.exception(f'Error handling request: {e}')
+				self.runtime_logger.exception(e, message=f'Daemon request handling failed: {e}')
 				response = {'id': '', 'success': False, 'error': str(e)}
 
 			writer.write((json.dumps(response) + '\n').encode())
@@ -268,6 +269,7 @@ class Daemon:
 			logger.debug('Connection timeout')
 		except Exception as e:
 			logger.exception(f'Connection error: {e}')
+			self.runtime_logger.exception(e, message=f'Daemon connection error: {e}')
 		finally:
 			writer.close()
 			try:
@@ -341,6 +343,7 @@ class Daemon:
 
 		except Exception as e:
 			logger.exception(f'Error dispatching {action}: {e}')
+			self.runtime_logger.exception(e, message=f'Daemon dispatch failed: {action}')
 			return {'id': req_id, 'success': False, 'error': str(e)}
 
 	async def run(self) -> None:

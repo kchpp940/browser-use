@@ -124,8 +124,6 @@ _LAZY_IMPORTS = {
 	'ChatVercel': ('browser_use.llm.vercel.chat', 'ChatVercel'),
 	# LLM models module
 	'models': ('browser_use.llm.models', None),
-	# Unified observability runtime (RuntimeLogger kept as lazy due to init cost)
-	'RuntimeLogger': ('browser_use.observability_runtime', 'RuntimeLogger'),
 	# Sandbox execution
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
 }

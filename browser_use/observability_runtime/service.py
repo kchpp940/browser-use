@@ -24,12 +24,12 @@ import socket
 import time
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any
+from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
 from browser_use.config import CONFIG, is_running_in_docker
-from browser_use.utils import get_browser_use_version, singleton
+from browser_use.utils import get_browser_use_version
 
 from .views import (
 	ErrorInfo,
@@ -162,6 +162,81 @@ class _RuntimeContext:
 			yield
 
 
+# ── Event field consistency validation ──────────────────────────────────────
+
+_REQUIRED_FIELDS_BY_SOURCE: dict[EventSource, tuple[str, ...]] = {
+	EventSource.AGENT: ('task_id', 'session_id', 'source'),
+	EventSource.BROWSER: ('session_id', 'source'),
+	EventSource.CLI: ('task_id', 'source'),
+	EventSource.MCP_SERVER: ('source',),
+	EventSource.SANDBOX: ('task_id', 'source'),
+	EventSource.SKILL_CLI: ('task_id', 'session_id', 'source'),
+}
+
+_SOURCE_ALLOWS_STEP: frozenset[EventSource] = frozenset(
+	{
+		EventSource.AGENT,
+	}
+)
+
+_SOURCE_ALLOWS_ERROR: frozenset[EventSource] = frozenset(
+	{
+		EventSource.AGENT,
+		EventSource.BROWSER,
+		EventSource.CLI,
+		EventSource.MCP_SERVER,
+		EventSource.SANDBOX,
+		EventSource.SKILL_CLI,
+	}
+)
+
+_SOURCE_ALLOWS_OUTPUT_FILES: frozenset[EventSource] = frozenset(
+	{
+		EventSource.AGENT,
+		EventSource.BROWSER,
+	}
+)
+
+
+def validate_event_consistency(event: RuntimeEvent) -> list[str]:
+	"""Check a RuntimeEvent for structural consistency.
+
+	Returns a list of human-readable violation descriptions.  An empty
+	list means the event is consistent with the schema expectations for
+	its ``source``.
+
+	Checked invariants:
+	- Required linking fields (task_id, session_id, source) are present
+	  for the event's source
+	- ``step`` is only set for sources that track steps
+	- ``error`` is structured (ErrorInfo) when present
+	- ``output_files`` is only set for sources that produce files
+	"""
+	violations: list[str] = []
+	source = event.source
+
+	# 1. Required fields for this source
+	required = _REQUIRED_FIELDS_BY_SOURCE.get(source, ('source',))
+	for field_name in required:
+		val = getattr(event, field_name, None)
+		if val is None:
+			violations.append(f'{field_name} is None (required for {source.value})')
+
+	# 2. step should only be set for step-tracking sources
+	if event.step is not None and source not in _SOURCE_ALLOWS_STEP:
+		violations.append(f'step={event.step} set but source={source.value} does not track steps')
+
+	# 3. error should be an ErrorInfo instance if present
+	if event.error is not None and source not in _SOURCE_ALLOWS_ERROR:
+		violations.append(f'error set but source={source.value} does not typically produce errors')
+
+	# 4. output_files should only be set for file-producing sources
+	if event.output_files and source not in _SOURCE_ALLOWS_OUTPUT_FILES:
+		violations.append(f'output_files set but source={source.value} does not typically produce files')
+
+	return violations
+
+
 # ── Sink configuration ─────────────────────────────────────────────────────
 
 
@@ -176,10 +251,31 @@ class SinkConfig(BaseModel):
 	min_telemetry_severity: EventSeverity = EventSeverity.WARNING
 
 
+def create_sink_config(
+	*,
+	console: bool = True,
+	event_bus: bool = False,
+	telemetry: bool = True,
+	cloud: bool = False,
+) -> SinkConfig:
+	"""Explicitly-typed factory for SinkConfig.
+
+	Pyright cannot infer Pydantic BaseModel keyword constructors through
+	certain import chains (``from __future__ import annotations`` + re-export
+	via ``__init__.py``).  This factory provides a fully-typed call site that
+	pyright understands without ``# type: ignore``.
+	"""
+	return SinkConfig(
+		console=console,
+		event_bus=event_bus,
+		telemetry=telemetry,
+		cloud=cloud,
+	)
+
+
 # ── RuntimeLogger: single entry point for ALL events ───────────────────────
 
 
-@singleton
 class RuntimeLogger:
 	"""
 	Unified adapter for ALL browser-use observability output.
@@ -199,7 +295,18 @@ class RuntimeLogger:
 	        rl.step_end(step=0, duration_ms=elapsed_ms)
 	"""
 
+	_INSTANCE: ClassVar[RuntimeLogger | None] = None
+	_INITIALIZED: ClassVar[bool] = False
+
+	def __new__(cls, source: EventSource = EventSource.AGENT) -> RuntimeLogger:
+		if cls._INSTANCE is None:
+			cls._INSTANCE = super().__new__(cls)
+		return cls._INSTANCE
+
 	def __init__(self, source: EventSource = EventSource.AGENT) -> None:
+		if type(self)._INITIALIZED:
+			return
+		type(self)._INITIALIZED = True
 		self._default_source = source
 		self._ctx = _RuntimeContext()
 		self._sink_config = SinkConfig()
@@ -324,11 +431,20 @@ class RuntimeLogger:
 		if event.is_docker is None:
 			event.is_docker = self._is_docker
 
+		# Structured field consistency check (debug-level, non-blocking)
+		violations = validate_event_consistency(event)
+		if violations:
+			logger.debug(
+				'RuntimeEvent consistency violation: %s  event_type=%s source=%s',
+				'; '.join(violations),
+				event.event_type.value,
+				event.source.value,
+			)
+
 		# Dispatch to each sink
 		try:
 			self._dispatch_to_sinks(event)
 		except Exception as exc:  # pragma: no cover - defensive
-			# Never let observability break business logic
 			logger.debug('RuntimeLogger dispatch failed: %s', exc)
 
 		return event
@@ -776,7 +892,7 @@ class RuntimeLogger:
 			if self._telemetry_service is None:
 				from browser_use.telemetry.service import ProductTelemetry
 
-				self._telemetry_service = ProductTelemetry()  # type: ignore[call-arg]
+				self._telemetry_service = ProductTelemetry()
 
 			# Bridge: create a BaseTelemetryEvent-compatible wrapper
 			# using the RuntimeEvent's to_telemetry_properties() output

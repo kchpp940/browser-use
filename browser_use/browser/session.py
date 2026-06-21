@@ -56,7 +56,7 @@ from browser_use.browser.profile import BrowserProfile, ProxySettings
 from browser_use.browser.views import BrowserStateSummary, TabInfo
 from browser_use.dom.views import DOMRect, EnhancedDOMTreeNode, TargetInfo
 from browser_use.observability import observe_debug
-from browser_use.observability_runtime import EventSource, RuntimeLogger, SinkConfig
+from browser_use.observability_runtime import EventSource, OutputFile, RuntimeLogger, create_sink_config
 from browser_use.utils import _log_pretty_url, create_task_with_error_handling, is_new_tab_page
 
 if TYPE_CHECKING:
@@ -689,20 +689,20 @@ class BrowserSession(BaseModel):
 		BaseWatchdog.attach_handler_to_session(self, CloseTabEvent, self.on_CloseTabEvent)
 
 		# Unified RuntimeLogger - observability runtime (browser layer)
-		self.runtime_logger = RuntimeLogger(source=EventSource.BROWSER)  # type: ignore[call-arg]
+		self.runtime_logger = RuntimeLogger(source=EventSource.BROWSER)
 		_has_cloud = bool(
 			getattr(self, 'cloud_profile_id', None)
 			or (self.browser_profile is not None and getattr(self.browser_profile, 'cloud_profile_id', None))
 		)
 		self.runtime_logger.set_sinks(
-			SinkConfig(  # type: ignore[reportCallIssue]
+			create_sink_config(
 				console=True,
 				event_bus=True,
 				telemetry=True,
 				cloud=_has_cloud,
 			)
 		)
-		self.runtime_logger._event_bus = self.event_bus  # type: ignore[attr-defined]
+		self.runtime_logger._event_bus = self.event_bus
 		self._runtime_logger_context_token = self.runtime_logger.set_context(session_id=self.id)
 
 	@observe_debug(ignore_input=True, ignore_output=True, name='browser_session_start')
@@ -880,6 +880,7 @@ class BrowserSession(BaseModel):
 					'Local browser failed to start. Cloud browsers require no local install and work out of the box.\n'
 					'         Try: Browser(use_cloud=True)  |  Get an API key: https://cloud.browser-use.com?utm_source=oss&utm_medium=browser_launch_failure'
 				)
+			self.runtime_logger.exception(e, message='Browser session start failed')
 			raise
 
 	async def on_NavigateToUrlEvent(self, event: NavigateToUrlEvent) -> None:
@@ -1233,6 +1234,11 @@ class BrowserSession(BaseModel):
 				self.logger.warning(f'FileDownloadedEvent has no path: {event}')
 			else:
 				self.logger.debug(f'File already tracked: {event.path}')
+		self.runtime_logger.info(
+			message=f'File downloaded: {event.path}',
+			data={'file_path': str(event.path)},
+			output_files=[OutputFile(path=str(event.path), size_bytes=getattr(event, 'size', None))],
+		)
 
 	def _cloud_session_id_from_cdp_url(self) -> str | None:
 		"""Derive cloud browser session ID from a Browser Use CDP URL."""
@@ -1291,6 +1297,7 @@ class BrowserSession(BaseModel):
 					details={'cdp_url': self.cdp_url, 'is_local': self.is_local},
 				)
 			)
+			self.runtime_logger.exception(e, message='Browser session stop failed')
 
 	# region - ========== CDP-based replacements for browser_context operations ==========
 	@property

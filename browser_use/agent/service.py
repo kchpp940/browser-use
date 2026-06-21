@@ -71,8 +71,8 @@ from browser_use.observability import observe, observe_debug
 from browser_use.observability_runtime import (
 	EventSource,
 	RuntimeLogger,
-	SinkConfig,
 	TokenUsage,
+	create_sink_config,
 )
 from browser_use.telemetry.service import ProductTelemetry
 from browser_use.telemetry.views import AgentTelemetryEvent
@@ -597,17 +597,17 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.eventbus = EventBus(name=f'Agent_{str(self.id)[-4:]}')
 
 		# Unified RuntimeLogger - observability runtime
-		self.runtime_logger = RuntimeLogger(source=EventSource.AGENT)  # type: ignore[call-arg]
+		self.runtime_logger = RuntimeLogger(source=EventSource.AGENT)
 		self.runtime_logger.set_sinks(
-			SinkConfig(  # type: ignore[reportCallIssue]
+			create_sink_config(
 				console=True,
 				event_bus=True,
 				telemetry=True,
 				cloud=self.browser_session is not None and bool(getattr(self.browser_session, 'cloud_profile_id', None)),
 			)
 		)
-		self.runtime_logger._telemetry.telemetry_client = self.telemetry  # type: ignore[attr-defined]
-		self.runtime_logger._event_bus = self.eventbus  # type: ignore[attr-defined]
+		self.runtime_logger._telemetry.telemetry_client = self.telemetry
+		self.runtime_logger._event_bus = self.eventbus
 
 		if self.settings.save_conversation_path:
 			self.settings.save_conversation_path = Path(self.settings.save_conversation_path).expanduser().resolve()
