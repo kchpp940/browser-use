@@ -17,42 +17,16 @@ import asyncio
 import os
 import sys
 
-# Ensure local repository (browser_use) is accessible
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from browser_use import Agent
-from browser_use.browser import BrowserSession
-from browser_use.tools.service import Tools
-
-
-def get_llm(provider: str):
-	if provider == 'anthropic':
-		from browser_use.llm import ChatAnthropic
-
-		api_key = os.getenv('ANTHROPIC_API_KEY')
-		if not api_key:
-			raise ValueError('Error: ANTHROPIC_API_KEY is not set. Please provide a valid API key.')
-
-		return ChatAnthropic(model='claude-3-5-sonnet-20240620', temperature=0.0)
-	elif provider == 'openai':
-		from browser_use import ChatOpenAI
-
-		api_key = os.getenv('OPENAI_API_KEY')
-		if not api_key:
-			raise ValueError('Error: OPENAI_API_KEY is not set. Please provide a valid API key.')
-
-		return ChatOpenAI(model='gpt-4.1', temperature=0.0)
-
-	else:
-		raise ValueError(f'Unsupported provider: {provider}')
+from browser_use.runtime import BrowserSessionConfig, CommandRuntimeAdapter, LLMConfig, TaskConfig
 
 
 def parse_arguments():
-	"""Parse command-line arguments."""
 	parser = argparse.ArgumentParser(description='Automate browser tasks using an LLM agent.')
 	parser.add_argument(
 		'--query', type=str, help='The query to process', default='go to reddit and search for posts about browser-use'
@@ -67,31 +41,36 @@ def parse_arguments():
 	return parser.parse_args()
 
 
-def initialize_agent(query: str, provider: str):
-	"""Initialize the browser agent with the given query and provider."""
-	llm = get_llm(provider)
-	tools = Tools()
-	browser_session = BrowserSession()
+def build_task_config(query: str, provider: str) -> TaskConfig:
+	llm_config = LLMConfig(provider=provider)
+	if provider == 'anthropic':
+		api_key = os.getenv('ANTHROPIC_API_KEY')
+		if not api_key:
+			raise ValueError('Error: ANTHROPIC_API_KEY is not set. Please provide a valid API key.')
+		llm_config.model = 'claude-3-5-sonnet-20240620'
+		llm_config.temperature = 0.0
+	elif provider == 'openai':
+		api_key = os.getenv('OPENAI_API_KEY')
+		if not api_key:
+			raise ValueError('Error: OPENAI_API_KEY is not set. Please provide a valid API key.')
+		llm_config.model = 'gpt-4.1'
+		llm_config.temperature = 0.0
 
-	return Agent(
+	return TaskConfig(
 		task=query,
-		llm=llm,
-		tools=tools,
-		browser_session=browser_session,
+		llm=llm_config,
+		browser=BrowserSessionConfig(),
 		use_vision=True,
-		max_actions_per_step=1,
-	), browser_session
+		agent_settings={'max_actions_per_step': 1},
+	)
 
 
 async def main():
-	"""Main async function to run the agent."""
 	args = parse_arguments()
-	agent, browser_session = initialize_agent(args.query, args.provider)
-
-	await agent.run(max_steps=25)
-
-	input('Press Enter to close the browser...')
-	await browser_session.kill()
+	task_config = build_task_config(args.query, args.provider)
+	adapter = CommandRuntimeAdapter(task_config)
+	result = await adapter.run_agent(max_steps=25)
+	print(result.format_text())
 
 
 if __name__ == '__main__':

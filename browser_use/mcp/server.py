@@ -37,8 +37,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from browser_use.llm import ChatAWSBedrock
-
 # Configure logging for MCP mode - redirect to stderr but preserve critical diagnostics
 logging.basicConfig(
 	stream=sys.stderr, level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', force=True
@@ -90,11 +88,10 @@ _configure_mcp_server_logging()
 logging.disable(logging.CRITICAL)
 
 # Import browser_use modules
-from browser_use import ActionModel, Agent
-from browser_use.browser import BrowserProfile, BrowserSession
+from browser_use import ActionModel
+from browser_use.browser import BrowserSession
 from browser_use.config import get_default_llm, get_default_profile, load_browser_use_config
 from browser_use.filesystem.file_system import FileSystem
-from browser_use.llm.openai.chat import ChatOpenAI
 from browser_use.tools.service import Tools
 
 logger = logging.getLogger(__name__)
@@ -193,10 +190,10 @@ class BrowserUseServer:
 
 		self.server = Server('browser-use')
 		self.config = load_browser_use_config()
-		self.agent: Agent | None = None
+		self.agent: Any | None = None
 		self.browser_session: BrowserSession | None = None
 		self.tools: Tools | None = None
-		self.llm: ChatOpenAI | None = None
+		self.llm: Any | None = None
 		self.file_system: FileSystem | None = None
 		self._telemetry = ProductTelemetry()
 		self._start_time = time.time()
@@ -569,66 +566,55 @@ class BrowserUseServer:
 		return f'Unknown tool: {tool_name}'
 
 	async def _init_browser_session(self, allowed_domains: list[str] | None = None, **kwargs):
-		"""Initialize browser session using config"""
+		"""Initialize browser session using CommandRuntimeAdapter."""
 		if self.browser_session:
 			return
 
-		# Ensure all logging goes to stderr before browser initialization
 		_ensure_all_loggers_use_stderr()
-
 		logger.debug('Initializing browser session...')
 
-		# Get profile config
+		from browser_use.runtime import BrowserSessionConfig, CommandRuntimeAdapter, LLMConfig, TaskConfig
+
 		profile_config = get_default_profile(self.config)
+		llm_config_dict = get_default_llm(self.config)
 
-		# Merge profile config with defaults and overrides
-		profile_data = {
-			'downloads_path': str(Path.home() / 'Downloads' / 'browser-use-mcp'),
-			'wait_between_actions': 0.5,
-			'keep_alive': True,
-			'user_data_dir': '~/.config/browseruse/profiles/default',
-			'device_scale_factor': 1.0,
-			'disable_security': False,
-			'headless': False,
-			**profile_config,  # Config values override defaults
-		}
+		bs_config = BrowserSessionConfig(
+			headless=profile_config.get('headless', False),
+			keep_alive=True,
+			user_data_dir=profile_config.get('user_data_dir', '~/.config/browseruse/profiles/default'),
+			device_scale_factor=profile_config.get('device_scale_factor', 1.0),
+			disable_security=profile_config.get('disable_security', False),
+			wait_between_actions=profile_config.get('wait_between_actions', 0.5),
+			downloads_path=str(Path.home() / 'Downloads' / 'browser-use-mcp'),
+			allowed_domains=allowed_domains if allowed_domains else profile_config.get('allowed_domains'),
+			**{k: v for k, v in kwargs.items() if v is not None},
+		)
 
-		# Tool parameter overrides (highest priority)
-		if allowed_domains is not None:
-			profile_data['allowed_domains'] = allowed_domains
+		llm_config = LLMConfig(
+			provider='auto',
+			model=llm_config_dict.get('model'),
+			temperature=llm_config_dict.get('temperature', 0.7),
+			api_key=llm_config_dict.get('api_key'),
+			base_url=llm_config_dict.get('base_url'),
+		)
+		if llm_config_dict.get('model_provider', '').lower() == 'bedrock':
+			llm_config.provider = 'aws_bedrock'
+			llm_config.aws_region = llm_config_dict.get('region')
+			llm_config.aws_sso_auth = llm_config_dict.get('aws_sso_auth', False)
 
-		# Merge any additional kwargs that are valid BrowserProfile fields
-		for key, value in kwargs.items():
-			profile_data[key] = value
+		task_config = TaskConfig(task='', llm=llm_config, browser=bs_config)
+		adapter = CommandRuntimeAdapter(task_config)
 
-		# Create browser profile
-		profile = BrowserProfile(**profile_data)
-
-		# Create browser session
-		self.browser_session = BrowserSession(browser_profile=profile)
+		self.browser_session = adapter.create_browser_session_sync()
 		await self.browser_session.start()
 
-		# Track the session for management
 		self._track_session(self.browser_session)
-
-		# Create tools for direct actions
 		self.tools = Tools()
 
-		# Initialize LLM from config
-		llm_config = get_default_llm(self.config)
-		base_url = llm_config.get('base_url', None)
-		kwargs = {}
-		if base_url:
-			kwargs['base_url'] = base_url
-		if api_key := llm_config.get('api_key'):
-			self.llm = ChatOpenAI(
-				model=llm_config.get('model', 'gpt-o4-mini'),
-				api_key=api_key,
-				temperature=llm_config.get('temperature', 0.7),
-				**kwargs,
-			)
+		llm = adapter.resolve_llm()
+		if llm is not None:
+			self.llm = llm
 
-		# Initialize FileSystem for extraction actions
 		file_system_path = profile_config.get('file_system_path', '~/.browser-use-mcp')
 		self.file_system = FileSystem(base_dir=Path(file_system_path).expanduser())
 
@@ -642,101 +628,46 @@ class BrowserUseServer:
 		allowed_domains: list[str] | None = None,
 		use_vision: bool = True,
 	) -> str:
-		"""Run an autonomous agent task."""
+		"""Run an autonomous agent task using CommandRuntimeAdapter."""
+		from browser_use.runtime import BrowserSessionConfig, CommandRuntimeAdapter, LLMConfig, TaskConfig
+
 		logger.debug(f'Running agent task: {task}')
 
-		# Get LLM config
-		llm_config = get_default_llm(self.config)
+		llm_config_dict = get_default_llm(self.config)
+		model_provider = llm_config_dict.get('model_provider') or os.getenv('MODEL_PROVIDER')
 
-		# Get LLM provider
-		model_provider = llm_config.get('model_provider') or os.getenv('MODEL_PROVIDER')
+		llm_config = LLMConfig(
+			provider='aws_bedrock' if model_provider and model_provider.lower() == 'bedrock' else 'auto',
+			model=model or llm_config_dict.get('model'),
+			temperature=llm_config_dict.get('temperature', 0.7),
+			api_key=llm_config_dict.get('api_key') or os.getenv('OPENAI_API_KEY'),
+			base_url=llm_config_dict.get('base_url'),
+			aws_region=llm_config_dict.get('region') or os.getenv('REGION', 'us-east-1'),
+			aws_sso_auth=llm_config_dict.get('aws_sso_auth', False),
+		)
 
-		# Get Bedrock-specific config
-		if model_provider and model_provider.lower() == 'bedrock':
-			llm_model = llm_config.get('model') or os.getenv('MODEL') or 'us.anthropic.claude-sonnet-4-20250514-v1:0'
-			aws_region = llm_config.get('region') or os.getenv('REGION')
-			if not aws_region:
-				aws_region = 'us-east-1'
-			aws_sso_auth = llm_config.get('aws_sso_auth', False)
-			llm = ChatAWSBedrock(
-				model=llm_model,  # or any Bedrock model
-				aws_region=aws_region,
-				aws_sso_auth=aws_sso_auth,
-			)
-		else:
-			api_key = llm_config.get('api_key') or os.getenv('OPENAI_API_KEY')
-			if not api_key:
-				return 'Error: OPENAI_API_KEY not set in config or environment'
-
-			# Use explicit model from tool call, otherwise fall back to configured default
-			llm_model = model or llm_config.get('model', 'gpt-4o')
-
-			base_url = llm_config.get('base_url', None)
-			kwargs = {}
-			if base_url:
-				kwargs['base_url'] = base_url
-			llm = ChatOpenAI(
-				model=llm_model,
-				api_key=api_key,
-				temperature=llm_config.get('temperature', 0.7),
-				**kwargs,
-			)
-
-		# Get profile config and merge with tool parameters
 		profile_config = get_default_profile(self.config)
-
-		# Override allowed_domains only when the client supplied a non-empty list.
-		# Treating an empty list as an override would silently disable any
-		# admin-configured allowlist on the default profile, since
-		# SecurityWatchdog interprets allowed_domains=[] as "no restrictions".
+		bs_config = BrowserSessionConfig(**{
+			k: v for k, v in profile_config.items() if v is not None
+		})
 		if allowed_domains:
-			profile_config['allowed_domains'] = allowed_domains
+			bs_config.allowed_domains = allowed_domains
 
-		# Create browser profile using config
-		profile = BrowserProfile(**profile_config)
-
-		# Create and run agent
-		agent = Agent(
+		task_config = TaskConfig(
 			task=task,
-			llm=llm,
-			browser_profile=profile,
+			llm=llm_config,
+			browser=bs_config,
+			max_steps=max_steps,
 			use_vision=use_vision,
 		)
 
-		try:
-			history = await agent.run(max_steps=max_steps)
+		adapter = CommandRuntimeAdapter(task_config)
+		result = await adapter.run_agent(max_steps=max_steps)
 
-			# Format results
-			results = []
-			results.append(f'Task completed in {len(history.history)} steps')
-			results.append(f'Success: {history.is_successful()}')
+		if not result.success:
+			return f'Agent task failed: {result.errors[0] if result.errors else "unknown error"}'
 
-			# Get final result if available
-			final_result = history.final_result()
-			if final_result:
-				results.append(f'\nFinal result:\n{final_result}')
-
-			# Include any errors
-			errors = history.errors()
-			if errors:
-				results.append(f'\nErrors encountered:\n{json.dumps(errors, indent=2)}')
-
-			# Include URLs visited
-			urls = history.urls()
-			if urls:
-				# Filter out None values and convert to strings
-				valid_urls = [str(url) for url in urls if url is not None]
-				if valid_urls:
-					results.append(f'\nURLs visited: {", ".join(valid_urls)}')
-
-			return '\n'.join(results)
-
-		except Exception as e:
-			logger.error(f'Agent task failed: {e}', exc_info=True)
-			return f'Agent task failed: {str(e)}'
-		finally:
-			# Clean up
-			await agent.close()
+		return result.format_text()
 
 	async def _navigate(self, url: str, new_tab: bool = False) -> str:
 		"""Navigate to a URL."""
