@@ -286,12 +286,13 @@ if [ $RELEASE_MODE -eq 1 ]; then
         exit 1
     fi
     
-    # ─── Isolated install tests (only in --isolated mode) ───
+    # ─── Isolated install tests (RELEASE HARD CONSTRAINT) ───
     if [ $ISOLATED_MODE -eq 1 ]; then
         echo ""
-        echo "🔬 Running isolated install tests (slow)..."
+        echo "🔬 Running isolated install tests (release hard constraint - all 5 combos)"
+        echo "   Combos: core, [cli], [aws], [oci], [all]"
         ISOLATED_START=$(date +%s)
-        if bash "$SCRIPT_DIR/check_isolated_installs.sh" --quick --keep 2>&1 | tee "$TEMP_DIR/isolated.log"; then
+        if bash "$SCRIPT_DIR/check_isolated_installs.sh" --keep 2>&1 | tee "$TEMP_DIR/isolated.log"; then
             ISOLATED_DURATION=$(($(date +%s) - ISOLATED_START))
             echo ""
             echo "✅ Isolated install tests passed! (${ISOLATED_DURATION}s)"
@@ -300,7 +301,7 @@ if [ $RELEASE_MODE -eq 1 ]; then
             echo ""
             echo "❌ Isolated install tests failed! (${ISOLATED_DURATION}s)"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            tail -50 "$TEMP_DIR/isolated.log"
+            tail -80 "$TEMP_DIR/isolated.log"
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
             exit 1
         fi

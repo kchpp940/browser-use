@@ -434,15 +434,15 @@ else
     check_warn "Skipping Python release tests (--quick mode)"
 fi
 
-# ─── 12. Isolated install tests (optional, slow) ───
+# ─── 12. Isolated install tests (RELEASE HARD CONSTRAINT) ───
 if [ $ISOLATED_MODE -eq 1 ]; then
     echo ""
-    echo "12. Running isolated install tests (slow)..."
+    echo "12. Running isolated install tests (release hard constraint - all combos)"
     
-    if bash "$SCRIPT_DIR/check_isolated_installs.sh" --quick; then
-        check_pass "Isolated install tests passed"
+    if bash "$SCRIPT_DIR/check_isolated_installs.sh" --keep; then
+        check_pass "Isolated install tests passed (all 5 combos: core, cli, aws, oci, all-extras)"
     else
-        check_fail "Isolated install tests failed"
+        check_fail "Isolated install tests failed - check venvs in /tmp/browser-use-isolated-test"
     fi
 fi
 
