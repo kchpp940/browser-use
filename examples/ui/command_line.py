@@ -42,7 +42,11 @@ def parse_arguments():
 
 
 def build_task_config(query: str, provider: str) -> TaskConfig:
-	llm_config = LLMConfig(provider=provider)
+	from typing import Literal, cast
+
+	llm_config = LLMConfig(
+		provider=cast(Literal['openai', 'anthropic', 'google', 'browser_use', 'aws_bedrock', 'auto'], provider)
+	)
 	if provider == 'anthropic':
 		api_key = os.getenv('ANTHROPIC_API_KEY')
 		if not api_key:
@@ -61,6 +65,7 @@ def build_task_config(query: str, provider: str) -> TaskConfig:
 		llm=llm_config,
 		browser=BrowserSessionConfig(),
 		use_vision=True,
+		max_steps=25,
 		agent_settings={'max_actions_per_step': 1},
 	)
 
@@ -69,8 +74,12 @@ async def main():
 	args = parse_arguments()
 	task_config = build_task_config(args.query, args.provider)
 	adapter = CommandRuntimeAdapter(task_config)
-	result = await adapter.run_agent(max_steps=25)
-	print(result.format_text())
+
+	result = await adapter.run_cli_task()
+
+	# Unified CLI output + exit code handling
+	print(result.format_cli())
+	sys.exit(result.exit_code)
 
 
 if __name__ == '__main__':

@@ -308,6 +308,35 @@ class Daemon:
 
 			from browser_use.skill_cli.commands import browser, python_exec
 
+			# Agent-based task execution — uses CommandRuntimeAdapter.for_skill() + run_skill_command()
+			if action == 'run_agent_task':
+				task = params.get('task', '')
+				if not task:
+					return {'id': req_id, 'success': False, 'error': 'Missing required param: task'}
+
+				from browser_use.runtime import CommandRuntimeAdapter
+
+				adapter = CommandRuntimeAdapter.for_skill(
+					task,
+					llm_provider=params.get('llm_provider', 'auto'),
+					llm_model=params.get('llm_model'),
+					llm_temperature=params.get('llm_temperature', 0.0),
+					llm_api_key=params.get('llm_api_key'),
+					headed=self.headed,
+					headless=params.get('headless'),
+					profile=self.profile if not self.cdp_url and not self.use_cloud else None,
+					cdp_url=self.cdp_url,
+					use_cloud=self.use_cloud,
+					cloud_profile_id=params.get('cloud_profile_id'),
+					cloud_proxy_country_code=params.get('cloud_proxy_country_code'),
+					cloud_timeout=params.get('cloud_timeout'),
+					max_steps=params.get('max_steps', 100),
+					use_vision=params.get('use_vision', True),
+				)
+				result_env = await adapter.run_skill_command(request_id=req_id)
+				logger.info(f'Agent task completed: success={result_env["success"]}')
+				return result_env
+
 			# Get or create the single session
 			session = await self._get_or_create_session()
 

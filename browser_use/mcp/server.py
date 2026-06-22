@@ -606,9 +606,12 @@ class BrowserUseServer:
 		adapter = CommandRuntimeAdapter(task_config)
 
 		self.browser_session = adapter.create_browser_session_sync()
-		await self.browser_session.start()
+		if self.browser_session is not None:
+			await self.browser_session.start()
+			self._track_session(self.browser_session)
+		else:
+			logger.warning('BrowserSession could not be created')
 
-		self._track_session(self.browser_session)
 		self.tools = Tools()
 
 		llm = adapter.resolve_llm()
@@ -628,7 +631,11 @@ class BrowserUseServer:
 		allowed_domains: list[str] | None = None,
 		use_vision: bool = True,
 	) -> str:
-		"""Run an autonomous agent task using CommandRuntimeAdapter.for_mcp()."""
+		"""Run an autonomous agent task using CommandRuntimeAdapter.for_mcp().
+
+		Returns RunResult.format_mcp() — a human-readable summary string that's
+		ready for MCP TextContent wrapping.
+		"""
 		from browser_use.runtime import CommandRuntimeAdapter
 
 		logger.debug(f'Running agent task: {task}')
@@ -643,7 +650,45 @@ class BrowserUseServer:
 			max_steps=max_steps,
 		)
 
-		return await adapter.run_mcp_tool()
+		def on_start(ad: CommandRuntimeAdapter, llm: Any) -> None:
+			self._telemetry.capture(
+				MCPServerTelemetryEvent(
+					version=get_browser_use_version(),
+					action='agent_task_start',
+					tool_name='retry_with_browser_use_agent',
+					duration_seconds=0,
+					error_message=None,
+				)
+			)
+
+		def on_complete(ad: CommandRuntimeAdapter, result: Any) -> None:
+			self._telemetry.capture(
+				MCPServerTelemetryEvent(
+					version=get_browser_use_version(),
+					action='agent_task_complete' if result.success else 'agent_task_error',
+					tool_name='retry_with_browser_use_agent',
+					duration_seconds=result.duration_seconds,
+					error_message=result.format_error() or None,
+				)
+			)
+
+		def on_error(ad: CommandRuntimeAdapter, error: Exception, duration: float) -> None:
+			self._telemetry.capture(
+				MCPServerTelemetryEvent(
+					version=get_browser_use_version(),
+					action='agent_task_error',
+					tool_name='retry_with_browser_use_agent',
+					duration_seconds=duration,
+					error_message=str(error),
+				)
+			)
+
+		return await adapter.run_mcp_tool(
+			max_steps=max_steps,
+			on_start=on_start,
+			on_complete=on_complete,
+			on_error=on_error,
+		)
 
 	async def _navigate(self, url: str, new_tab: bool = False) -> str:
 		"""Navigate to a URL."""

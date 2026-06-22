@@ -460,26 +460,47 @@ def test_cli_module_uses_commandruntimeadapter():
 
 
 def test_mcp_server_module_uses_for_mcp_and_run_mcp_tool():
-	"""Verify mcp/server.py uses the adapter layer via static AST check."""
+	"""Verify mcp/server.py uses the adapter layer via static AST check.
+
+	Locks three things: for_mcp() constructor, run_mcp_tool() runner, and
+	RunResult.format_mcp() for result serialization.
+	"""
 	import ast
 	from pathlib import Path
 
 	server_path = Path(__file__).resolve().parents[3] / 'browser_use' / 'mcp' / 'server.py'
 	assert server_path.exists(), f'mcp/server.py not found at {server_path}'
 
-	tree = ast.parse(server_path.read_text())
+	source = server_path.read_text()
+	tree = ast.parse(source)
 
 	found_for_mcp = False
 	found_run_mcp_tool = False
+	found_format_mcp_call = False
+	found_lifecycle_hooks = False
 	for node in ast.walk(tree):
 		if isinstance(node, ast.Attribute):
 			if node.attr == 'for_mcp':
 				found_for_mcp = True
 			elif node.attr == 'run_mcp_tool':
 				found_run_mcp_tool = True
+			elif node.attr == 'format_mcp':
+				found_format_mcp_call = True
+		if isinstance(node, ast.Name) and node.id in ('on_start', 'on_complete', 'on_error'):
+			found_lifecycle_hooks = True
+
+	# Also check the raw string for the `format_mcp` reference (which may live
+	# inside adapter.py but adapter.py references RunResult.format_mcp).
+	found_format_mcp_in_adapter = False
+	adapter_path = Path(__file__).resolve().parents[3] / 'browser_use' / 'runtime' / 'adapter.py'
+	if adapter_path.exists():
+		if 'format_mcp' in adapter_path.read_text():
+			found_format_mcp_in_adapter = True
 
 	assert found_for_mcp, 'mcp/server.py must use CommandRuntimeAdapter.for_mcp()'
 	assert found_run_mcp_tool, 'mcp/server.py must use CommandRuntimeAdapter.run_mcp_tool()'
+	assert found_lifecycle_hooks, 'mcp/server.py must pass lifecycle hooks to run_mcp_tool()'
+	assert found_format_mcp_in_adapter, 'adapter.py must call RunResult.format_mcp() for MCP serialization'
 
 
 def test_skill_cli_sessions_uses_browser_config_conversion():
@@ -504,3 +525,44 @@ def test_skill_cli_sessions_uses_browser_config_conversion():
 			break
 
 	assert found, 'skill_cli/sessions.py must use _browser_config_to_profile_kwargs'
+
+
+def test_skill_cli_daemon_has_run_agent_task_through_adapter():
+	"""Verify skill_cli/daemon.py exposes run_agent_task action via for_skill + run_skill_command."""
+	import ast
+	from pathlib import Path
+
+	daemon_path = (
+		Path(__file__).resolve().parents[3] / 'browser_use' / 'skill_cli' / 'daemon.py'
+	)
+	assert daemon_path.exists()
+
+	source = daemon_path.read_text()
+	tree = ast.parse(source)
+
+	found_action = False
+	found_for_skill = False
+	found_run_skill_command = False
+	found_to_skill_response_in_adapter = False
+
+	for node in ast.walk(tree):
+		# Check for `action == 'run_agent_task'`
+		if isinstance(node, ast.Compare):
+			for cmp_ in node.comparators:
+				if isinstance(cmp_, ast.Constant) and cmp_.value == 'run_agent_task':
+					found_action = True
+		if isinstance(node, ast.Attribute):
+			if node.attr == 'for_skill':
+				found_for_skill = True
+			elif node.attr == 'run_skill_command':
+				found_run_skill_command = True
+
+	adapter_path = Path(__file__).resolve().parents[3] / 'browser_use' / 'runtime' / 'adapter.py'
+	if adapter_path.exists():
+		if 'to_skill_response' in adapter_path.read_text():
+			found_to_skill_response_in_adapter = True
+
+	assert found_action, "skill_cli/daemon.py must define 'run_agent_task' action branch"
+	assert found_for_skill, "skill_cli/daemon.py must use CommandRuntimeAdapter.for_skill() for 'run_agent_task'"
+	assert found_run_skill_command, "skill_cli/daemon.py must use adapter.run_skill_command() for 'run_agent_task'"
+	assert found_to_skill_response_in_adapter, 'adapter.py must call RunResult.to_skill_response() for skill_cli envelope'
