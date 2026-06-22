@@ -158,7 +158,6 @@ from browser_use import Agent, Controller
 from browser_use.agent.views import AgentSettings
 from browser_use.browser import BrowserSession
 from browser_use.logging_config import addLoggingLevel
-from browser_use.runtime.adapter import create_task_config_from_cli_dict
 from browser_use.telemetry import CLITelemetryEvent, ProductTelemetry
 from browser_use.utils import get_browser_use_version
 
@@ -1495,22 +1494,8 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 	setup_logging()
 
 	telemetry = ProductTelemetry()
-	start_time = time.time()
-	error_msg = None
 
-	try:
-		config = load_user_config()
-		config = update_config_with_click_args(config, ctx)
-
-		task_config = create_task_config_from_cli_dict(config)
-		task_config.task = prompt
-		task_config.source = 'cli'
-		if task_config.browser.user_data_dir is None:
-			task_config.browser.user_data_dir = str(USER_DATA_DIR)
-
-		adapter = CommandRuntimeAdapter(task_config)
-		llm = adapter.resolve_llm()
-
+	def on_start(adapter: CommandRuntimeAdapter, llm: Any) -> None:
 		telemetry.capture(
 			CLITelemetryEvent(
 				version=get_browser_use_version(),
@@ -1521,27 +1506,20 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 			)
 		)
 
-		result = await adapter.run_agent()
-
+	def on_complete(adapter: CommandRuntimeAdapter, result: Any) -> None:
 		telemetry.capture(
 			CLITelemetryEvent(
 				version=get_browser_use_version(),
 				action='task_completed' if result.success else 'error',
 				mode='oneshot',
-				model=llm.model if hasattr(llm, 'model') else None,
-				model_provider=llm.__class__.__name__ if llm else None,
+				model=None,
+				model_provider=None,
 				duration_seconds=result.duration_seconds,
-				error_message=error_msg,
+				error_message=None,
 			)
 		)
 
-		if not result.success:
-			if result.errors:
-				print(f'Error: {result.errors[0]}', file=sys.stderr)
-			sys.exit(result.exit_code)
-
-	except Exception as e:
-		error_msg = str(e)
+	def on_error(adapter: CommandRuntimeAdapter, error: Exception, duration: float) -> None:
 		telemetry.capture(
 			CLITelemetryEvent(
 				version=get_browser_use_version(),
@@ -1549,8 +1527,45 @@ async def run_prompt_mode(prompt: str, ctx: click.Context, debug: bool = False):
 				mode='oneshot',
 				model=None,
 				model_provider=None,
-				duration_seconds=time.time() - start_time,
-				error_message=error_msg,
+				duration_seconds=duration,
+				error_message=str(error),
+			)
+		)
+
+	try:
+		config = load_user_config()
+		config = update_config_with_click_args(config, ctx)
+
+		adapter = CommandRuntimeAdapter.for_cli(
+			prompt,
+			user_config=config,
+			click_ctx=ctx,
+			source='cli',
+			user_data_dir=str(USER_DATA_DIR),
+		)
+
+		result = await adapter.run_cli_task(
+			on_start=on_start,
+			on_complete=on_complete,
+			on_error=on_error,
+		)
+
+		if not result.success:
+			err = result.format_error()
+			if err:
+				print(f'Error: {err}', file=sys.stderr)
+			sys.exit(result.exit_code)
+
+	except Exception as e:
+		telemetry.capture(
+			CLITelemetryEvent(
+				version=get_browser_use_version(),
+				action='error',
+				mode='oneshot',
+				model=None,
+				model_provider=None,
+				duration_seconds=0,
+				error_message=str(e),
 			)
 		)
 		if debug:
@@ -1588,18 +1603,20 @@ async def textual_interface(config: dict[str, Any]):
 
 	logger.debug('Setting up Browser, Controller, and LLM...')
 
-	task_config = create_task_config_from_cli_dict(config)
-	if task_config.browser.user_data_dir is None:
-		task_config.browser.user_data_dir = str(USER_DATA_DIR)
-	adapter = CommandRuntimeAdapter(task_config)
+	adapter = CommandRuntimeAdapter.for_cli(
+		'',
+		user_config=config,
+		source='cli',
+		user_data_dir=str(USER_DATA_DIR),
+	)
 
 	logger.debug('Initializing BrowserSession...')
 	try:
 		browser_session = adapter.create_browser_session_sync()
 		logger.info('Browser type: chromium')
-		if task_config.browser.executable_path:
-			logger.info(f'Browser binary: {task_config.browser.executable_path}')
-		if task_config.browser.headless:
+		if adapter.task_config.browser.executable_path:
+			logger.info(f'Browser binary: {adapter.task_config.browser.executable_path}')
+		if adapter.task_config.browser.headless:
 			logger.info('Browser mode: headless')
 		else:
 			logger.info('Browser mode: visible')

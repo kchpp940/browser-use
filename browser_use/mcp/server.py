@@ -628,46 +628,22 @@ class BrowserUseServer:
 		allowed_domains: list[str] | None = None,
 		use_vision: bool = True,
 	) -> str:
-		"""Run an autonomous agent task using CommandRuntimeAdapter."""
-		from browser_use.runtime import BrowserSessionConfig, CommandRuntimeAdapter, LLMConfig, TaskConfig
+		"""Run an autonomous agent task using CommandRuntimeAdapter.for_mcp()."""
+		from browser_use.runtime import CommandRuntimeAdapter
 
 		logger.debug(f'Running agent task: {task}')
 
-		llm_config_dict = get_default_llm(self.config)
-		model_provider = llm_config_dict.get('model_provider') or os.getenv('MODEL_PROVIDER')
-
-		llm_config = LLMConfig(
-			provider='aws_bedrock' if model_provider and model_provider.lower() == 'bedrock' else 'auto',
-			model=model or llm_config_dict.get('model'),
-			temperature=llm_config_dict.get('temperature', 0.7),
-			api_key=llm_config_dict.get('api_key') or os.getenv('OPENAI_API_KEY'),
-			base_url=llm_config_dict.get('base_url'),
-			aws_region=llm_config_dict.get('region') or os.getenv('REGION', 'us-east-1'),
-			aws_sso_auth=llm_config_dict.get('aws_sso_auth', False),
-		)
-
-		profile_config = get_default_profile(self.config)
-		bs_config = BrowserSessionConfig(**{
-			k: v for k, v in profile_config.items() if v is not None
-		})
-		if allowed_domains:
-			bs_config.allowed_domains = allowed_domains
-
-		task_config = TaskConfig(
-			task=task,
-			llm=llm_config,
-			browser=bs_config,
-			max_steps=max_steps,
+		adapter = CommandRuntimeAdapter.for_mcp(
+			task,
+			profile_config=get_default_profile(self.config),
+			llm_config_dict=get_default_llm(self.config),
+			model_override=model,
+			allowed_domains=allowed_domains,
 			use_vision=use_vision,
+			max_steps=max_steps,
 		)
 
-		adapter = CommandRuntimeAdapter(task_config)
-		result = await adapter.run_agent(max_steps=max_steps)
-
-		if not result.success:
-			return f'Agent task failed: {result.errors[0] if result.errors else "unknown error"}'
-
-		return result.format_text()
+		return await adapter.run_mcp_tool()
 
 	async def _navigate(self, url: str, new_tab: bool = False) -> str:
 		"""Navigate to a URL."""

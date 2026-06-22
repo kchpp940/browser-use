@@ -144,6 +144,267 @@ class CommandRuntimeAdapter:
 			finally:
 				self._browser_session = None
 
+	async def run_cli_task(
+		self,
+		max_steps: int | None = None,
+		on_start: Any | None = None,
+		on_complete: Any | None = None,
+		on_error: Any | None = None,
+	) -> RunResult:
+		"""Run agent for CLI oneshot mode with optional lifecycle hooks.
+
+		Parameters
+		----------
+		max_steps
+			Override the task_config.max_steps if provided.
+		on_start
+			Optional sync/async callable called with ``(adapter, llm)``
+			*after* LLM resolve but *before* agent start (for telemetry).
+		on_complete
+			Optional sync/async callable called with ``(adapter, result)``
+			after successful completion (for telemetry).
+		on_error
+			Optional sync/async callable called with ``(adapter, error, duration)``
+			if an exception escapes run_agent (for telemetry).
+
+		Returns
+		-------
+		RunResult
+			Always a valid RunResult (errors are converted, never raised).
+		"""
+		import asyncio as _asyncio
+
+		start = time.time()
+		try:
+			llm = self.resolve_llm()
+			if on_start is not None:
+				try:
+					if _asyncio.iscoroutinefunction(on_start):
+						await on_start(self, llm)
+					else:
+						on_start(self, llm)
+				except Exception:
+					logger.debug('run_cli_task on_start hook failed (ignored)', exc_info=True)
+
+			result = await self.run_agent(max_steps=max_steps)
+
+			if on_complete is not None:
+				try:
+					if _asyncio.iscoroutinefunction(on_complete):
+						await on_complete(self, result)
+					else:
+						on_complete(self, result)
+				except Exception:
+					logger.debug('run_cli_task on_complete hook failed (ignored)', exc_info=True)
+
+			return result
+
+		except Exception as e:
+			duration = time.time() - start
+			logger.exception('run_cli_task outer exception: %s', e)
+			if on_error is not None:
+				try:
+					if _asyncio.iscoroutinefunction(on_error):
+						await on_error(self, e, duration)
+					else:
+						on_error(self, e, duration)
+				except Exception:
+					logger.debug('run_cli_task on_error hook failed (ignored)', exc_info=True)
+			return RunResult.from_error(e, duration=duration)
+		finally:
+			await self.cleanup()
+
+	async def run_mcp_tool(
+		self,
+		max_steps: int | None = None,
+		on_start: Any | None = None,
+		on_complete: Any | None = None,
+		on_error: Any | None = None,
+	) -> str:
+		"""Run agent as an MCP tool and return formatted text response.
+
+		Equivalent to ``(await run_cli_task(...)).format_mcp()`` with the same
+		lifecycle hooks, but always returns a string suitable for MCP
+		``TextContent`` — never raises.
+		"""
+		result = await self.run_cli_task(
+			max_steps=max_steps,
+			on_start=on_start,
+			on_complete=on_complete,
+			on_error=on_error,
+		)
+		return result.format_mcp()
+
+	async def run_skill_command(
+		self,
+		request_id: str = '',
+		max_steps: int | None = None,
+	) -> dict[str, Any]:
+		"""Run agent as a skill_cli daemon command and return JSON response envelope.
+
+		Returns a dict in the standard skill_cli ``{id, success, data, error}``
+		envelope format, suitable for direct JSON serialization over the
+		daemon socket.
+		"""
+		result = await self.run_agent(max_steps=max_steps)
+		return result.to_skill_response(request_id=request_id)
+
+	@classmethod
+	def for_mcp(
+		cls,
+		task: str,
+		*,
+		profile_config: dict[str, Any] | None = None,
+		llm_config_dict: dict[str, Any] | None = None,
+		model_override: str | None = None,
+		allowed_domains: list[str] | None = None,
+		use_vision: bool = True,
+		max_steps: int = 100,
+	) -> CommandRuntimeAdapter:
+		"""Build an adapter directly from MCP tool-call parameters.
+
+		Parameters
+		----------
+		task
+			The agent task description.
+		profile_config
+			Dict from ``get_default_profile()`` (or equivalent).
+		llm_config_dict
+			Dict from ``get_default_llm()`` (or equivalent).
+		model_override
+			Model name passed by the MCP client; overrides llm_config_dict.
+		allowed_domains
+			Client-supplied domain allowlist (non-empty overrides profile).
+		use_vision
+			Whether to enable vision for the agent.
+		max_steps
+			Maximum agent steps.
+
+		Returns
+		-------
+		CommandRuntimeAdapter
+			Ready to call ``run_mcp_tool()`` or ``run_agent()``.
+		"""
+		import os as _os
+
+		llm_config_dict = llm_config_dict or {}
+		model_provider = llm_config_dict.get('model_provider') or _os.getenv('MODEL_PROVIDER')
+
+		llm = LLMConfig(
+			provider='aws_bedrock' if model_provider and str(model_provider).lower() == 'bedrock' else 'auto',
+			model=model_override or llm_config_dict.get('model'),
+			temperature=float(llm_config_dict.get('temperature', 0.7)),
+			api_key=llm_config_dict.get('api_key') or _os.getenv('OPENAI_API_KEY'),
+			base_url=llm_config_dict.get('base_url'),
+			aws_region=llm_config_dict.get('region') or _os.getenv('REGION', 'us-east-1'),
+			aws_sso_auth=bool(llm_config_dict.get('aws_sso_auth', False)),
+		)
+
+		profile_config = profile_config or {}
+		bs = BrowserSessionConfig(
+			**{k: v for k, v in profile_config.items() if v is not None and k in BrowserSessionConfig.model_fields}
+		)
+		if allowed_domains:
+			bs.allowed_domains = allowed_domains
+
+		task_cfg = TaskConfig(
+			task=task,
+			llm=llm,
+			browser=bs,
+			max_steps=max_steps,
+			use_vision=use_vision,
+		)
+		return cls(task_cfg)
+
+	@classmethod
+	def for_cli(
+		cls,
+		task: str,
+		*,
+		user_config: dict[str, Any],
+		click_ctx: Any | None = None,
+		source: str = 'cli',
+		user_data_dir: str | None = None,
+	) -> CommandRuntimeAdapter:
+		"""Build an adapter from legacy CLI user-config + click context.
+
+		Convenience wrapper that combines ``create_task_config_from_cli_dict``
+		with the post-processing steps commonly done in run_prompt_mode
+		(set task, source, user_data_dir).
+		"""
+		task_cfg = create_task_config_from_cli_dict(user_config)
+		task_cfg.task = task
+		task_cfg.source = source
+		if user_data_dir and task_cfg.browser.user_data_dir is None:
+			task_cfg.browser.user_data_dir = str(user_data_dir)
+		return cls(task_cfg)
+
+	@classmethod
+	def for_skill(
+		cls,
+		task: str,
+		*,
+		llm_provider: str = 'auto',
+		llm_model: str | None = None,
+		llm_temperature: float = 0.0,
+		llm_api_key: str | None = None,
+		headed: bool = False,
+		headless: bool | None = None,
+		profile: str | None = None,
+		cdp_url: str | None = None,
+		use_cloud: bool = False,
+		cloud_profile_id: str | None = None,
+		cloud_proxy_country_code: str | None = None,
+		cloud_timeout: int | None = None,
+		max_steps: int = 100,
+		use_vision: bool = True,
+	) -> CommandRuntimeAdapter:
+		"""Build an adapter from flat skill_cli-style keyword arguments.
+
+		Designed for daemon dispatch where each command param comes as a
+		separate keyword — no dict/config objects needed.
+		"""
+		llm = LLMConfig(
+			provider=llm_provider,  # type: ignore[arg-type]
+			model=llm_model,
+			temperature=llm_temperature,
+			api_key=llm_api_key,
+		)
+
+		bs = BrowserSessionConfig(
+			headless=headless,
+			headed=headed,
+			profile_directory=profile if not cdp_url and not use_cloud else None,
+			cdp_url=cdp_url,
+			use_cloud=use_cloud,
+			cloud_profile_id=cloud_profile_id,
+			cloud_proxy_country_code=cloud_proxy_country_code,
+			cloud_timeout=cloud_timeout,
+		)
+
+		# skill_cli real-Chrome profile path resolution
+		if profile and not cdp_url and not use_cloud:
+			try:
+				from browser_use.skill_cli.utils import find_chrome_executable, get_chrome_profile_path
+
+				chrome_path = find_chrome_executable()
+				if chrome_path:
+					bs.executable_path = chrome_path
+				u_dir = get_chrome_profile_path(None)
+				if u_dir:
+					bs.user_data_dir = u_dir
+			except Exception:
+				logger.debug('for_skill: Chrome profile path resolution skipped', exc_info=True)
+
+		task_cfg = TaskConfig(
+			task=task,
+			llm=llm,
+			browser=bs,
+			max_steps=max_steps,
+			use_vision=use_vision,
+		)
+		return cls(task_cfg)
+
 
 def _create_llm(cfg: LLMConfig) -> Any:
 	"""Instantiate an LLM object from an LLMConfig."""
@@ -307,9 +568,12 @@ def create_task_config_from_cli_dict(config: dict[str, Any]) -> TaskConfig:
 		bs_config.proxy_password = proxy.get('password')
 		bs_config.proxy_bypass = proxy.get('bypass')
 
+	max_steps = agent_cfg.get('max_steps')
+	remain_agent_settings = {k: v for k, v in agent_cfg.items() if k != 'max_steps'}
 	return TaskConfig(
 		task='',
 		llm=llm_config,
 		browser=bs_config,
-		agent_settings=agent_cfg,
+		agent_settings=remain_agent_settings,
+		**({'max_steps': max_steps} if max_steps is not None else {}),
 	)

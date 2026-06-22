@@ -113,3 +113,72 @@ class RunResult(BaseModel):
 		if self.urls_visited:
 			parts.append(f'\nURLs visited: {", ".join(self.urls_visited)}')
 		return '\n'.join(parts)
+
+	def format_final_result(self) -> str:
+		"""Return only the final result or a fallback message."""
+		if self.final_result:
+			return self.final_result
+		if self.success and self.is_done:
+			return 'Task completed successfully (no extracted result).'
+		if self.errors:
+			filtered = [e for e in self.errors if e is not None]
+			if filtered:
+				return f'Errors: {"; ".join(filtered)}'
+		return 'Task finished with no output.'
+
+	def format_error(self) -> str:
+		"""Return the first error message, or empty string."""
+		filtered = [e for e in self.errors if e is not None]
+		return filtered[0] if filtered else ''
+
+	def to_dict(self) -> dict[str, Any]:
+		"""Serialize to plain dict for JSON transmission."""
+		return self.model_dump()
+
+	def to_json(self, indent: int | None = 2) -> str:
+		"""Serialize to JSON string."""
+		import json
+
+		return json.dumps(self.to_dict(), indent=indent, ensure_ascii=False)
+
+	def format_mcp(self) -> str:
+		"""Format as MCP tool response text — concise, includes errors on failure."""
+		if self.success:
+			body = self.format_final_result()
+			header = f'Task completed in {self.steps} steps'
+			if self.urls_visited:
+				return f'{header}.\n{body}\n\nURLs visited: {", ".join(self.urls_visited)}'
+			return f'{header}.\n{body}'
+		else:
+			msg = self.format_error() or 'Unknown error'
+			return f'Agent task failed: {msg}'
+
+	def format_cli(self) -> str:
+		"""Format as human-readable CLI output (alias of format_text)."""
+		return self.format_text()
+
+	def to_skill_response(self, request_id: str = '') -> dict[str, Any]:
+		"""Format as skill_cli daemon JSON response envelope."""
+		if self.success:
+			return {
+				'id': request_id,
+				'success': True,
+				'error': None,
+				'data': {
+					'final_result': self.final_result,
+					'steps': self.steps,
+					'duration_seconds': self.duration_seconds,
+					'urls_visited': self.urls_visited,
+					'is_done': self.is_done,
+				},
+			}
+		else:
+			return {
+				'id': request_id,
+				'success': False,
+				'error': self.format_error() or 'Task failed',
+				'data': {
+					'steps': self.steps,
+					'duration_seconds': self.duration_seconds,
+				},
+			}
