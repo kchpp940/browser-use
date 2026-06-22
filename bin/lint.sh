@@ -7,12 +7,14 @@
 #   --fail-fast    Exit immediately on first failure (faster feedback)
 #   --quick        Fast mode: skips pyright type checking (~2s vs 5s)
 #   --staged       Check only staged files (for git pre-commit hook)
+#   --release      Run full release engineering checks (includes import boundary tests)
 #
 # Examples:
 #   $ ./bin/lint.sh                    # Full check (matches CI/CD) - 5s
 #   $ ./bin/lint.sh --quick            # Quick iteration (no types) - 2s
 #   $ ./bin/lint.sh --staged           # Only staged files - varies
 #   $ ./bin/lint.sh --staged --quick   # Fast pre-commit - <2s
+#   $ ./bin/lint.sh --release          # Full release engineering checks
 #
 # Note: 
 #   - Quick mode skips type checking. Always run full mode before pushing to CI.
@@ -40,14 +42,16 @@ fi
 FAIL_FAST=0
 QUICK_MODE=0
 STAGED_MODE=0
+RELEASE_MODE=0
 for arg in "$@"; do
     case "$arg" in
         --fail-fast) FAIL_FAST=1 ;;
         --quick) QUICK_MODE=1 ;;
         --staged) STAGED_MODE=1 ;;
+        --release) RELEASE_MODE=1 ;;
         *)
             echo "Unknown option: $arg"
-            echo "Usage: $0 [--fail-fast] [--quick] [--staged]"
+            echo "Usage: $0 [--fail-fast] [--quick] [--staged] [--release]"
             exit 1
             ;;
     esac
@@ -248,4 +252,38 @@ if [ $FAILED -eq 1 ]; then
 fi
 
 echo "✅ All checks passed! (${TOTAL_TIME}s total)"
+
+# ─── Release engineering checks (only in --release mode) ───
+if [ $RELEASE_MODE -eq 1 ]; then
+    echo ""
+    echo "📦 Running release engineering checks..."
+    
+    # Run shell-based release checks
+    if ! bash "$SCRIPT_DIR/check_release.sh" --quick; then
+        echo "❌ Release shell checks failed"
+        exit 1
+    fi
+    
+    # Run Python-based release engineering tests
+    echo ""
+    echo "Running release engineering pytest tests..."
+    PYTEST_START=$(date +%s)
+    if ${RUN_CMD}python -m pytest tests/ci/infrastructure/test_release_engineering.py -v --tb=short 2>&1 | tee "$TEMP_DIR/pytest-release.log"; then
+        PYTEST_DURATION=$(($(date +%s) - PYTEST_START))
+        echo ""
+        echo "✅ Release engineering tests passed! (${PYTEST_DURATION}s)"
+    else
+        PYTEST_DURATION=$(($(date +%s) - PYTEST_START))
+        echo ""
+        echo "❌ Release engineering tests failed! (${PYTEST_DURATION}s)"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        cat "$TEMP_DIR/pytest-release.log"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        exit 1
+    fi
+    
+    echo ""
+    echo "🎉 Full release engineering check complete!"
+fi
+
 exit 0

@@ -415,6 +415,22 @@ if echo "$MCP_ALL" | grep -qx "BrowserUseServer"; then
     fi
 fi
 
+# ─── 11. Python release engineering tests ───
+if [ $QUICK_MODE -eq 0 ]; then
+    echo ""
+    echo "11. Running Python release engineering tests"
+    
+    PYTEST_OUTPUT=$(python3 -m pytest tests/ci/infrastructure/test_release_engineering.py -v --tb=short 2>&1 || true)
+    if echo "$PYTEST_OUTPUT" | grep -q "FAILED"; then
+        echo "$PYTEST_OUTPUT" | tail -30
+        check_fail "Python release engineering tests failed"
+    else
+        check_pass "All Python release engineering tests passed"
+    fi
+else
+    check_warn "Skipping Python release tests (--quick mode)"
+fi
+
 # ─── Summary ───
 echo ""
 echo "========================================="
