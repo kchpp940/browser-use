@@ -53,8 +53,12 @@ if TYPE_CHECKING:
 	from browser_use.dom.service import DomService
 	from browser_use.llm import models
 	from browser_use.llm.anthropic.chat import ChatAnthropic
+	from browser_use.llm.aws.chat_anthropic import ChatAnthropicBedrock
+	from browser_use.llm.aws.chat_bedrock import ChatAWSBedrock
 	from browser_use.llm.azure.chat import ChatAzureOpenAI
 	from browser_use.llm.browser_use.chat import ChatBrowserUse
+	from browser_use.llm.cerebras.chat import ChatCerebras
+	from browser_use.llm.deepseek.chat import ChatDeepSeek
 	from browser_use.llm.google.chat import ChatGoogle
 	from browser_use.llm.groq.chat import ChatGroq
 	from browser_use.llm.litellm.chat import ChatLiteLLM
@@ -62,29 +66,24 @@ if TYPE_CHECKING:
 	from browser_use.llm.oci_raw.chat import ChatOCIRaw
 	from browser_use.llm.ollama.chat import ChatOllama
 	from browser_use.llm.openai.chat import ChatOpenAI
+	from browser_use.llm.openrouter.chat import ChatOpenRouter
 	from browser_use.llm.vercel.chat import ChatVercel
 	from browser_use.sandbox import sandbox
 	from browser_use.tools.service import Controller, Tools
 
 	# Lazy imports mapping - only import when actually accessed
 _LAZY_IMPORTS = {
-	# Agent service (heavy due to dependencies)
 	'Agent': ('browser_use.agent.service', 'Agent'),
-	# System prompt (moderate weight due to agent.views imports)
 	'SystemPrompt': ('browser_use.agent.prompts', 'SystemPrompt'),
-	# Agent views (very heavy - over 1 second!)
 	'ActionModel': ('browser_use.agent.views', 'ActionModel'),
 	'ActionResult': ('browser_use.agent.views', 'ActionResult'),
 	'AgentHistoryList': ('browser_use.agent.views', 'AgentHistoryList'),
 	'BrowserSession': ('browser_use.browser', 'BrowserSession'),
-	'Browser': ('browser_use.browser', 'BrowserSession'),  # Alias for BrowserSession
+	'Browser': ('browser_use.browser', 'BrowserSession'),
 	'BrowserProfile': ('browser_use.browser', 'BrowserProfile'),
-	# Tools (moderate weight)
 	'Tools': ('browser_use.tools.service', 'Tools'),
-	'Controller': ('browser_use.tools.service', 'Controller'),  # alias
-	# DOM service (moderate weight)
+	'Controller': ('browser_use.tools.service', 'Controller'),
 	'DomService': ('browser_use.dom.service', 'DomService'),
-	# Chat models (very heavy imports)
 	'ChatOpenAI': ('browser_use.llm.openai.chat', 'ChatOpenAI'),
 	'ChatGoogle': ('browser_use.llm.google.chat', 'ChatGoogle'),
 	'ChatAnthropic': ('browser_use.llm.anthropic.chat', 'ChatAnthropic'),
@@ -96,9 +95,12 @@ _LAZY_IMPORTS = {
 	'ChatOCIRaw': ('browser_use.llm.oci_raw.chat', 'ChatOCIRaw'),
 	'ChatOllama': ('browser_use.llm.ollama.chat', 'ChatOllama'),
 	'ChatVercel': ('browser_use.llm.vercel.chat', 'ChatVercel'),
-	# LLM models module
+	'ChatCerebras': ('browser_use.llm.cerebras.chat', 'ChatCerebras'),
+	'ChatDeepSeek': ('browser_use.llm.deepseek.chat', 'ChatDeepSeek'),
+	'ChatOpenRouter': ('browser_use.llm.openrouter.chat', 'ChatOpenRouter'),
+	'ChatAnthropicBedrock': ('browser_use.llm.aws.chat_anthropic', 'ChatAnthropicBedrock'),
+	'ChatAWSBedrock': ('browser_use.llm.aws.chat_bedrock', 'ChatAWSBedrock'),
 	'models': ('browser_use.llm.models', None),
-	# Sandbox execution
 	'sandbox': ('browser_use.sandbox', 'sandbox'),
 }
 
@@ -128,7 +130,7 @@ def __getattr__(name: str):
 __all__ = [
 	'Agent',
 	'BrowserSession',
-	'Browser',  # Alias for BrowserSession
+	'Browser',
 	'BrowserProfile',
 	'Controller',
 	'DomService',
@@ -136,7 +138,7 @@ __all__ = [
 	'ActionResult',
 	'ActionModel',
 	'AgentHistoryList',
-	# Chat models
+	'Tools',
 	'ChatOpenAI',
 	'ChatGoogle',
 	'ChatAnthropic',
@@ -148,10 +150,11 @@ __all__ = [
 	'ChatOCIRaw',
 	'ChatOllama',
 	'ChatVercel',
-	'Tools',
-	'Controller',
-	# LLM models module
+	'ChatCerebras',
+	'ChatDeepSeek',
+	'ChatOpenRouter',
+	'ChatAnthropicBedrock',
+	'ChatAWSBedrock',
 	'models',
-	# Sandbox execution
 	'sandbox',
 ]

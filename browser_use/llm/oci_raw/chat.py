@@ -8,17 +8,8 @@ Generative AI service using raw API calls without Langchain dependencies.
 import asyncio
 import json
 from dataclasses import dataclass
-from typing import Any, TypeVar, overload
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
-import oci
-from oci.generative_ai_inference import GenerativeAiInferenceClient
-from oci.generative_ai_inference.models import (
-	BaseChatRequest,
-	ChatDetails,
-	CohereChatRequest,
-	GenericChatRequest,
-	OnDemandServingMode,
-)
 from pydantic import BaseModel
 
 from browser_use.llm.base import BaseChatModel
@@ -28,6 +19,9 @@ from browser_use.llm.schema import SchemaOptimizer
 from browser_use.llm.views import ChatInvokeCompletion, ChatInvokeUsage
 
 from .serializer import OCIRawMessageSerializer
+
+if TYPE_CHECKING:
+	pass
 
 T = TypeVar('T', bound=BaseModel)
 
@@ -155,17 +149,23 @@ class ChatOCIRaw(BaseChatModel):
 				'top_k': True,
 			}
 
-	def _get_oci_client(self) -> GenerativeAiInferenceClient:
-		"""Get the OCI GenerativeAiInferenceClient following your working example."""
+	def _get_oci_client(self):
+		try:
+			import oci
+			from oci.generative_ai_inference import GenerativeAiInferenceClient
+		except ImportError:
+			raise ImportError(
+				'`oci` not installed. Please install using `pip install browser-use[oci] or pip install browser-use[all]`'
+			)
+
 		if not hasattr(self, '_client'):
-			# Configure OCI client based on auth_type (following your working example)
 			if self.auth_type == 'API_KEY':
 				config = oci.config.from_file('~/.oci/config', self.auth_profile)
 				self._client = GenerativeAiInferenceClient(
 					config=config,
 					service_endpoint=self.service_endpoint,
 					retry_strategy=oci.retry.NoneRetryStrategy(),
-					timeout=(10, 240),  # Following your working example
+					timeout=(10, 240),
 				)
 			elif self.auth_type == 'INSTANCE_PRINCIPAL':
 				config = {}
@@ -188,7 +188,6 @@ class ChatOCIRaw(BaseChatModel):
 					timeout=(10, 240),
 				)
 			else:
-				# Fallback to API_KEY
 				config = oci.config.from_file('~/.oci/config', self.auth_profile)
 				self._client = GenerativeAiInferenceClient(
 					config=config,
@@ -256,11 +255,20 @@ class ChatOCIRaw(BaseChatModel):
 			) from e
 
 	async def _make_request(self, messages: list[BaseMessage]):
-		"""Make async request to OCI API using proper OCI SDK models."""
+		try:
+			from oci.generative_ai_inference.models import (
+				BaseChatRequest,
+				ChatDetails,
+				CohereChatRequest,
+				GenericChatRequest,
+				OnDemandServingMode,
+			)
+		except ImportError:
+			raise ImportError(
+				'`oci` not installed. Please install using `pip install browser-use[oci] or pip install browser-use[all]`'
+			)
 
-		# Create chat request based on provider type
 		if self._uses_cohere_format():
-			# Cohere models use CohereChatRequest with single message string
 			message_text = OCIRawMessageSerializer.serialize_messages_for_cohere(messages)
 
 			chat_request = CohereChatRequest()
@@ -271,7 +279,6 @@ class ChatOCIRaw(BaseChatModel):
 			chat_request.top_p = self.top_p
 			chat_request.top_k = self.top_k
 		else:
-			# Meta, xAI and other models use GenericChatRequest with messages array
 			oci_messages = OCIRawMessageSerializer.serialize_messages(messages)
 
 			chat_request = GenericChatRequest()
@@ -281,43 +288,34 @@ class ChatOCIRaw(BaseChatModel):
 			chat_request.temperature = self.temperature
 			chat_request.top_p = self.top_p
 
-			# Provider-specific parameters
 			if self.provider.lower() == 'meta':
-				# Meta models support frequency_penalty and presence_penalty
 				chat_request.frequency_penalty = self.frequency_penalty
 				chat_request.presence_penalty = self.presence_penalty
 			elif self.provider.lower() == 'xai':
-				# xAI models support top_k but not frequency_penalty or presence_penalty
 				chat_request.top_k = self.top_k
 			else:
-				# Default: include all parameters for unknown providers
 				chat_request.frequency_penalty = self.frequency_penalty
 				chat_request.presence_penalty = self.presence_penalty
 
-		# Create serving mode
 		serving_mode = OnDemandServingMode(model_id=self.model_id)
 
-		# Create chat details
 		chat_details = ChatDetails()
 		chat_details.serving_mode = serving_mode
 		chat_details.chat_request = chat_request
 		chat_details.compartment_id = self.compartment_id
 
-		# Make the request in a thread to avoid blocking
 		def _sync_request():
 			try:
 				client = self._get_oci_client()
 				response = client.chat(chat_details)
-				return response  # Return the raw response object
+				return response
 			except Exception as e:
-				# Handle OCI-specific exceptions
 				status_code = getattr(e, 'status', 500)
 				if status_code == 429:
 					raise ModelRateLimitError(message=f'Rate limit exceeded: {str(e)}', model=self.name) from e
 				else:
 					raise ModelProviderError(message=str(e), status_code=status_code, model=self.name) from e
 
-		# Run in thread pool to make it async
 		loop = asyncio.get_event_loop()
 		return await loop.run_in_executor(None, _sync_request)
 

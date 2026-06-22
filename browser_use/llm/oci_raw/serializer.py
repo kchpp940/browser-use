@@ -5,7 +5,7 @@ This module handles the conversion between browser-use message formats
 and the OCI Raw API message format using proper OCI SDK models.
 """
 
-from oci.generative_ai_inference.models import ImageContent, ImageUrl, Message, TextContent
+from typing import TYPE_CHECKING
 
 from browser_use.llm.messages import (
 	AssistantMessage,
@@ -14,6 +14,9 @@ from browser_use.llm.messages import (
 	SystemMessage,
 	UserMessage,
 )
+
+if TYPE_CHECKING:
+	pass
 
 
 class OCIRawMessageSerializer:
@@ -45,30 +48,29 @@ class OCIRawMessageSerializer:
 			raise ValueError(f'Invalid base64 image URL format: {url}')
 
 	@staticmethod
-	def _create_image_content(part: ContentPartImageParam) -> ImageContent:
-		"""Convert ContentPartImageParam to OCI ImageContent."""
+	def _create_image_content(part: ContentPartImageParam):
+		try:
+			from oci.generative_ai_inference.models import ImageContent, ImageUrl
+		except ImportError:
+			raise ImportError(
+				'`oci` not installed. Please install using `pip install browser-use[oci] or pip install browser-use[all]`'
+			)
+
 		url = part.image_url.url
 
-		if OCIRawMessageSerializer._is_base64_image(url):
-			# Handle base64 encoded images - OCI expects data URLs as-is
-			image_url = ImageUrl(url=url)
-		else:
-			# Handle regular URLs
-			image_url = ImageUrl(url=url)
+		image_url = ImageUrl(url=url)
 
 		return ImageContent(image_url=image_url)
 
 	@staticmethod
-	def serialize_messages(messages: list[BaseMessage]) -> list[Message]:
-		"""
-		Serialize a list of browser-use messages to OCI Raw API Message objects.
+	def serialize_messages(messages: list[BaseMessage]) -> list:
+		try:
+			from oci.generative_ai_inference.models import Message, TextContent
+		except ImportError:
+			raise ImportError(
+				'`oci` not installed. Please install using `pip install browser-use[oci] or pip install browser-use[all]`'
+			)
 
-		Args:
-		    messages: List of browser-use messages
-
-		Returns:
-		    List of OCI Message objects
-		"""
 		oci_messages = []
 
 		for message in messages:
@@ -82,7 +84,6 @@ class OCIRawMessageSerializer:
 					text_content.text = content
 					oci_message.content = [text_content]
 				elif isinstance(content, list):
-					# Handle content parts - text and images
 					contents = []
 					for part in content:
 						if part.type == 'text':
@@ -103,7 +104,6 @@ class OCIRawMessageSerializer:
 					text_content.text = content
 					oci_message.content = [text_content]
 				elif isinstance(content, list):
-					# Handle content parts - typically just text for system messages
 					contents = []
 					for part in content:
 						if part.type == 'text':
@@ -111,7 +111,6 @@ class OCIRawMessageSerializer:
 							text_content.text = part.text
 							contents.append(text_content)
 						elif part.type == 'image_url':
-							# System messages can theoretically have images too
 							image_content = OCIRawMessageSerializer._create_image_content(part)
 							contents.append(image_content)
 					if contents:
@@ -125,7 +124,6 @@ class OCIRawMessageSerializer:
 					text_content.text = content
 					oci_message.content = [text_content]
 				elif isinstance(content, list):
-					# Handle content parts - text, images, and refusals
 					contents = []
 					for part in content:
 						if part.type == 'text':
@@ -133,8 +131,6 @@ class OCIRawMessageSerializer:
 							text_content.text = part.text
 							contents.append(text_content)
 						elif part.type == 'image_url':
-							# Assistant messages can have images in responses
-							# Note: This is currently unreachable in browser-use but kept for completeness
 							image_content = OCIRawMessageSerializer._create_image_content(part)
 							contents.append(image_content)
 						elif part.type == 'refusal':
@@ -144,13 +140,11 @@ class OCIRawMessageSerializer:
 					if contents:
 						oci_message.content = contents
 			else:
-				# Fallback for any message format issues
 				oci_message.role = 'USER'
 				text_content = TextContent()
 				text_content.text = str(message)
 				oci_message.content = [text_content]
 
-			# Only append messages that have content
 			if hasattr(oci_message, 'content') and oci_message.content:
 				oci_messages.append(oci_message)
 

@@ -12,7 +12,10 @@ from collections.abc import Callable, Coroutine
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Concatenate, ParamSpec, TypeVar, Union, cast, get_args, get_origin
 
-import cloudpickle
+try:
+	import cloudpickle
+except ImportError:
+	cloudpickle = None  # type: ignore
 import httpx
 
 from browser_use.sandbox.views import (
@@ -303,6 +306,8 @@ def sandbox(
 				needed_imports = 'from browser_use import Browser'
 
 			# 4. Pickle parameters using cloudpickle for robust serialization
+			if cloudpickle is None:
+				raise ImportError('`cloudpickle` is required for sandbox execution. Install it with: pip install cloudpickle')
 			pickled_params = base64.b64encode(cloudpickle.dumps(all_params)).decode()
 
 			# 5. Determine which params are in the function signature vs closure/globals
