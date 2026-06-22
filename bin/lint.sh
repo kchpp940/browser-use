@@ -8,6 +8,7 @@
 #   --quick        Fast mode: skips pyright type checking (~2s vs 5s)
 #   --staged       Check only staged files (for git pre-commit hook)
 #   --release      Run full release engineering checks (includes import boundary tests)
+#   --isolated     Run isolated install tests (slow, implies --release)
 #
 # Examples:
 #   $ ./bin/lint.sh                    # Full check (matches CI/CD) - 5s
@@ -15,6 +16,7 @@
 #   $ ./bin/lint.sh --staged           # Only staged files - varies
 #   $ ./bin/lint.sh --staged --quick   # Fast pre-commit - <2s
 #   $ ./bin/lint.sh --release          # Full release engineering checks
+#   $ ./bin/lint.sh --isolated         # Isolated install tests (slow)
 #
 # Note: 
 #   - Quick mode skips type checking. Always run full mode before pushing to CI.
@@ -43,15 +45,17 @@ FAIL_FAST=0
 QUICK_MODE=0
 STAGED_MODE=0
 RELEASE_MODE=0
+ISOLATED_MODE=0
 for arg in "$@"; do
     case "$arg" in
         --fail-fast) FAIL_FAST=1 ;;
         --quick) QUICK_MODE=1 ;;
         --staged) STAGED_MODE=1 ;;
         --release) RELEASE_MODE=1 ;;
+        --isolated) ISOLATED_MODE=1; RELEASE_MODE=1 ;;
         *)
             echo "Unknown option: $arg"
-            echo "Usage: $0 [--fail-fast] [--quick] [--staged] [--release]"
+            echo "Usage: $0 [--fail-fast] [--quick] [--staged] [--release] [--isolated]"
             exit 1
             ;;
     esac
@@ -280,6 +284,26 @@ if [ $RELEASE_MODE -eq 1 ]; then
         cat "$TEMP_DIR/pytest-release.log"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
         exit 1
+    fi
+    
+    # ─── Isolated install tests (only in --isolated mode) ───
+    if [ $ISOLATED_MODE -eq 1 ]; then
+        echo ""
+        echo "🔬 Running isolated install tests (slow)..."
+        ISOLATED_START=$(date +%s)
+        if bash "$SCRIPT_DIR/check_isolated_installs.sh" --quick --keep 2>&1 | tee "$TEMP_DIR/isolated.log"; then
+            ISOLATED_DURATION=$(($(date +%s) - ISOLATED_START))
+            echo ""
+            echo "✅ Isolated install tests passed! (${ISOLATED_DURATION}s)"
+        else
+            ISOLATED_DURATION=$(($(date +%s) - ISOLATED_START))
+            echo ""
+            echo "❌ Isolated install tests failed! (${ISOLATED_DURATION}s)"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            tail -50 "$TEMP_DIR/isolated.log"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            exit 1
+        fi
     fi
     
     echo ""

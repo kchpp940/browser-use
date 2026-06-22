@@ -36,7 +36,7 @@ MCP_SERVER = MCP_DIR / 'server.py'
 
 def parse_ast(path: Path) -> ast.Module:
 	"""Parse a Python file into an AST."""
-	with open(path, 'r', encoding='utf-8') as f:
+	with open(path, encoding='utf-8') as f:
 		return ast.parse(f.read())
 
 
@@ -358,7 +358,7 @@ class TestExampleScripts:
 		]
 
 		for py_file in EXAMPLES_DIR.rglob('*.py'):
-			with open(py_file, 'r', encoding='utf-8') as f:
+			with open(py_file, encoding='utf-8') as f:
 				lines = f.readlines()
 				for i, line in enumerate(lines, 1):
 					for pattern in internal_import_patterns:

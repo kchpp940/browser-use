@@ -7,6 +7,7 @@
 #   ./bin/check_release.sh              # Full check
 #   ./bin/check_release.sh --quick      # Skip slow import smoke tests
 #   ./bin/check_release.sh --fix        # Auto-fix what's possible
+#   ./bin/check_release.sh --isolated   # Also run isolated install tests (slow)
 #
 # Exit code: 0 = all checks pass, 1 = failures found
 
@@ -17,11 +18,13 @@ cd "$SCRIPT_DIR/.."
 
 QUICK_MODE=0
 FIX_MODE=0
+ISOLATED_MODE=0
 for arg in "$@"; do
     case "$arg" in
-        --quick) QUICK_MODE=1 ;;
-        --fix)   FIX_MODE=1 ;;
-        *)       echo "Unknown option: $arg"; echo "Usage: $0 [--quick] [--fix]"; exit 1 ;;
+        --quick)    QUICK_MODE=1 ;;
+        --fix)      FIX_MODE=1 ;;
+        --isolated) ISOLATED_MODE=1 ;;
+        *)          echo "Unknown option: $arg"; echo "Usage: $0 [--quick] [--fix] [--isolated]"; exit 1 ;;
     esac
 done
 
@@ -429,6 +432,18 @@ if [ $QUICK_MODE -eq 0 ]; then
     fi
 else
     check_warn "Skipping Python release tests (--quick mode)"
+fi
+
+# ─── 12. Isolated install tests (optional, slow) ───
+if [ $ISOLATED_MODE -eq 1 ]; then
+    echo ""
+    echo "12. Running isolated install tests (slow)..."
+    
+    if bash "$SCRIPT_DIR/check_isolated_installs.sh" --quick; then
+        check_pass "Isolated install tests passed"
+    else
+        check_fail "Isolated install tests failed"
+    fi
 fi
 
 # ─── Summary ───
